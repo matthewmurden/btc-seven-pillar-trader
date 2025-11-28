@@ -1,0 +1,31 @@
+pandas
+numpy
+requests
+python-binance
+websockets
+aiohttp
+pyarrow
+scikit-learn
+
+# Machine Learning
+scikit-learn
+lightgbm
+xgboost
+
+# For feature engineering utilities
+numba
+
+# Optional but useful for analysis / debugging
+matplotlib
+
+# Date parsing utilities
+python-dateutil
+
+# For websocket streaming & async data collection
+websocket-client
+
+# Fast file handling (optional future use)
+pyarrow
+
+# For environment variable management
+python-dotenv
