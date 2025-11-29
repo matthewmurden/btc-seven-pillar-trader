@@ -29,7 +29,20 @@ def optimise_exit(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     atr = out["atr"] if "atr" in out.columns else out.get("feature_volatility_atr")
     if atr is None:
-        raise ValueError("Missing ATR column (atr or feature_volatility_atr)")
+        # derive ATR from OHLC if available
+        if {"high", "low", "close"}.issubset(out.columns):
+            prev_close = out["close"].shift(1)
+            tr = pd.concat(
+                [
+                    out["high"] - out["low"],
+                    (out["high"] - prev_close).abs(),
+                    (out["low"] - prev_close).abs(),
+                ],
+                axis=1,
+            ).max(axis=1)
+            atr = tr.rolling(14, min_periods=5).mean()
+        else:
+            raise ValueError("Missing ATR column (atr or feature_volatility_atr)")
     atr = atr.ffill().bfill()
 
     n = len(out)
