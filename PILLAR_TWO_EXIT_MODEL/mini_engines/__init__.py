@@ -9,6 +9,12 @@ from .orderflow_engine import OrderflowEngine
 from .structure_engine import StructureEngine
 from .pattern_engine import PatternEngine
 from .regime_engine import RegimeEngine
+from .exit_mini_engines_master import ExitMiniEnginesMaster
+from .volatility_excursion_engine import VolatilityExcursionEngine
+from .adverse_move_engine import AdverseMoveEngine
+from .favourable_move_engine import FavourableMoveEngine
+from .path_shape_engine import PathShapeEngine
+from .regime_exit_engine import RegimeExitEngine
 
 __all__ = [
     "MiniEnginesMaster",
@@ -20,4 +26,10 @@ __all__ = [
     "StructureEngine",
     "PatternEngine",
     "RegimeEngine",
+    "ExitMiniEnginesMaster",
+    "VolatilityExcursionEngine",
+    "AdverseMoveEngine",
+    "FavourableMoveEngine",
+    "PathShapeEngine",
+    "RegimeExitEngine",
 ]

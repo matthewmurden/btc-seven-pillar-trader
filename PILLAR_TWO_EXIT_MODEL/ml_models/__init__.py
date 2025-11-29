@@ -1,6 +1,9 @@
 """ML models package for Pillar Two."""
 
-from .model_training_master import ModelTrainingMaster
-from .model_prediction_master import ModelPredictionMaster
+from .model_training_exit_master import train_all_exit_models
+from .model_prediction_exit_master import ExitModelPredictionMaster
 
-__all__ = ["ModelTrainingMaster", "ModelPredictionMaster"]
+__all__ = [
+    "train_all_exit_models",
+    "ExitModelPredictionMaster",
+]
