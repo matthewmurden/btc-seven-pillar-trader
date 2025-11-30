@@ -250,33 +250,36 @@ def apply_meta_features(
     exit_direction_consistency = tp_proba - sl_proba
     expected_exit_time = np.maximum(exit_time_pred, 0)
 
-    meta = pd.DataFrame(
-    {
-        "asymmetry_ratio": asymmetry_ratio,
-        "reward_risk_prediction": reward_risk_prediction,
-        "survival_confidence": survival_conf,
-        "volatility_after_entry_pred": volatility_after_entry_pred,
-        "exit_direction_consistency": exit_direction_consistency,
-        "expected_exit_time": expected_exit_time,
-    },
-    index=df.index,
+    meta_df = pd.DataFrame(
+        {
+            "asymmetry_ratio": asymmetry_ratio,
+            "reward_risk_prediction": reward_risk_prediction,
+            "survival_confidence": survival_conf,
+            "volatility_after_entry_pred": volatility_after_entry_pred,
+            "exit_direction_consistency": exit_direction_consistency,
+            "expected_exit_time": expected_exit_time,
+            "tp_first_proba": tp_proba.astype(np.float32),
+            "sl_first_proba": sl_proba.astype(np.float32),
+        },
+        index=df.index,
     )
 
     # Add z-scores for decay filter
-    meta["asymmetry_ratio_z"] = (meta["asymmetry_ratio"] - meta["asymmetry_ratio"].mean()) / (meta["asymmetry_ratio"].std() + 1e-12)
-    meta["reward_risk_z"] = (meta["reward_risk_prediction"] - meta["reward_risk_prediction"].mean()) / (meta["reward_risk_prediction"].std() + 1e-12)
-    meta["exit_direction_z"] = (meta["exit_direction_consistency"] - meta["exit_direction_consistency"].mean()) / (meta["exit_direction_consistency"].std() + 1e-12)
+    meta_df["asymmetry_ratio_z"] = (meta_df["asymmetry_ratio"] - meta_df["asymmetry_ratio"].mean()) / (meta_df["asymmetry_ratio"].std() + 1e-12)
+    meta_df["reward_risk_z"] = (meta_df["reward_risk_prediction"] - meta_df["reward_risk_prediction"].mean()) / (meta_df["reward_risk_prediction"].std() + 1e-12)
+    meta_df["exit_direction_z"] = (meta_df["exit_direction_consistency"] - meta_df["exit_direction_consistency"].mean()) / (meta_df["exit_direction_consistency"].std() + 1e-12)
+    meta_df["volatility_after_entry_z"] = (meta_df["volatility_after_entry_pred"] - meta_df["volatility_after_entry_pred"].mean()) / (meta_df["volatility_after_entry_pred"].std() + 1e-12)
 
     # Validate + save
-    meta = _clip_and_validate(meta).astype(np.float32)
+    meta_df = _clip_and_validate(meta_df).astype(np.float32)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    meta.to_parquet(output_path, index=False)
+    meta_df.to_parquet(output_path, index=False)
 
     logger.info("Saved meta exit features to %s", output_path)
     logger.info("Completed in %.2f seconds", time.time() - t0)
 
-    return meta
+    return meta_df
 
 
 if __name__ == "__main__":
