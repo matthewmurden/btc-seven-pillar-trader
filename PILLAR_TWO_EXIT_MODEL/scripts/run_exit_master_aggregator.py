@@ -53,6 +53,15 @@ def main():
     merged = merged.loc[:, ~merged.columns.duplicated()]  # keep first occurrence (meta is authoritative)
     logger.info("Merged shape: %s", merged.shape)
 
+    # Ensure entry columns are present for final decision layer
+    required_entry_cols = ["entry_signal", "entry_direction", "entry_price"]
+    missing_entry = [c for c in required_entry_cols if c not in merged.columns]
+    if missing_entry:
+        raise ValueError(
+            f"Missing entry columns in merged data: {missing_entry}. "
+            "Ensure exit_features_with_mini_engines.parquet includes these columns."
+        )
+
     aggregated = apply_exit_master_aggregation(merged)
 
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
