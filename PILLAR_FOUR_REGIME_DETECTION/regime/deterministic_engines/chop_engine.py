@@ -1,43 +1,31 @@
 """
-Deterministic chop engine.
+Chop Engine
+Detects sideways, low-directional, mean-reverting chop conditions.
 """
 
-from __future__ import annotations
-
-import numpy as np
 import pandas as pd
-
-from regime.deterministic_engines.engine_utils import sigmoid, zscore
-
+import numpy as np
 
 def apply_chop_engine(df: pd.DataFrame) -> pd.DataFrame:
-    required = [
-        "micro_trend_entropy",
-        "bar_clustering_score",
-        "chop_index",
-        "upper_wick_body",
-        "lower_wick_body",
-    ]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing columns for chop engine: {missing}")
+    out = df.copy()
 
-    entropy_norm = zscore(df["micro_trend_entropy"].to_numpy(dtype=np.float64))
-    chop_norm = zscore(df["chop_index"].to_numpy(dtype=np.float64))
-    uwb = df["upper_wick_body"].to_numpy(dtype=np.float64)
-    lwb = df["lower_wick_body"].to_numpy(dtype=np.float64)
+    entropy = out["micro_trend_entropy"]
+    bar_cluster = out["bar_clustering_score"]
+    alt_ratio = out["chop_index"]  # alternation of candle direction
+    wick_ratio = (
+        out["upper_wick_body"] + out["lower_wick_body"]
+    ) / 2
 
-    score = sigmoid(
-        entropy_norm
-        + chop_norm
-        + 0.5 * (uwb + lwb)
+    chop_score = (
+        0.3 * entropy +
+        0.25 * bar_cluster +
+        0.25 * alt_ratio +
+        0.2 * wick_ratio
     )
-    chop_flag = (score > 0.6).astype(np.float32)
 
-    return pd.DataFrame(
-        {
-            "chop_strength_score": score.astype(np.float32),
-            "chop_flag": chop_flag,
-        },
-        index=df.index,
-    )
+    chop_flag = (chop_score > 0.55).astype(int)
+
+    out["chop_strength_score"] = chop_score.clip(0, 1)
+    out["chop_flag"] = chop_flag
+
+    return out

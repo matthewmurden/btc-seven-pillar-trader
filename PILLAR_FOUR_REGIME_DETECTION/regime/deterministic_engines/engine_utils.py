@@ -1,25 +1,12 @@
-"""
-Utility functions for deterministic regime engines.
-"""
-
-from __future__ import annotations
-
 import numpy as np
+import pandas as pd
 
 
-def sigmoid(x: np.ndarray) -> np.ndarray:
-    return 1.0 / (1.0 + np.exp(-x))
+def zscore(series: pd.Series, window: int = 100) -> pd.Series:
+    mean = series.rolling(window).mean()
+    std = series.rolling(window).std()
+    return (series - mean) / (std + 1e-9)
 
 
-def zscore(x: np.ndarray) -> np.ndarray:
-    mean = np.nanmean(x)
-    std = np.nanstd(x) + 1e-12
-    return (x - mean) / std
-
-
-def safe_div(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    return a / (b + 1e-12)
-
-
-def classify_threshold(value: np.ndarray, threshold: float) -> np.ndarray:
-    return (value > threshold).astype(np.float32)
+def smooth(series: pd.Series, alpha: float = 0.2) -> pd.Series:
+    return series.ewm(alpha=alpha).mean()

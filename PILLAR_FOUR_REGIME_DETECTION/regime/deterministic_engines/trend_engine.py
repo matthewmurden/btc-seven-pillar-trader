@@ -1,59 +1,44 @@
 """
-Deterministic trend engine.
+Trend Engine
+Detects structural trend states using slope, efficiency, HH/HL structure,
+and HTF alignment from raw regime features.
 """
 
-from __future__ import annotations
-
-import numpy as np
 import pandas as pd
-
-from regime.deterministic_engines.engine_utils import sigmoid, zscore
-
+import numpy as np
 
 def apply_trend_engine(df: pd.DataFrame) -> pd.DataFrame:
-    required = [
-        "slope_5",
-        "lr_grad_fast",
-        "trend_strength",
-        "higher_high_score",
-        "higher_low_score",
-        "htf_trend_5m",
-        "htf_trend_15m",
-        "htf_trend_1h",
-    ]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing columns for trend engine: {missing}")
+    out = df.copy()
 
-    slope_norm = zscore(df["slope_5"].to_numpy(dtype=np.float64))
-    strength_norm = zscore(df["trend_strength"].to_numpy(dtype=np.float64))
-    htf_alignment = np.nanmean(
-        np.column_stack(
-            [
-                np.sign(df["htf_trend_5m"]),
-                np.sign(df["htf_trend_15m"]),
-                np.sign(df["htf_trend_1h"]),
-            ]
-        ),
-        axis=1,
+    # Trend strength: smoothed slope & ATR-adjusted slope
+    slope = out["trend_slope"]
+    efficiency = out["trend_strength"]
+    atr_adj = out["atr_adjusted_trend"]
+
+    # High Timeframe (HTF) alignment
+    htf_score = (
+        out["htf_trend_5m"]
+        + out["htf_trend_15m"]
+        + out["htf_trend_1h"]
+    ) / 3.0
+
+    # Structural trend components
+    hh_score = out["higher_high_score"]
+    hl_score = out["higher_low_score"]
+    structure_score = (hh_score + hl_score) / 2
+
+    # Trend strength score (0–1)
+    trend_score = (
+        0.4 * slope +
+        0.3 * efficiency +
+        0.2 * atr_adj +
+        0.1 * structure_score
     )
 
-    hh = df["higher_high_score"].to_numpy(dtype=np.float64)
-    hl = df["higher_low_score"].to_numpy(dtype=np.float64)
+    # Final trend flag
+    trend_flag = (trend_score > 0.6).astype(int)
 
-    score = sigmoid(
-        0.6 * slope_norm
-        + 0.6 * strength_norm
-        + 0.4 * ((hh + hl) / 2.0)
-        + 0.4 * htf_alignment
-    )
-    trend_flag = (score > 0.65).astype(np.float32)
+    out["trend_strength_score"] = trend_score.clip(0, 1)
+    out["trend_flag"] = trend_flag
 
-    out = pd.DataFrame(
-        {
-            "trend_strength_score": score.astype(np.float32),
-            "trend_flag": trend_flag,
-        },
-        index=df.index,
-    )
     return out

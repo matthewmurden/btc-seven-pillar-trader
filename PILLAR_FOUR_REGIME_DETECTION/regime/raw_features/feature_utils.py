@@ -1,217 +1,138 @@
 """
-High-level feature builders for raw regime detection.
+Utility functions for computing raw regime features:
+trend, volatility, liquidity, microstructure, and range context.
 """
 
 from __future__ import annotations
 
-import logging
-from typing import Tuple
-
 import numpy as np
 import pandas as pd
 
-from regime.rolling_metrics import (
-    rolling_chop_index,
-    rolling_entropy,
-    rolling_hurst_exponent,
-    rolling_lr_gradient,
-    rolling_range_compression,
+from .rolling_metrics import (
     rolling_slope,
-    rolling_variance,
-    rolling_volatility,
+    rolling_mean,
+    rolling_std,
+    rolling_zscore,
+    rolling_min,
+    rolling_max,
+    hurst_exponent,
 )
 
-logger = logging.getLogger(__name__)
+
+# -------------------------
+# Trend Measures
+# -------------------------
+
+def compute_trend_features(df: pd.DataFrame) -> pd.DataFrame:
+    close = df["close"]
+
+    df["slope_2"] = rolling_slope(close, 2)
+    df["slope_5"] = rolling_slope(close, 5)
+    df["slope_15"] = rolling_slope(close, 15)
+
+    df["lr_grad_fast"] = df["slope_5"] / (rolling_std(close, 20).replace(0, np.nan))
+
+    df["trend_strength"] = rolling_mean(df["slope_5"].abs(), 20)
+
+    # HTF alignment approximations
+    df["htf_trend_5m"] = rolling_mean(df["slope_5"], 5 * 5)
+    df["htf_trend_15m"] = rolling_mean(df["slope_5"], 15 * 5)
+    df["htf_trend_1h"] = rolling_mean(df["slope_5"], 60 * 5)
+
+    return df
 
 
-def _atr(df: pd.DataFrame, window: int = 14) -> pd.Series:
-    prev_close = df["close"].shift(1)
-    tr = pd.concat(
-        [
-            df["high"] - df["low"],
-            (df["high"] - prev_close).abs(),
-            (df["low"] - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    return tr.rolling(window, min_periods=1).mean()
+# -------------------------
+# Volatility Features
+# -------------------------
 
+def compute_volatility_features(df: pd.DataFrame) -> pd.DataFrame:
+    close = df["close"]
 
-def compute_impulse_correction(df: pd.DataFrame) -> pd.Series:
-    candle_range = (df["high"] - df["low"]).replace(0, np.nan)
-    impulse = (df["close"] - df["open"]).abs() / candle_range
-    return impulse.rolling(20, min_periods=1).mean().fillna(0)
+    df["realized_vol_1"] = rolling_std(close, 1)
+    df["realized_vol_5"] = rolling_std(close, 5)
+    df["realized_vol_15"] = rolling_std(close, 15)
+    df["realized_vol_30"] = rolling_std(close, 30)
 
-
-def compute_bos_choch_frequency(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
-    # Keep these as boolean for logical operations
-    higher_high = df["high"] > df["high"].shift(1)
-    higher_low = df["low"] > df["low"].shift(1)
-
-    # BOS occurs when both HH and HL are true
-    bos_signal = higher_high & higher_low
-
-    # Rolling BOS counts
-    bos_20 = bos_signal.rolling(20, min_periods=1).sum().astype(float)
-    bos_50 = bos_signal.rolling(50, min_periods=1).sum().astype(float)
-
-    return bos_20, bos_50
-
-def compute_vol_compression(df: pd.DataFrame) -> pd.Series:
-    rng = df["high"] - df["low"]
-    return rng / (rng.rolling(20, min_periods=1).mean() + 1e-12)
-
-
-def compute_vol_expansion(ret: pd.Series) -> pd.Series:
-    std20 = rolling_volatility(ret, 20)
-    return (std20 - std20.rolling(50, min_periods=1).mean()) / (
-        std20.rolling(50, min_periods=1).std(ddof=0) + 1e-12
+    df["var_ratio_5_20"] = df["realized_vol_5"] / (rolling_std(close, 20).replace(0, np.nan))
+    df["var_ratio_20_50"] = (
+        rolling_std(close, 20) / rolling_std(close, 50).replace(0, np.nan)
     )
 
+    df["vol_compression_score"] = rolling_zscore(df["realized_vol_5"], 50)
+    df["vol_expansion_score"] = rolling_zscore(df["realized_vol_1"], 20)
 
-def compute_liquidity_drought(volume: pd.Series) -> pd.Series:
-    return (volume < volume.rolling(50, min_periods=1).quantile(0.2)).astype(np.float32)
+    df["atr_percentile"] = rolling_zscore(df["realized_vol_15"], 200)
+    df["vol_clustering"] = rolling_zscore(df["realized_vol_5"], 30)
 
+    df["vol_breakout_flag"] = (df["realized_vol_1"] > df["realized_vol_15"] * 1.5).astype(int)
 
-def compute_noise_to_signal(df: pd.DataFrame) -> pd.Series:
-    return ((df["close"] - df["open"]).abs() / (df["high"] - df["low"]).replace(0, np.nan)).fillna(0)
-
-
-def compute_htf_alignment(df: pd.DataFrame) -> pd.DataFrame:
-    ts = df["timestamp"].astype("datetime64[ns]")
-    tmp = df.set_index(ts)
-    out = pd.DataFrame(index=df.index)
-    for freq, name in [("5T", "5m"), ("15T", "15m"), ("1H", "1h")]:
-        res = tmp["close"].resample(freq).last().ffill()
-        # slope window must be >= 2
-        out[f"htf_trend_{name}"] = rolling_slope(res, 10).reindex(tmp.index, method="ffill")
-    return out
+    return df
 
 
-def compute_sweep_flags(df: pd.DataFrame) -> pd.Series:
-    high = df["high"]
-    low = df["low"]
-    roll_high = high.rolling(20, min_periods=1).max()
-    roll_low = low.rolling(20, min_periods=1).min()
-    sweep_high = (high >= roll_high.shift(1)) & (df["close"] < df["open"])
-    sweep_low = (low <= roll_low.shift(1)) & (df["close"] > df["open"])
-    return (sweep_high | sweep_low).astype(np.float32)
+# -------------------------
+# Liquidity/Microstructure
+# -------------------------
+
+def compute_liquidity_features(df: pd.DataFrame) -> pd.DataFrame:
+    # Proxy features (pure OHLCV only)
+    vol = df["volume"]
+
+    df["delta_intensity"] = rolling_zscore(vol.diff().abs(), 20)
+    df["imbalance_persistence"] = rolling_mean(vol.diff(), 10)
+    df["cvd_slope"] = rolling_slope(vol.cumsum(), 20)
+
+    df["volume_expansion_5"] = rolling_mean(vol, 5)
+    df["volume_expansion_20"] = rolling_mean(vol, 20)
+
+    df["liquidity_drought_score"] = (vol < rolling_min(vol, 100)).astype(int)
+
+    return df
 
 
-def build_trend_features(df: pd.DataFrame) -> pd.DataFrame:
-    out = pd.DataFrame(index=df.index)
-    close = df["close"]
-    ret = close.pct_change().fillna(0)
-    atr14 = _atr(df, 14)
+# -------------------------
+# Microstructure Features
+# -------------------------
 
-    # FIX: slope_1 removed — slope needs >=2 window
-    out["slope_2"] = rolling_slope(close, 2).fillna(0)
-    out["slope_5"] = rolling_slope(close, 5)
-    out["slope_15"] = rolling_slope(close, 15)
+def compute_microstructure_features(df: pd.DataFrame) -> pd.DataFrame:
+    o, h, l, c = df["open"], df["high"], df["low"], df["close"]
 
-    out["lr_grad_fast"] = rolling_lr_gradient(close, 10)
-    out["trend_strength"] = out["slope_5"] / (rolling_volatility(ret, 20) + 1e-12)
-    out["atr_adjusted_trend"] = out["slope_5"] / (atr14 + 1e-12)
+    df["micro_trend_entropy"] = rolling_std((c - o).abs(), 20)
 
-    htf = compute_htf_alignment(df)
-    out = pd.concat([out, htf], axis=1)
+    df["bar_clustering_score"] = rolling_mean((c > o).astype(int).diff().abs(), 20)
 
-    out["impulse_correction_ratio"] = compute_impulse_correction(df)
-    out["higher_high_score"] = (df["high"] > df["high"].shift(1)).rolling(20, min_periods=1).mean()
-    out["higher_low_score"] = (df["low"] > df["low"].shift(1)).rolling(20, min_periods=1).mean()
+    df["chop_index"] = rolling_mean((c.diff().abs() < (h - l)).astype(int), 20)
 
-    bos20, bos50 = compute_bos_choch_frequency(df)
-    out["bos_count_20"] = bos20
-    out["bos_count_50"] = bos50
-    return out
+    df["upper_wick_body"] = (h - np.maximum(c, o)) / (h - l + 1e-9)
+    df["lower_wick_body"] = (np.minimum(c, o) - l) / (h - l + 1e-9)
+
+    df["noise_to_signal"] = rolling_std(c.diff(), 20) / (np.abs(rolling_mean(c.diff(), 20)) + 1e-9)
+
+    df["hurst_exponent"] = hurst_exponent(c)
+
+    return df
 
 
-def build_volatility_features(df: pd.DataFrame) -> pd.DataFrame:
-    out = pd.DataFrame(index=df.index)
-    ret = df["close"].pct_change().fillna(0)
+# -------------------------
+# Structure / Range Features
+# -------------------------
 
-    out["realized_vol_1"] = rolling_volatility(ret, 1)
-    out["realized_vol_5"] = rolling_volatility(ret, 5)
-    out["realized_vol_15"] = rolling_volatility(ret, 15)
-    out["realized_vol_30"] = rolling_volatility(ret, 30)
-
-    out["var_ratio_5_20"] = (rolling_variance(ret, 5) + 1e-12) / (rolling_variance(ret, 20) + 1e-12)
-    out["var_ratio_20_50"] = (rolling_variance(ret, 20) + 1e-12) / (rolling_variance(ret, 50) + 1e-12)
-
-    out["vol_compression_score"] = compute_vol_compression(df)
-    out["vol_expansion_score"] = compute_vol_expansion(ret)
-
-    atr = _atr(df, 14)
-    out["atr_percentile"] = rolling_entropy(atr, 200)
-    out["vol_clustering"] = rolling_chop_index(ret.pow(2), 20)
-    out["vol_breakout_flag"] = (out["atr_percentile"] > 0.9).astype(np.float32)
-
-    return out
-
-
-def build_liquidity_features(df: pd.DataFrame) -> pd.DataFrame:
-    out = pd.DataFrame(index=df.index)
-    volume = df["volume"].replace(0, np.nan)
-    delta = df.get("delta", pd.Series(0, index=df.index))
-
-    out["delta_intensity"] = (delta.abs() / volume).fillna(0)
-    out["imbalance_persistence"] = np.sign(delta).rolling(20, min_periods=1).sum()
-    cvd = delta.cumsum()
-
-    out["cvd_slope"] = rolling_slope(cvd, 20)
-    out["volume_expansion_5"] = volume / (volume.rolling(5, min_periods=1).mean() + 1e-12)
-    out["volume_expansion_20"] = volume / (volume.rolling(20, min_periods=1).mean() + 1e-12)
-    out["liquidity_drought_score"] = compute_liquidity_drought(volume)
-
-    return out
-
-
-def build_microstructure_features(df: pd.DataFrame) -> pd.DataFrame:
-    out = pd.DataFrame(index=df.index)
-    ret = df["close"] - df["close"].shift(1)
-
-    out["micro_trend_entropy"] = rolling_entropy(ret.fillna(0), 20)
-
-    direction = np.sign(ret.fillna(0))
-    out["bar_clustering_score"] = direction.rolling(20, min_periods=1).mean().abs()
-    out["chop_index"] = rolling_chop_index(direction, 20)
-
-    body = (df["close"] - df["open"]).replace(0, np.nan)
-    upper_wick = df["high"] - df[["open", "close"]].max(axis=1)
-    lower_wick = df[["open", "close"]].min(axis=1) - df["low"]
-
-    out["upper_wick_body"] = (upper_wick / body.abs()).fillna(0)
-    out["lower_wick_body"] = (lower_wick / body.abs()).fillna(0)
-    out["noise_to_signal"] = compute_noise_to_signal(df)
-    out["hurst_exponent"] = rolling_hurst_exponent(df["close"], 50)
-
-    return out
-
-
-def build_structure_range_features(df: pd.DataFrame) -> pd.DataFrame:
-    out = pd.DataFrame(index=df.index)
-
-    high = df["high"]
-    low = df["low"]
+def compute_range_features(df: pd.DataFrame) -> pd.DataFrame:
     close = df["close"]
 
-    atr = _atr(df, 14)
+    df["distance_to_last_swing_high"] = close - rolling_max(close, 20)
+    df["distance_to_last_swing_low"] = close - rolling_min(close, 20)
 
-    out["distance_to_last_swing_high"] = (close - high.rolling(20, min_periods=1).max()) / (atr + 1e-12)
-    out["distance_to_last_swing_low"] = (close - low.rolling(20, min_periods=1).min()) / (atr + 1e-12)
+    df["range_compression"] = rolling_zscore(hurst_exponent(close), 50)
 
-    out["range_compression"] = rolling_range_compression(high, low, 20)
+    df["htf_range_position"] = (close - rolling_min(close, 200)) / (
+        rolling_max(close, 200) - rolling_min(close, 200) + 1e-9
+    )
 
-    ts = df["timestamp"].astype("datetime64[ns]")
-    tmp = df.set_index(ts)
+    df["sweep_flags"] = (close < rolling_min(close, 50)).astype(int)
 
-    htf = tmp.resample("1H").agg({"high": "max", "low": "min", "close": "last"}).ffill()
-    htf_pos = (htf["close"] - htf["low"]) / ((htf["high"] - htf["low"]).replace(0, np.nan))
+    df["mean_reversion_distance"] = rolling_zscore(close.diff().abs(), 20)
 
-    out["htf_range_position"] = htf_pos.reindex(tmp.index, method="ffill").fillna(0)
-    out["sweep_flags"] = compute_sweep_flags(df)
+    df["range_tightness_score"] = rolling_std(close, 30)
 
-    out["mean_reversion_distance"] = close - close.rolling(20, min_periods=1).mean()
-    out["range_tightness_score"] = ((high - low).rolling(20, min_periods=1).mean()) / (atr + 1e-12)
-
-    return out
+    return df

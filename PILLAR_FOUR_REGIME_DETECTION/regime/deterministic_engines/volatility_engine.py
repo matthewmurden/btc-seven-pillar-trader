@@ -1,48 +1,41 @@
 """
-Deterministic volatility regime engine.
+Volatility Regime Engine
+Classifies compression → normal → expansion using multi-horizon vol curve.
 """
 
-from __future__ import annotations
-
-import numpy as np
 import pandas as pd
-
-from regime.deterministic_engines.engine_utils import sigmoid, zscore
-
+import numpy as np
 
 def apply_volatility_engine(df: pd.DataFrame) -> pd.DataFrame:
-    required = [
-        "realized_vol_5",
-        "realized_vol_15",
-        "realized_vol_30",
-        "atr_percentile",
-        "vol_compression_score",
-        "vol_expansion_score",
-    ]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing columns for volatility engine: {missing}")
+    out = df.copy()
 
-    vol_exp_norm = zscore(df["vol_expansion_score"].to_numpy(dtype=np.float64))
-    vol_comp_norm = zscore(df["vol_compression_score"].to_numpy(dtype=np.float64))
-    atr_pct = df["atr_percentile"].to_numpy(dtype=np.float64)
+    vol1 = out["realized_vol_1"]
+    vol5 = out["realized_vol_5"]
+    vol15 = out["realized_vol_15"]
+    vol30 = out["realized_vol_30"]
 
-    vol_score = sigmoid(
-        0.5 * vol_exp_norm
-        - 0.5 * vol_comp_norm
-        + atr_pct
+    compression = out["vol_compression_score"]
+    expansion = out["vol_expansion_score"]
+    atrp = out["atr_percentile"]
+
+    # Composite volatility level
+    base_vol = (vol1 + vol5 + vol15 + vol30) / 4
+
+    # Score: expansion > normal > compression
+    vol_score = (
+        0.4 * base_vol +
+        0.3 * expansion +
+        0.3 * atrp
     )
 
-    vol_regime = np.full(len(df), 1, dtype=np.int8)
-    comp_mask = (df["vol_compression_score"] > 1.5) & (df["atr_percentile"] < 0.3)
-    exp_mask = (df["vol_expansion_score"] > 1.0) | (df["atr_percentile"] > 0.7)
-    vol_regime = np.where(comp_mask, 0, vol_regime)
-    vol_regime = np.where(exp_mask, 2, vol_regime)
+    # Discrete volatility regime
+    # 0 = compression
+    # 1 = normal
+    # 2 = expansion
+    regime = np.where(expansion > 0.55, 2,
+                np.where(compression > 0.55, 0, 1))
 
-    return pd.DataFrame(
-        {
-            "volatility_regime_score": vol_score.astype(np.float32),
-            "volatility_regime": vol_regime.astype(np.int8),
-        },
-        index=df.index,
-    )
+    out["volatility_regime_score"] = vol_score.clip(0, 1)
+    out["volatility_regime"] = regime.astype(int)
+
+    return out

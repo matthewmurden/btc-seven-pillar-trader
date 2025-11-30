@@ -1,84 +1,124 @@
 """
-Compute raw regime features (Pillar 4, Part 1) with strict no-leakage.
+Pillar 4 — RAW REGIME FEATURE BUILDER
+=====================================
+
+This module constructs ALL raw regime features used by:
+- deterministic engines
+- ML classifier
+- regime fusion layer
+- stability/smoothing pipeline
+
+It is the SINGLE source of truth for raw features.
+No leakage. No forward-looking windows. All features computable in real time.
 """
 
 from __future__ import annotations
 
 import logging
 from pathlib import Path
-
-import numpy as np
 import pandas as pd
 
-from regime.raw_features.feature_utils import (
-    build_liquidity_features,
-    build_microstructure_features,
-    build_structure_range_features,
-    build_trend_features,
-    build_volatility_features,
+from .feature_utils import (
+    compute_trend_features,
+    compute_volatility_features,
+    compute_liquidity_features,
+    compute_microstructure_features,
+    compute_range_features,
 )
 
-
 logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-ENTRY_DATA_PATH = PROJECT_ROOT / "PILLAR_ONE_ENTRY_MODEL" / "data" / "processed" / "features_with_final_signal.parquet"
-OUTPUT_PATH = PROJECT_ROOT / "PILLAR_TWO_EXIT_MODEL" / "data" / "processed" / "raw_regime_features.parquet"
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+RAW_OUTPUT = PROJECT_ROOT / "PILLAR_FOUR_REGIME_DETECTION" / "data" / "processed" / "raw_regime_features.parquet"
 
 
-def _load_entry_data() -> pd.DataFrame:
-    if not ENTRY_DATA_PATH.exists():
-        raise FileNotFoundError(f"Entry data not found at {ENTRY_DATA_PATH}")
-    df = pd.read_parquet(ENTRY_DATA_PATH)
-    if "timestamp" not in df.columns:
-        raise ValueError("Input missing timestamp column.")
+# ---------------------------------------------------------
+# LOAD BASE OHLCV
+# ---------------------------------------------------------
+
+def _load_ohlcv() -> pd.DataFrame:
+    """
+    Replace this function if your OHLCV source changes.
+
+    Requirements:
+        - columns: ["timestamp", "open", "high", "low", "close", "volume"]
+        - indexed in chronological order
+    """
+
+    possible_paths = [
+        PROJECT_ROOT / "data" / "processed" / "ohlcv.parquet",
+        PROJECT_ROOT / "PILLAR_ONE_ENTRY_MODEL" / "data" / "processed" / "ohlcv.parquet",
+    ]
+
+    for p in possible_paths:
+        if p.exists():
+            df = pd.read_parquet(p)
+            logger.info(f"Loaded OHLCV from {p}")
+            return df
+
+    raise FileNotFoundError("Could not find OHLCV parquet in expected locations.")
+
+
+# ---------------------------------------------------------
+# MAIN FEATURE BUILDER
+# ---------------------------------------------------------
+
+def compute_raw_regime_features() -> pd.DataFrame:
+    """
+    Constructs the full raw regime feature matrix.
+
+    Output columns include:
+    - Trend features
+    - Volatility structure features
+    - Liquidity & orderflow proxies
+    - Microstructure features
+    - Range/contextual features
+    """
+
+    df = _load_ohlcv()
+
+    # Ensure chronological order
     df = df.sort_values("timestamp").reset_index(drop=True)
+
+    # Validate structure
+    required = ["timestamp", "open", "high", "low", "close", "volume"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"OHLCV missing required columns: {missing}")
+
+    logger.info("Computing trend features...")
+    df = compute_trend_features(df)
+
+    logger.info("Computing volatility features...")
+    df = compute_volatility_features(df)
+
+    logger.info("Computing liquidity features...")
+    df = compute_liquidity_features(df)
+
+    logger.info("Computing microstructure features...")
+    df = compute_microstructure_features(df)
+
+    logger.info("Computing range/context features...")
+    df = compute_range_features(df)
+
+    # Fill any NaNs caused by rolling windows
+    df = df.fillna(0.0)
+
+    # Ensure timestamp is the first column
+    cols = ["timestamp"] + [c for c in df.columns if c != "timestamp"]
+    df = df[cols]
+
+    logger.info(f"Final raw regime feature shape: {df.shape}")
+    df.to_parquet(RAW_OUTPUT, index=False)
+    logger.info(f"Saved raw regime features → {RAW_OUTPUT}")
+
     return df
 
 
-def compute_raw_regime_features() -> pd.DataFrame:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    logger.info("Loading entry data from %s", ENTRY_DATA_PATH)
-    base = _load_entry_data()
-
-    logger.info("Building trend features...")
-    trend = build_trend_features(base)
-    logger.info("Building volatility features...")
-    vol = build_volatility_features(base)
-    logger.info("Building liquidity features...")
-    liq = build_liquidity_features(base)
-    logger.info("Building microstructure features...")
-    micro = build_microstructure_features(base)
-    logger.info("Building structure & range features...")
-    struct = build_structure_range_features(base)
-
-    logger.info("Assembling raw regime feature set...")
-    out = pd.concat(
-        [
-            base[["timestamp"]].reset_index(drop=True),
-            trend.reset_index(drop=True),
-            vol.reset_index(drop=True),
-            liq.reset_index(drop=True),
-            micro.reset_index(drop=True),
-            struct.reset_index(drop=True),
-        ],
-        axis=1,
-    )
-
-    for idx, dtype in enumerate(out.dtypes):
-        if dtype.kind in ("i", "u", "f"):
-            arr = out.iloc[:, idx].to_numpy()
-            arr = np.where(np.isinf(arr), np.nan, arr)
-            arr = np.where(np.isnan(arr), 0.0, arr)
-            out.iloc[:, idx] = arr
-
-    out = out.replace([np.inf, -np.inf], 0.0).fillna(0.0)
-
-    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    out.to_parquet(OUTPUT_PATH, index=False)
-    logger.info("Saved raw regime features to %s", OUTPUT_PATH)
-    return out
-
+# ---------------------------------------------------------
+# CLI ENTRYPOINT
+# ---------------------------------------------------------
 
 if __name__ == "__main__":
     compute_raw_regime_features()

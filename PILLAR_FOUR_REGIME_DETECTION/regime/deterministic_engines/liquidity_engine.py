@@ -1,47 +1,34 @@
 """
-Deterministic liquidity engine.
+Liquidity Engine
+Detects liquidity drought/normal/expansion states using orderflow proxies.
 """
 
-from __future__ import annotations
-
-import numpy as np
 import pandas as pd
-
-from regime.deterministic_engines.engine_utils import sigmoid, zscore
-
+import numpy as np
 
 def apply_liquidity_engine(df: pd.DataFrame) -> pd.DataFrame:
-    required = [
-        "delta_intensity",
-        "imbalance_persistence",
-        "volume_expansion_5",
-        "volume_expansion_20",
-    ]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing columns for liquidity engine: {missing}")
+    out = df.copy()
 
-    delta_norm = zscore(df["delta_intensity"].to_numpy(dtype=np.float64))
-    imbalance_norm = zscore(df["imbalance_persistence"].to_numpy(dtype=np.float64))
-    ve5_norm = zscore(df["volume_expansion_5"].to_numpy(dtype=np.float64))
-    ve20_norm = zscore(df["volume_expansion_20"].to_numpy(dtype=np.float64))
+    delta = out["delta_intensity"]
+    imb = out["imbalance_persistence"]
+    cvd = out["cvd_slope"]
+    vol_exp = out["volume_expansion_20"]
 
-    liquidity_score = sigmoid(
-        -delta_norm
-        + imbalance_norm
-        + 0.5 * (ve5_norm + ve20_norm)
+    drought_score = (
+        0.4 * (1 - delta) +
+        0.3 * (1 - imb) +
+        0.2 * (1 - cvd) +
+        0.1 * (1 - vol_exp)
     )
 
-    regime = np.full(len(df), 1, dtype=np.int8)
-    drought = df["volume_expansion_20"] < 0.5
-    expansion = df["volume_expansion_20"] > 1.3
-    regime = np.where(drought, 0, regime)
-    regime = np.where(expansion, 2, regime)
+    # Liquidity regime
+    # 0 = drought
+    # 1 = normal
+    # 2 = expansion
+    regime = np.where(vol_exp > 0.6, 2,
+                np.where(drought_score > 0.6, 0, 1))
 
-    return pd.DataFrame(
-        {
-            "liquidity_score": liquidity_score.astype(np.float32),
-            "liquidity_regime": regime.astype(np.int8),
-        },
-        index=df.index,
-    )
+    out["liquidity_score"] = 1 - drought_score.clip(0, 1)
+    out["liquidity_regime"] = regime.astype(int)
+
+    return out
