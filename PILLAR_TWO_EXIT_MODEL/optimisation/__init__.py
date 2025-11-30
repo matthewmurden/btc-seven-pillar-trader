@@ -1,1 +1,0 @@
-"""Optimisation routines placeholder."""
