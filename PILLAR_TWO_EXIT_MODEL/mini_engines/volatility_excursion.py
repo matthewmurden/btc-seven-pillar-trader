@@ -2,82 +2,131 @@ import numpy as np
 import pandas as pd
 
 
+# ------------------------------------------------------------
+# Utility Functions
+# ------------------------------------------------------------
+
 def _sanitize(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan)
 
 
-def _min_max_norm(series: pd.Series) -> pd.Series:
-    finite = series.replace([np.inf, -np.inf], np.nan)
-    min_val = finite.min(skipna=True)
-    max_val = finite.max(skipna=True)
-    span = max_val - min_val
-    if span is None or pd.isna(span) or span == 0:
-        return pd.Series(np.zeros(len(series)), index=series.index)
-    return (finite - min_val) / span
+def _robust_norm(series: pd.Series) -> pd.Series:
+    """Median/IQR logistic scaling → stable across regimes."""
+    s = series.replace([np.inf, -np.inf], np.nan)
+    med = s.median(skipna=True)
+    iqr = s.quantile(0.75) - s.quantile(0.25)
+    if iqr is None or pd.isna(iqr) or iqr == 0:
+        return pd.Series(np.zeros(len(s)), index=s.index)
+    z = (s - med) / (iqr * 1.349)
+    return 1 / (1 + np.exp(-z))
 
+
+def _softmax(a, axis=-1):
+    exp_a = np.exp(a - np.max(a, axis=axis, keepdims=True))
+    return exp_a / exp_a.sum(axis=axis, keepdims=True)
+
+
+# ------------------------------------------------------------
+# Elite Volatility Excursion Engine (MFE Potential)
+# ------------------------------------------------------------
 
 def compute_volatility_excursion(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Estimate favourable move potential (MFE) using only current-bar volatility context.
+    Elite MFE extension estimator.
 
-    Inputs:
-        ATR_14, ATR_slope, realized_vol_5/15/30, volatility_compression_score,
-        spread, wick_ratio, volume_expansion_5 (optional).
-    Logic:
-        - Higher ATR_14 and positive ATR_slope increase score.
-        - Lower compression (vol20 / vol100) increases score.
-        - Higher realized volatility suggests room for extension.
-        - Positive curvature of realized vols (discrete second derivative) increases score.
-        - Higher volume expansion increases score.
-        - Moderate wick_ratio is preferred; extreme wicks reduce score.
-        - Spread contributes additively as an additional activity proxy.
+    Uses:
+        - multi-horizon realized volatility shape & curvature
+        - ATR level + ATR acceleration
+        - volatility compression acceleration
+        - volume–volatility synergy (breakout predictor)
+        - wick/single-bar structure (momentum health)
+        - regime-aware scoring (implicit through vol shape)
+
     Output:
-        Adds column `mfe_potential_score` in [0, 1], NaN-safe and clipped.
+        Adds:
+            mfe_potential_score ∈ [0, 1]
     """
+
     if "mfe_potential_score" in df.columns:
         raise ValueError("mfe_potential_score already exists; refusing to overwrite.")
 
-    working = df.copy()
+    w = df.copy()
 
-    atr_norm = _min_max_norm(_sanitize(working.get("ATR_14", pd.Series(index=working.index))))
-    slope = _sanitize(working.get("ATR_slope", pd.Series(index=working.index)))
-    slope_norm = 0.5 * (np.tanh(slope) + 1)
+    # -------------------------
+    # Core Vol Inputs
+    # -------------------------
+    atr = _sanitize(w.get("ATR_14", pd.Series(index=w.index))).fillna(0)
+    atr_slope = _sanitize(w.get("ATR_slope", pd.Series(index=w.index))).fillna(0)
 
-    comp = _min_max_norm(
-        _sanitize(working.get("volatility_compression_score", pd.Series(index=working.index)))
-    )
-    comp_inverted = 1 - comp
+    rv5 = _sanitize(w.get("realized_vol_5", pd.Series(index=w.index))).fillna(0)
+    rv15 = _sanitize(w.get("realized_vol_15", pd.Series(index=w.index))).fillna(0)
+    rv30 = _sanitize(w.get("realized_vol_30", pd.Series(index=w.index))).fillna(0)
 
-    vol5 = _sanitize(working.get("realized_vol_5", pd.Series(index=working.index)))
-    vol15 = _sanitize(working.get("realized_vol_15", pd.Series(index=working.index)))
-    vol30 = _sanitize(working.get("realized_vol_30", pd.Series(index=working.index)))
-    vol_mix = (vol5 + vol15 + vol30) / 3
-    vol_norm = _min_max_norm(vol_mix)
+    comp = _sanitize(w.get("volatility_compression_score", pd.Series(index=w.index))).fillna(0)
+    spread = _sanitize(w.get("spread", pd.Series(index=w.index))).fillna(0)
+    wick = _sanitize(w.get("wick_ratio", pd.Series(index=w.index))).fillna(0.5)
+    volume_exp = _sanitize(w.get("volume_expansion_5", pd.Series(index=w.index))).fillna(1.0)
 
-    # Discrete curvature approximation: second derivative of realized vols.
-    curvature = vol5 - 2 * vol15 + vol30
-    curvature_norm = _min_max_norm(curvature)
+    # -------------------------
+    # Volatility Shape & Curvature
+    # -------------------------
+    slope_1 = rv5 - rv15          # short-term vol acceleration
+    slope_2 = rv15 - rv30         # mid-term vol momentum
+    curvature = slope_1 - slope_2 # convexity = "ignition" signal
 
-    spread_norm = _min_max_norm(_sanitize(working.get("spread", pd.Series(index=working.index))))
+    # -------------------------
+    # Volatility acceleration signals
+    # -------------------------
+    atr_normalised = _robust_norm(atr)
+    atr_acc = 0.5 * (np.tanh(atr_slope) + 1)
 
-    volume_exp_norm = _min_max_norm(
-        _sanitize(working.get("volume_expansion_5", pd.Series(index=working.index)))
-    )
+    comp_inv = 1 - _robust_norm(comp)
+    comp_acc = comp_inv.diff().fillna(0)
+    comp_acc_norm = 0.5 * (np.tanh(comp_acc) + 1)
 
-    wick = _sanitize(working.get("wick_ratio", pd.Series(index=working.index)))
-    wick_penalty = 1 - (np.abs(wick - 0.5) / 0.5)
-    wick_penalty = wick_penalty.clip(0, 1).fillna(0.5)
+    # volume-volatility synergy
+    vov_synergy = _robust_norm(volume_exp * rv5)
 
-    score = (
-        0.25 * atr_norm
-        + 0.15 * slope_norm
-        + 0.15 * comp_inverted
-        + 0.10 * vol_norm
-        + 0.10 * spread_norm
-        + 0.10 * wick_penalty
-        + 0.10 * volume_exp_norm
-        + 0.05 * curvature_norm
-    )
+    # wick health (momentum)
+    wick_health = (1 - np.abs(wick - 0.5) / 0.5).clip(0, 1)
 
-    working["mfe_potential_score"] = score.clip(0, 1).fillna(0.0)
-    return working
+    # spread as activity proxy
+    spread_norm = _robust_norm(spread)
+
+    # normalize slopes and curvature
+    slope_norm = _robust_norm(slope_1 + 0.5 * slope_2)
+    curve_norm = _robust_norm(curvature)
+
+    # -------------------------
+    # Softmax large-move classifier
+    # -------------------------
+    # 0 = low extension
+    # 1 = medium extension
+    # 2 = high extension (true MFE potential)
+
+    logits = np.vstack([
+        # LOW MFE
+        -(slope_norm + curve_norm + vov_synergy)
+        + comp
+        + (1 - spread_norm),
+
+        # MEDIUM MFE
+        0.6 * atr_normalised
+        + 0.5 * slope_norm
+        + 0.5 * vov_synergy
+        + 0.4 * wick_health,
+
+        # HIGH MFE (extension)
+        1.3 * slope_norm
+        + 1.4 * curve_norm
+        + 1.2 * vov_synergy
+        + 0.7 * atr_acc
+        + 0.6 * comp_acc_norm
+        + 0.4 * spread_norm
+    ]).T
+
+    probs = _softmax(logits, axis=1)
+    high_prob = probs[:, 2]
+
+    w["mfe_potential_score"] = np.clip(high_prob, 0, 1)
+    return w

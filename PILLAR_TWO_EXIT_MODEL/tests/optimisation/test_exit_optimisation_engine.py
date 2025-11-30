@@ -9,6 +9,7 @@ BASE_DIR = Path(__file__).resolve().parents[2]
 sys.path.append(str(BASE_DIR))
 
 from optimisation.exit_optimisation_engine import _sl_grid, _tp_grid, optimise_exits  # noqa: E402
+from optimisation.decay_validity_filter import apply_decay_and_validity  # noqa: E402
 
 
 def synthetic_df(n: int = 6) -> pd.DataFrame:
@@ -26,8 +27,15 @@ def synthetic_df(n: int = 6) -> pd.DataFrame:
             "ATR_slope": rng.normal(0, 0.1, n),
             "volatility_score": rng.normal(0, 1, n),
             "path_entropy_score": rng.uniform(0, 1, n),
+            "mfe_potential_score": rng.uniform(0, 1, n),
+            "survival_confidence_filtered": rng.uniform(0.5, 1.0, n),
+            "decayed_mfe_potential": rng.uniform(0, 1, n),
+            "decayed_mae_risk": rng.uniform(0, 1, n),
+            "asymmetry_ratio_z": rng.normal(0, 1, n),
+            "reward_risk_z": rng.normal(0, 1, n),
+            "exit_direction_z": rng.normal(0, 1, n),
         }
-    )
+    ).assign(regime=lambda d: d["exit_regime"])
 
 
 def test_tp_grid_dynamic():
@@ -56,15 +64,14 @@ def test_expectancy_monotonicity():
     df.loc[1, "exit_direction_consistency"] = -1.0  # higher SL prob
     res = optimise_exits(df)
     assert res["recommended_tp_pct"].iloc[0] >= res["recommended_sl_pct"].iloc[0]
-    assert res["recommended_tp_pct"].iloc[1] >= 0.0  # still finite
+    assert res["recommended_tp_pct"].iloc[1] >= 0.0  # finite
 
 
-def test_vectorised_equals_loop_small():
-    df = synthetic_df(3)
-    res_vec = optimise_exits(df)
-    # NaN-free and positive
-    assert not res_vec.isna().any().any()
-    assert (res_vec[["recommended_tp_pct", "recommended_sl_pct"]] > 0).all().all()
+def test_vectorised_output_valid():
+    df = synthetic_df(4)
+    res = optimise_exits(df)
+    assert not res.isna().any().any()
+    assert (res[["recommended_tp_pct", "recommended_sl_pct"]] > 0).all().all()
 
 
 def test_edge_cases_atr_zero_and_exit_time_short():
@@ -82,6 +89,23 @@ def test_path_entropy_bounds():
     df.loc[1, "path_entropy_score"] = 1.0
     res = optimise_exits(df)
     assert (res["recommended_tp_pct"] > 0).all()
+
+
+def test_decay_filter_end_to_end():
+    df = synthetic_df(5)
+    filtered = apply_decay_and_validity(df)
+    assert not filtered.isna().any().any()
+    assert "meta_exit_strength" in filtered
+
+
+def test_optimisation_with_decayed_fields():
+    df = synthetic_df(3)
+    decayed = apply_decay_and_validity(df)
+    merged = pd.concat([df.reset_index(drop=True), decayed.reset_index(drop=True)], axis=1)
+    res = optimise_exits(merged)
+    assert not res.isna().any().any()
+    assert (res[["recommended_tp_pct", "recommended_sl_pct"]] > 0).all().all()
+    assert (res["expected_exit_time"] >= 0).all()
 
 
 def test_end_to_end_sanity():

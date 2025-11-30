@@ -119,6 +119,10 @@ def optimise_exits(df: pd.DataFrame) -> pd.DataFrame:
         exit_direction_consistency, survival_confidence, volatility_after_entry_pred,
         volatility_after_entry_z, mae_risk_score, ATR_14, expected_exit_time,
         exit_regime, ATR_slope, volatility_score, path_entropy_score
+    Optionally uses:
+        decayed_mfe_potential
+        decayed_mae_risk
+        survival_confidence_filtered
     """
     required = [
         "exit_direction_consistency",
@@ -138,6 +142,14 @@ def optimise_exits(df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(f"Missing required columns: {missing}")
 
     df = df.copy()
+
+    # Hook for decayed fields
+    if "decayed_mfe_potential" in df.columns:
+        df["volatility_after_entry_pred"] = df["decayed_mfe_potential"]
+    if "decayed_mae_risk" in df.columns:
+        df["mae_risk_score"] = df["decayed_mae_risk"]
+    if "survival_confidence_filtered" in df.columns:
+        df["survival_confidence"] = df["survival_confidence_filtered"]
 
     # Reconstruct probabilities from exit_direction_consistency
     exit_cons = df["exit_direction_consistency"].astype(float).to_numpy()

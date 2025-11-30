@@ -73,26 +73,62 @@ def _require_columns(df: pd.DataFrame, cols: list[str], context: str) -> None:
     if missing:
         raise ValueError(f"Missing columns in {context}: {missing}")
 
-
 def _load_model(path: Path):
-    """Load any model format: raw booster, sklearn model, or dict-wrapped model."""
+    """
+    Load models safely regardless of how they were saved:
+    - raw estimator (LightGBM, sklearn, XGBoost, etc)
+    - dict {"model": estimator, "feature_names": [...]}
+    - dict with no "model" key (fallback to treating dict as estimator)
+    """
+
     if not path.exists():
-        raise FileNotFoundError(f"Missing model file: {path}")
+        raise FileNotFoundError(f"Model file not found: {path}")
 
     obj = joblib.load(path)
 
-    # Case 1 — dict wrapper {"model": ..., "feature_names": [...]}
-    if isinstance(obj, dict):
-        model = obj.get("model", obj)   # fallback: entire dict IS the model
-        feats = obj.get("feature_names")
-        return model, feats
+    # ---------------------------------------------------------
+    # CASE 1 — raw estimator (most likely your case)
+    # ---------------------------------------------------------
+    if not isinstance(obj, dict):
+        model = obj
 
-    # Case 2 — sklearn/lightgbm model with attribute .feature_names
-    feats = getattr(obj, "feature_names", None)
+        # LightGBM sklearn wrapper
+        if hasattr(model, "feature_name_"):
+            return model, list(model.feature_name_)
 
-    # Case 3 — raw LightGBM booster (no .predict_proba, no .feature_names)
-    return obj, feats
+        # LightGBM Booster API
+        if hasattr(model, "feature_name"):
+            return model, list(model.feature_name)
 
+        # fallback
+        return model, None
+
+    # ---------------------------------------------------------
+    # CASE 2 — dict {"model": ..., "feature_names": [...]}
+    # ---------------------------------------------------------
+    if "model" in obj:
+        return obj["model"], obj.get("feature_names")
+
+    # ---------------------------------------------------------
+    # CASE 3 — dict WITHOUT "model"
+    # Treat dict as the model itself (rare but safe)
+    # ---------------------------------------------------------
+    model = obj
+
+    # Try to extract features
+    feats = (
+        obj.get("feature_names")
+        if isinstance(obj.get("feature_names"), list)
+        else None
+    )
+
+    # LightGBM boosters may be inside dict
+    if hasattr(model, "feature_name_"):
+        feats = list(model.feature_name_)
+    elif hasattr(model, "feature_name"):
+        feats = list(model.feature_name)
+
+    return model, feats
 
 def _prepare_features(df: pd.DataFrame, feature_names: list[str]) -> pd.DataFrame:
     _require_columns(df, feature_names, "model input feature schema")
@@ -191,6 +227,7 @@ def apply_meta_features(
         model, feats = models[key]
         feats = feats or feature_schema
         return _predict_proba(model, _prepare_features(df, feats))
+        
 
     # Regression outputs
     mae_pred = _pred("mae")
@@ -213,26 +250,22 @@ def apply_meta_features(
     exit_direction_consistency = tp_proba - sl_proba
     expected_exit_time = np.maximum(exit_time_pred, 0)
 
-    def _zscore(x: np.ndarray) -> np.ndarray:
-        mean = np.mean(x)
-        std = np.std(x) + 1e-12
-        return (x - mean) / std
-
     meta = pd.DataFrame(
-        {
-            "asymmetry_ratio": asymmetry_ratio,
-            "reward_risk_prediction": reward_risk_prediction,
-            "survival_confidence": survival_conf,
-            "volatility_after_entry_pred": volatility_after_entry_pred,
-            "exit_direction_consistency": exit_direction_consistency,
-            "expected_exit_time": expected_exit_time,
-            "asymmetry_z": _zscore(asymmetry_ratio),
-            "reward_risk_z": _zscore(reward_risk_prediction),
-            "exit_direction_z": _zscore(exit_direction_consistency),
-            "volatility_after_entry_z": _zscore(volatility_after_entry_pred),
-        },
-        index=df.index,
+    {
+        "asymmetry_ratio": asymmetry_ratio,
+        "reward_risk_prediction": reward_risk_prediction,
+        "survival_confidence": survival_conf,
+        "volatility_after_entry_pred": volatility_after_entry_pred,
+        "exit_direction_consistency": exit_direction_consistency,
+        "expected_exit_time": expected_exit_time,
+    },
+    index=df.index,
     )
+
+    # Add z-scores for decay filter
+    meta["asymmetry_ratio_z"] = (meta["asymmetry_ratio"] - meta["asymmetry_ratio"].mean()) / (meta["asymmetry_ratio"].std() + 1e-12)
+    meta["reward_risk_z"] = (meta["reward_risk_prediction"] - meta["reward_risk_prediction"].mean()) / (meta["reward_risk_prediction"].std() + 1e-12)
+    meta["exit_direction_z"] = (meta["exit_direction_consistency"] - meta["exit_direction_consistency"].mean()) / (meta["exit_direction_consistency"].std() + 1e-12)
 
     # Validate + save
     meta = _clip_and_validate(meta).astype(np.float32)
