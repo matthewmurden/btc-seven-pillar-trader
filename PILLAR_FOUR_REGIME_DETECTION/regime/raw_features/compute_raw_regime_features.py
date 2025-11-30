@@ -21,9 +21,9 @@ from regime.raw_features.feature_utils import (
 
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ENTRY_DATA_PATH = PROJECT_ROOT / "PILLAR_ONE_ENTRY_MODEL" / "data" / "processed" / "features_with_final_signal.parquet"
-OUTPUT_PATH = PROJECT_ROOT / "PILLAR_FOUR_REGIME_DETECTION" / "data" / "processed" / "raw_regime_features.parquet"
+OUTPUT_PATH = PROJECT_ROOT / "PILLAR_TWO_EXIT_MODEL" / "data" / "processed" / "raw_regime_features.parquet"
 
 
 def _load_entry_data() -> pd.DataFrame:
@@ -65,7 +65,6 @@ def compute_raw_regime_features() -> pd.DataFrame:
         axis=1,
     )
 
-    # Clean infinities and NaNs
     for idx, dtype in enumerate(out.dtypes):
         if dtype.kind in ("i", "u", "f"):
             arr = out.iloc[:, idx].to_numpy()
