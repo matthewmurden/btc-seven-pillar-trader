@@ -15,6 +15,7 @@ def load_entry_signals_for_test(test_len: int) -> pd.DataFrame:
     This uses a simple positional alignment for the backtest.
     """
     candidates = [
+        PROJECT_ROOT.parent / "PILLAR_ONE_ENTRY_MODEL" / "data" / "processed" / "pillar1_outputs.parquet",
         PROJECT_ROOT.parent / "PILLAR_ONE_ENTRY_MODEL" / "data" / "processed" / "features_with_entry_probability.parquet",
         PROJECT_ROOT.parent / "PILLAR_ONE_ENTRY_MODEL" / "data" / "processed" / "features_with_final_signal.parquet",
     ]

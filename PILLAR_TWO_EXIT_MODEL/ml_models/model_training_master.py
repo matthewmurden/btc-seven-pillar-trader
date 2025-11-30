@@ -18,8 +18,9 @@ if str(PROJECT_ROOT) not in sys.path:
 
 DATA_DIR = PROJECT_ROOT / "data" / "processed"
 FEATURES_CANDIDATES = [
+    DATA_DIR / "exit_training_aligned.parquet",
+    DATA_DIR / "features_with_labels_and_pillar1.parquet",
     DATA_DIR / "exit_training.parquet",
-    DATA_DIR / "features_part3_with_labels.parquet",
 ]
 TRAIN_PATH = DATA_DIR / "exit_train.parquet"
 TEST_PATH = DATA_DIR / "exit_test.parquet"
@@ -95,6 +96,10 @@ class ModelTrainingMaster:
 
     def train_all(self) -> None:
         df = _load_features()
+        if df.isna().any().any():
+            raise ValueError("Training data contains NaNs")
+        if len(df) < 5000:
+            print("Warning: training data has fewer than 5000 samples; results may be unstable.")
         train_df, _ = _split_train_test(df)
         feat_cols = _get_feature_columns(train_df)
         X_train = train_df[feat_cols].fillna(0)

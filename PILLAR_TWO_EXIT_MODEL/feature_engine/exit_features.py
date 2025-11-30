@@ -70,7 +70,11 @@ class ExitFeatureEngine:
         for path in self.entry_features_path_candidates:
             if path.exists():
                 entry_df = pd.read_parquet(path)
-                # align by index position
+                if "timestamp" in entry_df.columns:
+                    entry_df["timestamp"] = pd.to_datetime(entry_df["timestamp"])
+                    entry_df = entry_df.drop_duplicates(subset=["timestamp"], keep="last").sort_values("timestamp")
+                    df = df.merge(entry_df, on="timestamp", how="left", suffixes=("", "_p1"))
+                # align by index position as fallback
                 cols = [
                     "momentum_score",
                     "trend_score",
@@ -83,13 +87,22 @@ class ExitFeatureEngine:
                     "raw_entry_confidence",
                 ]
                 for c in cols:
-                    if c in entry_df.columns:
+                    if c in df.columns and c + "_p1" in df.columns:
+                        df[c] = df[c].fillna(df[c + "_p1"])
+                    elif c + "_p1" in df.columns:
+                        df[c] = df[c + "_p1"]
+                    elif c in entry_df.columns and c not in df.columns:
                         df[c] = entry_df[c].values[: len(df)]
+                drop_cols = [c for c in df.columns if c.endswith("_p1")]
+                if drop_cols:
+                    df = df.drop(columns=drop_cols)
                 break
         return df
 
     def transform(self, df: pd.DataFrame) -> pd.DataFrame:
         out = df.copy()
+        if "timestamp" in out.columns:
+            out["timestamp"] = pd.to_datetime(out["timestamp"])
 
         # Price & Market State
         out["feature_exit_hl2"] = (out["high"] + out["low"]) / 2
@@ -181,5 +194,13 @@ class ExitFeatureEngine:
 
         # Carry-over from Pillar 1
         out = self._attach_entry_features(out)
+
+        # Fill scalar NaNs (excluding object/array columns)
+        for col in out.columns:
+            if col == "next_1_to_300_returns":
+                continue
+            if out[col].dtype.kind in ("O", "S", "U"):
+                continue
+            out[col] = out[col].ffill().bfill()
 
         return out

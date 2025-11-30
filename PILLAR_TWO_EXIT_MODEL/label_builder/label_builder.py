@@ -213,5 +213,6 @@ def build_and_save_labels(
     label_cols += [c for c in labels_df.columns if c.startswith("volatility_curve_")]
     # Path series (object arrays) retained for testing
     label_cols.append("next_1_to_300_returns")
+    label_cols = ["timestamp"] + label_cols
     labels_df[label_cols].to_parquet(output_path)
     return output_path

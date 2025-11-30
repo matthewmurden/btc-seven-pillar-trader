@@ -1,4 +1,4 @@
-"""Merge features and labels into a single training parquet."""
+"""Merge features and labels into a single training parquet with timestamp alignment."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from utils.timestamp_utils import normalise_timestamp
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 FEATURES_PATH = BASE_DIR / "data" / "processed" / "features_part3.parquet"
@@ -19,10 +20,11 @@ def merge_features_and_labels() -> Path:
     if not LABELS_PATH.exists():
         raise FileNotFoundError(f"Labels file missing at {LABELS_PATH}")
 
-    features = pd.read_parquet(FEATURES_PATH)
-    labels = pd.read_parquet(LABELS_PATH)
+    features = normalise_timestamp(pd.read_parquet(FEATURES_PATH))
+    labels = normalise_timestamp(pd.read_parquet(LABELS_PATH))
 
-    merged = features.join(labels, how="inner")
+    merged = features.merge(labels, on="timestamp", how="inner")
+    merged = merged.sort_values("timestamp").reset_index(drop=True)
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     merged.to_parquet(OUTPUT_PATH)
     print(f"Merged dataset saved: {OUTPUT_PATH.name}")
