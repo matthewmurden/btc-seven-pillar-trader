@@ -1,29 +1,38 @@
-# ============================================
-# liquidity_engine.py
-# ============================================
+"""
+liquidity_engine.py
+Detects liquidity drought/expansion via volume intensity.
+"""
+
+from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from .engine_utils import pct_rank
+
+from .engine_utils import get_series, normalize
 
 
 def compute_liquidity_engine(df: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(index=df.index)
 
-    vol = df["volume"]
-    orderflow = df["orderflow_score"]
-    delta_int = df["delta_intensity"]
+    volume = None
+    for col in ("volume", "vol"):
+        if col in df.columns:
+            volume = df[col].astype(float)
+            break
+    if volume is None:
+        volume = pd.Series(0.0, index=df.index)
 
-    # Reliably identifies thin markets in your dataset
-    out["liquidity_score"] = (
-        -0.4 * pct_rank(vol) +
-        -0.4 * pct_rank(orderflow) +
-        -0.2 * pct_rank(delta_int)
-    ).fillna(0)
+    delta_intensity = get_series(df, "delta_intensity", default=0.0012)
 
-    reg = np.full(len(df), 1, dtype=np.int8)  # normal
-    reg[(vol < vol.quantile(0.25)) & (orderflow < -0.4)] = 0  # drought
-    reg[(vol > vol.quantile(0.75)) & (delta_int > 0.6)] = 2  # expansion (optional)
+    rolling_vol_mean = volume.rolling(window=20, min_periods=10).mean().fillna(volume.mean())
+    volume_expansion_ratio = (volume / rolling_vol_mean).replace([np.inf, -np.inf], np.nan).fillna(1.0)
 
-    out["liquidity_regime"] = reg
+    regime = np.full(len(df), 0, dtype=np.int8)  # 0 = normal
+    regime = np.where(volume < rolling_vol_mean * 0.6, 1, regime)  # drought
+    regime = np.where(volume > rolling_vol_mean * 1.3, 2, regime)  # expansion
+
+    liquidity_score = normalize(volume_expansion_ratio - 1.0).clip(-1, 1).fillna(0.0)
+
+    out["liquidity_regime"] = pd.Series(regime, index=df.index, dtype=int)
+    out["liquidity_score"] = liquidity_score
     return out
