@@ -78,12 +78,36 @@ def run_smoothing_ml():
     if "ml_confidence" not in df.columns:
         raise ValueError("regime_labels_fused.parquet must include ml_confidence column.")
 
-    df["regime_label"] = smooth_labels_ml(
-        df["regime_label"].values,
-        df["ml_confidence"].values
-    )
+    prev_labels = df["regime_label"].values
+    smoothed_labels = smooth_labels_ml(prev_labels, df["ml_confidence"].values)
+
+    # Build minimal output schema
+    out_df = pd.DataFrame({
+        "timestamp": df["timestamp"].values,
+        "regime_label": smoothed_labels,
+        "regime_label_prev": prev_labels,
+        "smoothing_mode": ["hysteresis"] * len(df),  # current logic is hysteresis-based
+        "hold_length": _compute_hold_lengths(smoothed_labels),
+    })
 
     out = DATA_DIR / "regime_labels_stable_ml.parquet"
-    df.to_parquet(out, index=False)
+    out_df.to_parquet(out, index=False)
 
     print(f"[Part 5B] Saved ML-smoothed regimes → {out}")
+
+
+def _compute_hold_lengths(labels: np.ndarray) -> np.ndarray:
+    holds = np.zeros(len(labels), dtype=int)
+    if len(labels) == 0:
+        return holds
+    holds[0] = 1
+    for i in range(1, len(labels)):
+        if labels[i] == labels[i - 1]:
+            holds[i] = holds[i - 1] + 1
+        else:
+            holds[i] = 1
+    return holds
+
+
+if __name__ == "__main__":
+    run_smoothing_ml()
