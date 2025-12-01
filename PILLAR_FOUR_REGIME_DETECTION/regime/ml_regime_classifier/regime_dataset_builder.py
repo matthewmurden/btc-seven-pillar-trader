@@ -123,6 +123,13 @@ def build_regime_dataset(include_labels: bool = True):
     logging.info("Loading deterministic engine outputs…")
     det = _load_deterministic()
 
+    # Avoid column collisions (e.g., volatility_score) by dropping overlapping non-key cols in det;
+    # keep the raw version for consistency and to prevent _x/_y suffixes.
+    overlap = [c for c in det.columns if c != "timestamp" and c in raw.columns]
+    if overlap:
+        logging.info("Dropping overlapping deterministic cols to avoid suffixes: %s", overlap)
+        det = det.drop(columns=overlap)
+
     logging.info("Extracting Pillar-1 high-level signals…")
     p1 = _load_pillar1()
 
@@ -138,6 +145,19 @@ def build_regime_dataset(include_labels: bool = True):
     # ------------------------------------------------------------------
     raw_features = [c for c in raw.columns if c != "timestamp"]
     all_features = raw_features + DETERMINISTIC_COLUMNS + PILLAR1_COLUMNS
+
+    # De-duplicate feature names while preserving order (LightGBM/XGBoost dislike dup names)
+    deduped = []
+    seen = set()
+    for c in all_features:
+        if c in seen:
+            continue
+        seen.add(c)
+        deduped.append(c)
+    if len(deduped) != len(all_features):
+        logging.info("Removed duplicate feature names; final feature count: %d (was %d)",
+                     len(deduped), len(all_features))
+    all_features = deduped
 
     # Safety check
     missing = [c for c in all_features if c not in merged.columns]

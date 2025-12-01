@@ -60,16 +60,23 @@ def train_and_save():
         n_estimators=400,
         max_depth=8
     )
-    xgb.fit(X, y)
+    
+    # ---- FIX FOR XGBOOST CLASS LABELS ----
+    import numpy as np
+
+    # Map regime 7 → 6 for XGBoost (required for contiguous labels 0..K-1)
+    y_xgb = np.where(y == 7, 6, y)
+
+    xgb.fit(X, y_xgb)
     save_model(xgb, "xgboost_regime.pkl")
 
     pred_x = xgb.predict(X)
     prob_x = xgb.predict_proba(X)
 
     logging.info("XGBoost:")
-    logging.info("Accuracy %.5f", accuracy_score(y, pred_x))
-    logging.info("LogLoss %.5f", log_loss(y, prob_x))
-    logging.info("Confusion: %s", confusion_matrix(y, pred_x).tolist())
+    logging.info("Accuracy %.5f", accuracy_score(y_xgb, pred_x))
+    logging.info("LogLoss %.5f", log_loss(y_xgb, prob_x))
+    logging.info("Confusion: %s", confusion_matrix(y_xgb, pred_x).tolist())
 
     # ======================================================
     # Metadata
