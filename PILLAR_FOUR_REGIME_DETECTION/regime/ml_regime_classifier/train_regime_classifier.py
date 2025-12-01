@@ -1,19 +1,21 @@
-"""
-Train LightGBM + XGBoost regime classifiers.
-Ensures consistent feature ordering and strict reproducibility.
-"""
+# ======================================================
+# train_regime_classifier.py (Pillar 4, Part 3)
+# ======================================================
 
 from __future__ import annotations
 import logging
-import pickle
 from pathlib import Path
+
 import numpy as np
+from sklearn.metrics import accuracy_score, classification_report, log_loss, confusion_matrix
+from lightgbm import LGBMClassifier
+from xgboost import XGBClassifier
 
 from .regime_dataset_builder import build_regime_dataset
-from .model_utils import train_lgbm, train_xgb, eval_model
+from .model_utils import save_model, save_feature_list, save_metadata
 
-MODEL_DIR = Path(__file__).resolve().parents[1] / "models"
-MODEL_DIR.mkdir(parents=True, exist_ok=True)
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+OUT_PATH = PROJECT_ROOT / "PILLAR_FOUR_REGIME_DETECTION" / "data" / "processed"
 
 
 def train_and_save():
@@ -21,34 +23,65 @@ def train_and_save():
 
     df, features, labels = build_regime_dataset(include_labels=True)
 
-    X = df[features].to_numpy(dtype=np.float32)
-    y = labels.astype(np.int8)
+    X = df[features].astype(float)
+    y = labels
+    num_classes = int(y.max()) + 1
 
-    # Train LGBM
-    lgbm = train_lgbm(X, y)
-    lgbm_metrics = eval_model(lgbm, X, y)
+    # ======================================================
+    # LightGBM
+    # ======================================================
+    lgb = LGBMClassifier(
+        n_estimators=400,
+        learning_rate=0.03,
+        num_leaves=96,
+        objective="multiclass",
+        num_class=num_classes
+    )
+    lgb.fit(X, y)
+    save_model(lgb, "lgbm_regime.pkl")
 
-    # Train XGB
-    xgb = train_xgb(X, y)
-    xgb_metrics = eval_model(xgb, X, y)
+    pred_l = lgb.predict(X)
+    prob_l = lgb.predict_proba(X)
 
-    # Save models
-    with open(MODEL_DIR / "lgbm_regime_model.pkl", "wb") as f:
-        pickle.dump(lgbm, f)
-    with open(MODEL_DIR / "xgboost_regime_model.pkl", "wb") as f:
-        pickle.dump(xgb, f)
-    with open(MODEL_DIR / "feature_list.pkl", "wb") as f:
-        pickle.dump(features, f)
+    logging.info("LightGBM:")
+    logging.info("Accuracy %.5f", accuracy_score(y, pred_l))
+    logging.info("LogLoss %.5f", log_loss(y, prob_l))
+    logging.info("Confusion: %s", confusion_matrix(y, pred_l).tolist())
+    logging.info("Report: %s", classification_report(y, pred_l))
 
-    # Save config
-    with open(MODEL_DIR / "model_config.json", "w") as f:
-        import json
-        json.dump({
-            "model": "regime_classifier",
-            "features_sha256": "placeholder",
-            "feature_count": len(features),
-            "lgbm_metrics": lgbm_metrics,
-            "xgb_metrics": xgb_metrics
-        }, f, indent=4)
+    # ======================================================
+    # XGBoost
+    # ======================================================
+    xgb = XGBClassifier(
+        objective="multi:softprob",
+        num_class=num_classes,
+        tree_method="hist",
+        learning_rate=0.03,
+        n_estimators=400,
+        max_depth=8
+    )
+    xgb.fit(X, y)
+    save_model(xgb, "xgboost_regime.pkl")
 
-    logging.info("Saved regime classifier models + config.")
+    pred_x = xgb.predict(X)
+    prob_x = xgb.predict_proba(X)
+
+    logging.info("XGBoost:")
+    logging.info("Accuracy %.5f", accuracy_score(y, pred_x))
+    logging.info("LogLoss %.5f", log_loss(y, prob_x))
+    logging.info("Confusion: %s", confusion_matrix(y, pred_x).tolist())
+
+    # ======================================================
+    # Metadata
+    # ======================================================
+    save_feature_list(features)
+    save_metadata({
+        "num_classes": num_classes,
+        "feature_count": len(features)
+    })
+
+    logging.info("Saved both models + metadata.")
+
+
+if __name__ == "__main__":
+    train_and_save()

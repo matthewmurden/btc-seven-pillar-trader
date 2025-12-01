@@ -1,28 +1,30 @@
-"""
-Mean Reversion Engine
-Detects pullback → reversion conditions using sweep flags,
-bias distance, and reversion intensity.
-"""
+# ============================================
+# mean_reversion_engine.py
+# ============================================
 
-import pandas as pd
 import numpy as np
+import pandas as pd
+from .engine_utils import pct_rank
 
-def apply_mean_reversion_engine(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
 
-    sweeps = out["sweep_flags"]
-    dist = out["mean_reversion_distance"]
-    tight = out["range_tightness_score"]
+def compute_mean_reversion_engine(df: pd.DataFrame) -> pd.DataFrame:
+    out = pd.DataFrame(index=df.index)
 
-    mr_score = (
-        0.5 * sweeps +
-        0.3 * dist +
-        0.2 * tight
-    )
+    rev = df["reversion_score"]
+    dist = df["mean_reversion_distance"]
+    sweep = df["sweep_signal"]
 
-    mr_flag = (mr_score > 0.55).astype(int)
+    # Score
+    out["mean_reversion_score"] = (
+        0.5 * pct_rank(rev) +
+        0.3 * pct_rank(dist) +
+        0.2 * sweep
+    ).fillna(0)
 
-    out["mean_reversion_score"] = mr_score.clip(0, 1)
-    out["mean_reversion_flag"] = mr_flag
+    out["mean_reversion_flag"] = (
+        (rev > 0.45) &
+        (dist > dist.quantile(0.75)) &
+        (sweep == 1)
+    ).astype(int)
 
     return out

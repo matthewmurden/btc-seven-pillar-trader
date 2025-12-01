@@ -1,46 +1,48 @@
-"""
-Apply trained regime classifier models to new data.
-"""
+# ======================================================
+# apply_regime_classifier.py
+# ======================================================
 
 from __future__ import annotations
-import pickle
+import logging
 import numpy as np
 import pandas as pd
 from pathlib import Path
+
+from .model_utils import load_model, load_feature_list
 from .regime_dataset_builder import build_regime_dataset
 
-MODEL_DIR = Path(__file__).resolve().parents[1] / "models"
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+OUT_FILE = PROJECT_ROOT / "PILLAR_FOUR_REGIME_DETECTION/data/processed/regime_ml_predictions.parquet"
 
 
-def apply_regime_classifier():
+def apply_models():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
     df, features, _ = build_regime_dataset(include_labels=False)
+    X = df[features].astype(float)
 
-    X = df[features].to_numpy(dtype=np.float32)
+    # Load models + feature list
+    saved_features = load_feature_list()
+    if saved_features != features:
+        raise ValueError("Feature mismatch between training & inference!")
 
-    with open(MODEL_DIR / "lgbm_regime_model.pkl", "rb") as f:
-        lgbm = pickle.load(f)
-    with open(MODEL_DIR / "xgboost_regime_model.pkl", "rb") as f:
-        xgb = pickle.load(f)
-    with open(MODEL_DIR / "feature_list.pkl", "rb") as f:
-        saved_features = pickle.load(f)
+    lgb = load_model("lgbm_regime.pkl")
+    xgb = load_model("xgboost_regime.pkl")
 
-    if features != saved_features:
-        raise ValueError("Feature mismatch between training and inference!")
+    # Predict
+    prob_l = lgb.predict_proba(X)
+    prob_x = xgb.predict_proba(X)
 
-    p_lgbm = lgbm.predict_proba(X)
-    p_xgb = xgb.predict_proba(X)
+    # Average ensemble
+    probs = (prob_l + prob_x) / 2
+    labels = probs.argmax(axis=1)
+    confidence = probs.max(axis=1)
 
-    final_probs = (p_lgbm + p_xgb) / 2
-    preds = np.argmax(final_probs, axis=1)
+    out = df[["timestamp"]].copy()
+    out["regime_pred"] = labels
+    out["regime_confidence"] = confidence
+    for i in range(probs.shape[1]):
+        out[f"prob_{i}"] = probs[:, i]
 
-    out = pd.DataFrame({
-        "timestamp": df["timestamp"],
-        "regime_pred": preds,
-        "confidence": final_probs.max(axis=1),
-    })
-
-    # Save
-    out_path = MODEL_DIR.parents[2] / "data/processed/regime_ml_predictions.parquet"
-    out.to_parquet(out_path, index=False)
-
-    return out
+    out.to_parquet(OUT_FILE, index=False)
+    logging.info("Saved ML regime predictions: %s", OUT_FILE)

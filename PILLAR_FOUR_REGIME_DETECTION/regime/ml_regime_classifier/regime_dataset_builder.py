@@ -1,127 +1,166 @@
 """
-Single source of truth for regime ML dataset creation.
-Ensures identical feature ordering for training/inference,
-strict de-duplication, timestamp enforcement, and deterministic labels.
+Build the combined feature dataset for ML regime classifier (Part 3).
+
+This merges:
+- Raw regime features (Part 1)
+- Deterministic engines (Part 2)
+- Pillar-1 high-level signals (trend, chop, volatility)
+- Supplied regime labels (NO autolabelling)
+
+Inputs:
+    raw_regime_features.parquet
+    deterministic_regime_engines.parquet
+    PILLAR_ONE_ENTRY_MODEL/DATA/PROCESSED/features_with_final_signal.parquet
+    regime_labels.parquet
+
+Outputs:
+    merged dataframe
+    feature_list
+    labels vector
 """
 
 from __future__ import annotations
 import logging
-from hashlib import sha256
 from pathlib import Path
-from typing import List, Tuple
-import numpy as np
 import pandas as pd
+import numpy as np
 
-logger = logging.getLogger(__name__)
+# ---------------------------------------------------------------------
+# Resolve project roots
+# ---------------------------------------------------------------------
+THIS_FILE = Path(__file__).resolve()
+P4_ROOT = THIS_FILE.parents[2]              # PILLAR_FOUR_REGIME_DETECTION/
+P4_DATA = P4_ROOT / "data" / "processed"
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-
-RAW_PATH = PROJECT_ROOT / "PILLAR_FOUR_REGIME_DETECTION/data/processed/raw_regime_features.parquet"
-DET_PATH = PROJECT_ROOT / "PILLAR_FOUR_REGIME_DETECTION/data/processed/deterministic_regime_engines.parquet"
-ENTRY_PATH = PROJECT_ROOT / "PILLAR_ONE_ENTRY_MODEL/data/processed/features_with_final_signal.parquet"
+P1_ROOT = P4_ROOT.parents[0] / "PILLAR_ONE_ENTRY_MODEL"
+P1_DATA = P1_ROOT / "DATA" / "PROCESSED"
 
 
-def _load(path: Path, required: List[str] | None = None) -> pd.DataFrame:
-    if not path.exists():
-        raise FileNotFoundError(f"Missing dataset: {path}")
+# ---------------------------------------------------------------------
+# Deterministic engine columns (Part 2)
+# ---------------------------------------------------------------------
+DETERMINISTIC_COLUMNS = [
+    "trend_strength_score",
+    "trend_flag",
+
+    "chop_strength_score",
+    "chop_flag",
+
+    "volatility_regime",
+    "volatility_score",
+
+    "liquidity_regime",
+    "liquidity_score",
+
+    "mean_reversion_flag",
+    "mean_reversion_score",
+]
+
+
+# ---------------------------------------------------------------------
+# Pillar-1 signal columns (computed here)
+# ---------------------------------------------------------------------
+PILLAR1_COLUMNS = [
+    "pillar1_trend_score",
+    "pillar1_chop_score",
+    "pillar1_volatility_score",
+]
+
+
+# ---------------------------------------------------------------------
+# Load helpers
+# ---------------------------------------------------------------------
+def _load_raw_features() -> pd.DataFrame:
+    path = P4_DATA / "raw_regime_features.parquet"
+    return pd.read_parquet(path)
+
+
+def _load_deterministic() -> pd.DataFrame:
+    path = P4_DATA / "deterministic_regime_engines.parquet"
+    return pd.read_parquet(path)
+
+
+def _load_pillar1() -> pd.DataFrame:
+    """
+    Load Pillar-1 enriched data and extract the 3 signals needed for Pillar-4.
+    """
+    path = P1_DATA / "features_with_final_signal.parquet"
     df = pd.read_parquet(path)
-    if required:
-        missing = [c for c in required if c not in df.columns]
-        if missing:
-            raise ValueError(f"Missing columns {missing} in {path}")
-    return df
+
+    if "timestamp" not in df.columns:
+        raise ValueError("Pillar-1 file missing required `timestamp` column.")
+
+    # Trend + Volatility come from decayed versions (stable)
+    df["pillar1_trend_score"] = df.get("trend_score_decayed", df.get("trend_score")).fillna(0)
+
+    df["pillar1_volatility_score"] = df.get("volatility_score_decayed", df.get("volatility_score")).fillna(0)
+
+    # Chop must be derived — no native chop signal in Pillar-1
+    if "pattern_score_decayed" in df.columns and "trend_score_decayed" in df.columns:
+        df["pillar1_chop_score"] = (df["pattern_score_decayed"] - df["trend_score_decayed"]).abs()
+    else:
+        df["pillar1_chop_score"] = 0.0
+
+    # Return only what we need
+    return df[["timestamp"] + PILLAR1_COLUMNS]
 
 
-def _drop_overlap(raw: pd.DataFrame, det: pd.DataFrame) -> pd.DataFrame:
-    overlap = list(set(raw.columns).intersection(det.columns))
-    if overlap:
-        logger.warning(f"Dropping overlapping raw cols from det: {overlap}")
-        det = det.drop(columns=overlap)
-    return det
-
-
-def _ensure_timestamp(df: pd.DataFrame) -> pd.DataFrame:
-    ts_cols = [c for c in df.columns if c.startswith("timestamp")]
-    if not ts_cols:
-        raise ValueError("timestamp missing after merge.")
-    base = df[ts_cols[0]]
-    df = df.drop(columns=ts_cols)
-    df.insert(0, "timestamp", base.values)
-    return df
-
-
-def _auto_label(df: pd.DataFrame) -> np.ndarray:
+def _load_labels() -> pd.DataFrame:
     """
-    Priority-based deterministic 8-class labeling.
+    Load final regime labels created by the fusion/smoothing pipeline.
     """
-    labels = np.full(len(df), 1, dtype=np.int8)  # default: range
-
-    labels[df.get("trend_flag", 0).values == 1] = 0
-    labels[(df.get("chop_flag", 0).values == 1) & (labels == 1)] = 2
-
-    vol = df.get("volatility_regime", 1).values
-    labels[(vol == 2) & (labels == 1)] = 3
-    labels[(vol == 0) & (labels == 1)] = 4
-
-    liq = df.get("liquidity_regime", 1).values
-    labels[(liq == 0) & (labels == 1)] = 5
-
-    # Momentum ignition (rare)
-    labels[(df.get("delta_intensity", 0).values > 0.9) & (labels == 1)] = 6
-
-    # Mean reversion
-    labels[df.get("mean_reversion_flag", 0).values == 1] = 7
-
-    if labels.min() < 0 or labels.max() > 7:
-        raise ValueError("Label range invalid.")
-    return labels
+    path = P4_DATA / "regime_labels_stable_deterministic.parquet"
+    return pd.read_parquet(path)
 
 
-def _clean(df: pd.DataFrame) -> pd.DataFrame:
-    return df.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
-
-def _feature_hash(cols: List[str]):
-    h = sha256(",".join(cols).encode()).hexdigest()
-    logger.info(f"Feature count: {len(cols)}")
-    logger.info(f"Feature SHA256: {h}")
-    return h
-
-
+# ---------------------------------------------------------------------
+# Main dataset builder
+# ---------------------------------------------------------------------
 def build_regime_dataset(include_labels: bool = True):
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.info("Loading raw regime features…")
+    raw = _load_raw_features()
 
-    raw = _load(RAW_PATH)
-    det = _load(DET_PATH)
-    entry = _load(ENTRY_PATH, required=["trend_score", "volatility_score", "pattern_score"])
+    logging.info("Loading deterministic engine outputs…")
+    det = _load_deterministic()
 
-    det = _drop_overlap(raw, det)
+    logging.info("Extracting Pillar-1 high-level signals…")
+    p1 = _load_pillar1()
 
+    logging.info("Merging Part 1 + Part 2 + Pillar-1…")
     merged = (
-        raw.reset_index(drop=True)
-        .merge(det.reset_index(drop=True), left_index=True, right_index=True)
-        .merge(entry[["trend_score", "volatility_score", "pattern_score"]].reset_index(drop=True),
-               left_index=True, right_index=True)
+        raw
+        .merge(det, on="timestamp", how="left")
+        .merge(p1, on="timestamp", how="left")
     )
 
-    merged = _ensure_timestamp(merged)
-    merged = _clean(merged)
+    # ------------------------------------------------------------------
+    # Build feature list
+    # ------------------------------------------------------------------
+    raw_features = [c for c in raw.columns if c != "timestamp"]
+    all_features = raw_features + DETERMINISTIC_COLUMNS + PILLAR1_COLUMNS
 
-    # Prevent suffix duplicates
-    bad = [c for c in merged.columns if c.endswith("_x") or c.endswith("_y")]
-    if bad:
-        raise ValueError(f"Suffix duplicates detected: {bad}")
+    # Safety check
+    missing = [c for c in all_features if c not in merged.columns]
+    if missing:
+        raise ValueError(f"Missing required feature columns: {missing}")
 
-    labels = None
+    # ------------------------------------------------------------------
+    # Load labels (if requested)
+    # ------------------------------------------------------------------
     if include_labels:
-        merged["regime_label"] = _auto_label(merged)
-        labels = merged["regime_label"].to_numpy(np.int8)
+        logging.info("Loading regime labels…")
+        lbl = _load_labels()
 
-    feature_cols = [c for c in merged.columns if c not in ["timestamp", "regime_label"]]
-    feature_cols = sorted(feature_cols)
+        merged = merged.merge(lbl, on="timestamp", how="left")
 
-    merged = merged[["timestamp"] + feature_cols + (["regime_label"] if include_labels else [])]
+        if "regime_label" not in merged.columns:
+            raise ValueError("Labels file must contain `regime_label`.")
 
-    _feature_hash(feature_cols)
+        labels = merged["regime_label"].astype(int).values
+    else:
+        labels = None
 
-    return merged, feature_cols, labels
+    # Final shape + sort
+    merged = merged.sort_values("timestamp").reset_index(drop=True)
+
+    return merged, all_features, labels

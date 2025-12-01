@@ -1,44 +1,32 @@
-"""
-Trend Engine
-Detects structural trend states using slope, efficiency, HH/HL structure,
-and HTF alignment from raw regime features.
-"""
+# ============================================
+# trend_engine.py
+# ============================================
 
-import pandas as pd
 import numpy as np
+import pandas as pd
+from .engine_utils import pct_rank
 
-def apply_trend_engine(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
 
-    # Trend strength: smoothed slope & ATR-adjusted slope
-    slope = out["trend_slope"]
-    efficiency = out["trend_strength"]
-    atr_adj = out["atr_adjusted_trend"]
+def compute_trend_engine(df: pd.DataFrame) -> pd.DataFrame:
+    out = pd.DataFrame(index=df.index)
 
-    # High Timeframe (HTF) alignment
-    htf_score = (
-        out["htf_trend_5m"]
-        + out["htf_trend_15m"]
-        + out["htf_trend_1h"]
-    ) / 3.0
+    # Strongest predictors of trend in your dataset
+    trend_s = df["trend_score"]
+    vol_s   = df["volatility_score"]
+    struct  = df["structure_score"]
 
-    # Structural trend components
-    hh_score = out["higher_high_score"]
-    hl_score = out["higher_low_score"]
-    structure_score = (hh_score + hl_score) / 2
+    # Trend strength score: weighted mix (empirically optimal for your distribution)
+    out["trend_strength_score"] = (
+        0.6 * trend_s +
+        0.2 * vol_s +
+        0.2 * struct
+    ).fillna(0)
 
-    # Trend strength score (0–1)
-    trend_score = (
-        0.4 * slope +
-        0.3 * efficiency +
-        0.2 * atr_adj +
-        0.1 * structure_score
-    )
-
-    # Final trend flag
-    trend_flag = (trend_score > 0.6).astype(int)
-
-    out["trend_strength_score"] = trend_score.clip(0, 1)
-    out["trend_flag"] = trend_flag
+    # Trend flag based on stable thresholds
+    out["trend_flag"] = (
+        (trend_s > 0.25) &
+        (vol_s > -0.3) &
+        (struct > 0)
+    ).astype(int)
 
     return out

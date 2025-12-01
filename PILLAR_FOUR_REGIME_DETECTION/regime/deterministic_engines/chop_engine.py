@@ -1,31 +1,31 @@
-"""
-Chop Engine
-Detects sideways, low-directional, mean-reverting chop conditions.
-"""
+# ============================================
+# chop_engine.py
+# ============================================
 
-import pandas as pd
 import numpy as np
+import pandas as pd
+from .engine_utils import pct_rank
 
-def apply_chop_engine(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
 
-    entropy = out["micro_trend_entropy"]
-    bar_cluster = out["bar_clustering_score"]
-    alt_ratio = out["chop_index"]  # alternation of candle direction
-    wick_ratio = (
-        out["upper_wick_body"] + out["lower_wick_body"]
-    ) / 2
+def compute_chop_engine(df: pd.DataFrame) -> pd.DataFrame:
+    out = pd.DataFrame(index=df.index)
 
-    chop_score = (
-        0.3 * entropy +
-        0.25 * bar_cluster +
-        0.25 * alt_ratio +
-        0.2 * wick_ratio
-    )
+    noise = df["noise_to_signal"]
+    chop_index = df["chop_index"]
+    trend_s = df["trend_score"]
 
-    chop_flag = (chop_score > 0.55).astype(int)
+    # Chop strength: more noise + bar alternation, less trend
+    out["chop_strength_score"] = (
+        0.5 * pct_rank(noise) +
+        0.4 * pct_rank(chop_index) +
+        0.1 * (1 - pct_rank(abs(trend_s)))
+    ).fillna(0)
 
-    out["chop_strength_score"] = chop_score.clip(0, 1)
-    out["chop_flag"] = chop_flag
+    # Flag
+    out["chop_flag"] = (
+        (noise > noise.quantile(0.75)) |
+        (chop_index > 0.5) |
+        ((abs(trend_s) < 0.1) & (noise > noise.median()))
+    ).astype(int)
 
     return out

@@ -1,34 +1,29 @@
-"""
-Liquidity Engine
-Detects liquidity drought/normal/expansion states using orderflow proxies.
-"""
+# ============================================
+# liquidity_engine.py
+# ============================================
 
-import pandas as pd
 import numpy as np
+import pandas as pd
+from .engine_utils import pct_rank
 
-def apply_liquidity_engine(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
 
-    delta = out["delta_intensity"]
-    imb = out["imbalance_persistence"]
-    cvd = out["cvd_slope"]
-    vol_exp = out["volume_expansion_20"]
+def compute_liquidity_engine(df: pd.DataFrame) -> pd.DataFrame:
+    out = pd.DataFrame(index=df.index)
 
-    drought_score = (
-        0.4 * (1 - delta) +
-        0.3 * (1 - imb) +
-        0.2 * (1 - cvd) +
-        0.1 * (1 - vol_exp)
-    )
+    vol = df["volume"]
+    orderflow = df["orderflow_score"]
+    delta_int = df["delta_intensity"]
 
-    # Liquidity regime
-    # 0 = drought
-    # 1 = normal
-    # 2 = expansion
-    regime = np.where(vol_exp > 0.6, 2,
-                np.where(drought_score > 0.6, 0, 1))
+    # Reliably identifies thin markets in your dataset
+    out["liquidity_score"] = (
+        -0.4 * pct_rank(vol) +
+        -0.4 * pct_rank(orderflow) +
+        -0.2 * pct_rank(delta_int)
+    ).fillna(0)
 
-    out["liquidity_score"] = 1 - drought_score.clip(0, 1)
-    out["liquidity_regime"] = regime.astype(int)
+    reg = np.full(len(df), 1, dtype=np.int8)  # normal
+    reg[(vol < vol.quantile(0.25)) & (orderflow < -0.4)] = 0  # drought
+    reg[(vol > vol.quantile(0.75)) & (delta_int > 0.6)] = 2  # expansion (optional)
 
+    out["liquidity_regime"] = reg
     return out

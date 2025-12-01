@@ -1,47 +1,38 @@
-import numpy as np
-import lightgbm as lgb
-import xgboost as xgb
-from sklearn.metrics import log_loss, accuracy_score, confusion_matrix, classification_report
+# ======================================================
+# model_utils.py
+# ======================================================
+
+from __future__ import annotations
+import pickle
+from pathlib import Path
+import json
+
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+MODEL_DIR = PROJECT_ROOT / "PILLAR_FOUR_REGIME_DETECTION" / "regime" / "ml_regime_classifier" / "models"
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def train_lgbm(X, y):
-    model = lgb.LGBMClassifier(
-        n_estimators=300,
-        num_leaves=64,
-        max_depth=-1,
-        subsample=0.9,
-        colsample_bytree=0.9,
-        objective="multiclass",
-        num_class=8,
-        learning_rate=0.05,
-        min_child_samples=30,
-    )
-    model.fit(X, y)
-    return model
+def save_model(model, name: str):
+    with open(MODEL_DIR / name, "wb") as f:
+        pickle.dump(model, f)
 
 
-def train_xgb(X, y):
-    model = xgb.XGBClassifier(
-        n_estimators=300,
-        max_depth=6,
-        subsample=0.9,
-        colsample_bytree=0.9,
-        learning_rate=0.05,
-        objective="multi:softprob",
-        num_class=8,
-        eval_metric="mlogloss",
-    )
-    model.fit(X, y)
-    return model
+def load_model(name: str):
+    with open(MODEL_DIR / name, "rb") as f:
+        return pickle.load(f)
 
 
-def eval_model(model, X, y):
-    probs = model.predict_proba(X)
-    preds = np.argmax(probs, axis=1)
+def save_feature_list(features):
+    with open(MODEL_DIR / "feature_list.pkl", "wb") as f:
+        pickle.dump(features, f)
 
-    return {
-        "logloss": log_loss(y, probs),
-        "accuracy": accuracy_score(y, preds),
-        "confusion_matrix": confusion_matrix(y, preds).tolist(),
-        "classification_report": classification_report(y, preds, output_dict=True),
-    }
+
+def load_feature_list():
+    with open(MODEL_DIR / "feature_list.pkl", "rb") as f:
+        import pickle
+        return pickle.load(f)
+
+
+def save_metadata(meta: dict):
+    with open(MODEL_DIR / "model_metadata.json", "w") as f:
+        json.dump(meta, f, indent=2)

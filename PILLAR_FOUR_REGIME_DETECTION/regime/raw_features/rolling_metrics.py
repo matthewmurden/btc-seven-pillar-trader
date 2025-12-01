@@ -1,6 +1,7 @@
 """
-High-performance rolling metrics used by raw regime feature construction.
-Fully vectorised, leakage-proof, and safe for ML pipelines.
+Rolling statistical utilities for regime feature construction.
+Supports volatility, variance ratios, ATR windows, entropy windows,
+microstructure metrics, and multi-horizon rolling statistics.
 """
 
 from __future__ import annotations
@@ -8,87 +9,63 @@ import numpy as np
 import pandas as pd
 
 
-# -------------------------
-# Safe Rolling Helpers
-# -------------------------
-
-def rolling_mean(x: pd.Series, window: int) -> pd.Series:
-    return x.rolling(window, min_periods=window).mean()
+def rolling_vol(series: pd.Series, window: int) -> pd.Series:
+    return series.pct_change().rolling(window).std().fillna(0.0)
 
 
-def rolling_std(x: pd.Series, window: int) -> pd.Series:
-    return x.rolling(window, min_periods=window).std(ddof=0)
+def rolling_variance_ratio(series: pd.Series, w_small: int, w_large: int) -> pd.Series:
+    var_small = series.pct_change().rolling(w_small).var()
+    var_large = series.pct_change().rolling(w_large).var()
+    return (var_small / var_large).replace([np.inf, -np.inf], np.nan).fillna(1.0)
 
-
-def rolling_min(x: pd.Series, window: int) -> pd.Series:
-    return x.rolling(window, min_periods=window).min()
-
-
-def rolling_max(x: pd.Series, window: int) -> pd.Series:
-    return x.rolling(window, min_periods=window).max()
-
-
-def rolling_sum(x: pd.Series, window: int) -> pd.Series:
-    return x.rolling(window, min_periods=window).sum()
-
-
-def rolling_zscore(x: pd.Series, window: int) -> pd.Series:
-    m = rolling_mean(x, window)
-    s = rolling_std(x, window)
-    return (x - m) / (s.replace(0, np.nan))
-
-
-# -------------------------
-# Price Structure Metrics
-# -------------------------
 
 def rolling_slope(series: pd.Series, window: int) -> pd.Series:
+    x = np.arange(window)
+    slopes = (
+        series.rolling(window)
+        .apply(lambda y: np.polyfit(x, y, 1)[0] if y.size == window else 0.0, raw=True)
+        .fillna(0.0)
+    )
+    return slopes
+
+
+def entropy(series: pd.Series, window: int = 20) -> pd.Series:
+    def _ent(vals):
+        hist, _ = np.histogram(vals, bins=8)
+        p = hist / (hist.sum() + 1e-9)
+        return -(p * np.log(p + 1e-9)).sum()
+
+    return series.rolling(window).apply(_ent, raw=False).fillna(0.0)
+
+
+def hurst(series: pd.Series, window: int = 80) -> pd.Series:
     """
-    Linear regression slope over a rolling window.
-    Fast implementation using closed-form OLS.
+    Fast, stable rolling Hurst exponent estimator.
+    Uses log–log regression of variances.
     """
-    y = series.values
-    n = window
+    series = series.astype(float)
 
-    if len(y) < n:
-        return pd.Series(np.zeros_like(y), index=series.index)
+    def _hurst_window(x: np.ndarray) -> float:
+        try:
+            lags = range(2, 20)
+            tau = [np.sqrt(np.std(np.subtract(x[lag:], x[:-lag]))) for lag in lags]
+            tau = np.array(tau)
 
-    x = np.arange(n)
-    denom = n * np.sum(x * x) - np.sum(x) ** 2
+            if np.any(tau <= 0):
+                return 0.5
 
-    slopes = np.zeros(len(y))
-    for i in range(n - 1, len(y)):
-        y_window = y[i - n + 1 : i + 1]
-        num = n * np.sum(x * y_window) - np.sum(x) * np.sum(y_window)
-        slopes[i] = num / denom
+            poly = np.polyfit(np.log(lags), np.log(tau), 1)
+            hurst_exp = poly[0] * 2.0
 
-    return pd.Series(slopes, index=series.index)
+            if np.isnan(hurst_exp) or np.isinf(hurst_exp):
+                return 0.5
 
+            return float(np.clip(hurst_exp, 0.0, 1.0))
+        except Exception:
+            return 0.5
 
-def hurst_exponent(price: pd.Series, window: int = 100) -> pd.Series:
-    """
-    Hurst exponent estimator (rough, but extremely useful).
-    Measures trending (H > 0.5) vs mean-reversion (H < 0.5).
-    """
-    log_p = np.log(price.replace(0, np.nan).ffill())
-
-    def calc_hurst(sub: np.ndarray) -> float:
-        if len(sub) < 20:
-            return np.nan
-        tau = []
-        lagvec = range(2, 20)
-        for lag in lagvec:
-            pp = np.subtract(sub[lag:], sub[:-lag])
-            tau.append(np.sqrt(np.std(pp)))
-        lagvec = np.array(list(lagvec))
-        tau = np.array(tau)
-        return np.polyfit(np.log(lagvec), np.log(tau), 1)[0]
-
-    out = []
-    for i in range(len(log_p)):
-        if i < window:
-            out.append(np.nan)
-        else:
-            out.append(calc_hurst(log_p.values[i - window : i]))
-
-    return pd.Series(out, index=price.index).fillna(method="bfill").fillna(0.5)
+    return (
+        series.rolling(window)
+        .apply(lambda x: _hurst_window(x.values), raw=False)
+        .fillna(0.5)
+    )

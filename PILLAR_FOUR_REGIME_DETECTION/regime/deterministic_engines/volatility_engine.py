@@ -1,41 +1,31 @@
-"""
-Volatility Regime Engine
-Classifies compression → normal → expansion using multi-horizon vol curve.
-"""
+# ============================================
+# volatility_engine.py
+# ============================================
 
-import pandas as pd
 import numpy as np
+import pandas as pd
+from .engine_utils import pct_rank
 
-def apply_volatility_engine(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
 
-    vol1 = out["realized_vol_1"]
-    vol5 = out["realized_vol_5"]
-    vol15 = out["realized_vol_15"]
-    vol30 = out["realized_vol_30"]
+def compute_volatility_engine(df: pd.DataFrame) -> pd.DataFrame:
+    out = pd.DataFrame(index=df.index)
 
-    compression = out["vol_compression_score"]
-    expansion = out["vol_expansion_score"]
-    atrp = out["atr_percentile"]
+    vol_s  = df["volatility_score"]
+    atr_exp = df["atr_expansion"]
+    bb_w = df["bb_width"]
 
-    # Composite volatility level
-    base_vol = (vol1 + vol5 + vol15 + vol30) / 4
+    # Smooth combined score
+    out["volatility_regime_score"] = (
+        0.5 * pct_rank(vol_s) +
+        0.3 * pct_rank(atr_exp) +
+        0.2 * pct_rank(bb_w)
+    ).fillna(0)
 
-    # Score: expansion > normal > compression
-    vol_score = (
-        0.4 * base_vol +
-        0.3 * expansion +
-        0.3 * atrp
-    )
+    # Multi-state regime: compression, normal, expansion
+    reg = np.full(len(df), 1, dtype=np.int8)  # default normal
 
-    # Discrete volatility regime
-    # 0 = compression
-    # 1 = normal
-    # 2 = expansion
-    regime = np.where(expansion > 0.55, 2,
-                np.where(compression > 0.55, 0, 1))
+    reg[(vol_s > 0.55) & (atr_exp > 0.35) & (bb_w > bb_w.quantile(0.70))] = 2  # expansion
+    reg[(vol_s < -0.35) & (bb_w < bb_w.quantile(0.20))] = 0  # compression
 
-    out["volatility_regime_score"] = vol_score.clip(0, 1)
-    out["volatility_regime"] = regime.astype(int)
-
+    out["volatility_regime"] = reg
     return out

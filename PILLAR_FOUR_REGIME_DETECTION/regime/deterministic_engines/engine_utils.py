@@ -1,12 +1,19 @@
-import numpy as np
+# ============================================
+# engine_utils.py
+# Utility functions only — NO ENGINE IMPORTS
+# ============================================
+
 import pandas as pd
 
-
-def zscore(series: pd.Series, window: int = 100) -> pd.Series:
-    mean = series.rolling(window).mean()
-    std = series.rolling(window).std()
-    return (series - mean) / (std + 1e-9)
+def pct_rank(x: pd.Series) -> pd.Series:
+    """Percentile-rank a series (0–1)."""
+    return x.rank(pct=True).fillna(0.5)
 
 
-def smooth(series: pd.Series, alpha: float = 0.2) -> pd.Series:
-    return series.ewm(alpha=alpha).mean()
+def normalize(x: pd.Series) -> pd.Series:
+    """Z-score normalization with fallback."""
+    mu = x.mean()
+    sd = x.std()
+    if sd == 0:
+        return pd.Series(0, index=x.index)
+    return (x - mu) / sd
