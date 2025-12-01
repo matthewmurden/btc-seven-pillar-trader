@@ -30,6 +30,10 @@ def main():
     logging.info("Running deterministic engines on %s rows", len(df))
     result = run_all_engines(df)
 
+    # Preserve timestamp for downstream fusion
+    if "timestamp" in df.columns:
+        result.insert(0, "timestamp", df["timestamp"].values)
+
     result.to_parquet(OUTPUT_PATH, index=False)
     logging.info("Saved deterministic engine outputs → %s", OUTPUT_PATH)
     logging.info("Sample output:\n%s", result.head())
