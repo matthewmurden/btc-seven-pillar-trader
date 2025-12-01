@@ -28,15 +28,16 @@ def fuse_row_ml(row):
     """
 
     ml_pred = int(row["ml_regime"])
-    ml_conf = float(row["ml_confidence"])
+    ml_conf = float(row.get("ml_confidence", 0.0))
     det_pred = int(row["det_regime"])
 
     # Liquidity drought always overrides
-    if row["liquidity_regime"] == 0:
+    # Note: liquidity_regime=1 indicates drought in current engine logic.
+    if row.get("liquidity_regime", 0) == 1:
         return 5
 
     # Vol expansion overrides
-    if row["volatility_regime"] == 2:
+    if row.get("volatility_regime", 1) == 2:
         return 3
 
     # Low ML confidence → deterministic fallback

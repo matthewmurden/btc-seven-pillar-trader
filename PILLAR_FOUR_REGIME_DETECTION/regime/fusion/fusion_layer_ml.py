@@ -15,7 +15,7 @@ def run_ml_fusion():
     raw = pd.read_parquet(DATA_DIR / "raw_regime_features.parquet")
     det = pd.read_parquet(DATA_DIR / "deterministic_regime_engines.parquet")
     labels_raw = pd.read_parquet(DATA_DIR / "regime_labels_raw.parquet")
-    ml = pd.read_parquet(DATA_DIR / "regime_ml_raw_output.parquet")
+    ml = pd.read_parquet(DATA_DIR / "regime_ml_predictions.parquet")
 
     # Merge everything
     df = (
@@ -27,9 +27,20 @@ def run_ml_fusion():
     # Rename for clarity
     df = df.rename(columns={
         "regime_label": "det_regime",
-        "ml_pred": "ml_regime",
-        "ml_conf": "ml_confidence"
+        "regime_pred": "ml_regime",
+        "regime_confidence": "ml_confidence",
     })
+
+    # Safety: ensure expected columns exist; fall back if needed
+    if "ml_confidence" not in df.columns:
+        if "regime_confidence" in df.columns:
+            df["ml_confidence"] = df["regime_confidence"]
+        else:
+            prob_cols = [c for c in df.columns if c.startswith("prob_")]
+            if prob_cols:
+                df["ml_confidence"] = df[prob_cols].max(axis=1)
+            else:
+                raise ValueError("regime_ml_predictions.parquet must include ml_confidence column.")
 
     df["regime_label"] = df.apply(fuse_row_ml, axis=1)
 
