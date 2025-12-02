@@ -13,7 +13,7 @@ except ImportError as exc:  # pragma: no cover - environment guard
 # =========================
 # PATHS
 # =========================
-BASE_DIR = Path(__file__).resolve().parent.parent
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = BASE_DIR / "data" / "processed"
 PART_ONE_DIR = DATA_DIR / "part_one"
 PART_TWO_DIR = DATA_DIR / "part_two"
@@ -90,16 +90,20 @@ def generate_labels(det: pd.DataFrame) -> pd.Series:
 def prepare_features(
     raw_feats: pd.DataFrame, det: pd.DataFrame
 ) -> pd.DataFrame:
-    # ensure open_time_ms exists and sorted
-    for df in (raw_feats, det):
-        if "open_time_ms" in df.columns:
-            df.sort_values("open_time_ms", inplace=True)
+    # ensure open_time_ms exists and sorted on raw features
+    if "open_time_ms" in raw_feats.columns:
+        raw_feats = raw_feats.sort_values("open_time_ms").reset_index(drop=True)
 
-    # merge deterministic and session onto raw
-    df = raw_feats.merge(det, left_index=False, right_index=True, how="left") if "open_time_ms" not in det.columns else raw_feats.merge(det, on="open_time_ms", how="left")
+    # deterministic engines may not carry timestamps; align by index length
+    if "open_time_ms" in det.columns:
+        det = det.sort_values("open_time_ms").reset_index(drop=True)
+        df = raw_feats.merge(det, on="open_time_ms", how="left")
+    else:
+        if len(det) != len(raw_feats):
+            raise ValueError("Deterministic engines missing open_time_ms and length mismatch with raw features.")
+        df = pd.concat([raw_feats.reset_index(drop=True), det.reset_index(drop=True)], axis=1)
 
-    df = df.fillna(0)
-    return df
+    return df.fillna(0)
 
 
 def encode_categoricals(df: pd.DataFrame) -> pd.DataFrame:
@@ -122,7 +126,7 @@ def train_model(X_train, y_train, X_val, y_val):
         "verbosity": -1,
     }
     model = lgb.LGBMClassifier(**params)
-    model.fit(X_train, y_train, eval_set=[(X_val, y_val)], eval_metric="multi_logloss", verbose=False)
+    model.fit(X_train, y_train, eval_set=[(X_val, y_val)], eval_metric="multi_logloss")
     return model
 
 
