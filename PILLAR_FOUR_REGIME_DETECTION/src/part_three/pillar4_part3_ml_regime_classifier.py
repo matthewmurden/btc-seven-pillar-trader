@@ -21,7 +21,6 @@ PART_THREE_DIR = DATA_DIR / "part_three"
 
 RAW_FEATURES_PATH = PART_ONE_DIR / "raw_regime_features.parquet"
 DETERMINISTIC_PATH = PART_TWO_DIR / "deterministic_regime_engines.parquet"
-SESSION_CONTEXT_PATH = PART_ONE_DIR / "session_context_features.parquet"
 OUTPUT_PATH = PART_THREE_DIR / "regime_ml_predictions.parquet"
 
 
@@ -89,16 +88,15 @@ def generate_labels(det: pd.DataFrame) -> pd.Series:
 # FEATURES
 # =========================
 def prepare_features(
-    raw_feats: pd.DataFrame, det: pd.DataFrame, sess: pd.DataFrame
+    raw_feats: pd.DataFrame, det: pd.DataFrame
 ) -> pd.DataFrame:
     # ensure open_time_ms exists and sorted
-    for df in (raw_feats, det, sess):
+    for df in (raw_feats, det):
         if "open_time_ms" in df.columns:
             df.sort_values("open_time_ms", inplace=True)
 
     # merge deterministic and session onto raw
     df = raw_feats.merge(det, left_index=False, right_index=True, how="left") if "open_time_ms" not in det.columns else raw_feats.merge(det, on="open_time_ms", how="left")
-    df = df.merge(sess, on="open_time_ms", how="left")
 
     df = df.fillna(0)
     return df
@@ -150,10 +148,9 @@ def main():
     logging.info("Loading inputs")
     raw_feats = pd.read_parquet(RAW_FEATURES_PATH)
     det = pd.read_parquet(DETERMINISTIC_PATH)
-    sess = pd.read_parquet(SESSION_CONTEXT_PATH)
 
     logging.info("Preparing features and labels")
-    df = prepare_features(raw_feats, det, sess)
+    df = prepare_features(raw_feats, det)
     labels = generate_labels(det)
 
     # drop timestamp columns
