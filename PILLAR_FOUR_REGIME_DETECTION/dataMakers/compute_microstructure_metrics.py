@@ -23,7 +23,6 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-
 # ==========================================
 # MICROSTRUCTURE FUNCTIONS
 # ==========================================
@@ -31,7 +30,6 @@ def compute_minute_stats(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
 
-    # per-minute groups
     g = df.groupby("minute")
 
     out = pd.DataFrame({
@@ -67,7 +65,7 @@ def compute_minute_stats(df: pd.DataFrame) -> pd.DataFrame:
         if len(x) >= 3 else 0
     )
 
-    # micro-clustering = std of price differences inside minute
+    # micro clustering
     out["micro_clustering"] = g.apply(
         lambda x: np.std(np.diff(x.price)) if len(x) > 1 else 0
     )
@@ -100,17 +98,22 @@ def process_one_file(path: Path) -> pd.DataFrame:
     else:
         df = pd.read_csv(path)
 
-    # standardise
     df = df.rename(columns={
-        "price": "price",
         "quantity": "qty",
         "transact_time": "ts",
         "is_buyer_maker": "bm"
     })
 
     df["minute"] = (df["ts"] // 60000) * 60000
-    df["bm"] = df["bm"].astype(str).str.lower() == "false"   # taker BUY = false
-    df["delta"] = np.where(df["bm"], df["qty"], -df["qty"])
+
+    # CORRECTED:
+    # Binance meaning:
+    # bm == True  → buyer is maker → **SELL TAKER** → delta = -qty
+    # bm == False → buyer is taker → **BUY TAKER**  → delta = +qty
+    df["bm"] = df["bm"].astype(str).str.lower()
+    df["bm"] = df["bm"].map({"true": True, "false": False, "1": True, "0": False})
+
+    df["delta"] = np.where(df["bm"] == False, df["qty"], -df["qty"])
 
     return compute_minute_stats(df)
 
@@ -135,16 +138,16 @@ def main():
                 m = process_one_file(f)
                 all_minutes.append(m)
             except Exception as exc:
-                logging.error(f"Skipping {f.name} due to read error: {exc}")
+                logging.error(f"Skipping {f.name}: {exc}")
                 continue
 
         if not all_minutes:
-            raise RuntimeError("No trade data processed. Check bulk_trades directory.")
+            raise RuntimeError("No trade data processed.")
 
         micro = pd.concat(all_minutes).sort_index()
         micro = micro[~micro.index.duplicated(keep="first")]
 
-        # merge with candles
+        # MERGE WITH CANDLES
         merged = candles.merge(
             micro,
             left_on="open_time_ms",
@@ -152,18 +155,23 @@ def main():
             how="left"
         ).fillna(0)
 
-        # compute candle-only metrics
+        # Candle metrics
         body = (merged.close - merged.open).abs()
         wick = (merged.high - merged.low) - body
+
         merged["wick_body_ratio"] = wick / (body + 1e-12)
         merged["micro_volatility"] = body / merged.close.shift(1).replace(0, np.nan).fillna(0)
         merged["micro_return"] = (merged.close - merged.open) / merged.open.replace(0, np.nan).fillna(1)
-        merged["order_imbalance"] = (merged.taker_buy_base - (merged.volume - merged.taker_buy_base)) / merged.volume.replace(0, np.nan).fillna(1)
-        merged["no_trend_stat"] = ((merged.high - merged.low) / merged.close.replace(0, np.nan).fillna(1) < 0.0003).astype(int)
+        merged["order_imbalance"] = (
+            merged.taker_buy_base - (merged.volume - merged.taker_buy_base)
+        ) / merged.volume.replace(0, np.nan).fillna(1)
+        merged["no_trend_stat"] = ((merged.high - merged.low) /
+                                   merged.close.replace(0, np.nan).fillna(1) < 0.0003).astype(int)
 
-        # final
+        # FINAL OUTPUT + REQUIRED open_time_ms
         out = merged[
             [
+                "open_time_ms",
                 "wick_body_ratio",
                 "micro_volatility",
                 "micro_return",
