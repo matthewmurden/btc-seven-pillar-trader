@@ -1,7 +1,0 @@
-{
-    "model": "regime_classifier",
-    "feature_count": 0,
-    "features_sha256": "",
-    "lgbm_metrics": {},
-    "xgb_metrics": {}
-}
