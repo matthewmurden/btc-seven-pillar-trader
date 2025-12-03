@@ -1,4 +1,5 @@
 import logging
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -22,6 +23,7 @@ PART_THREE_DIR = DATA_DIR / "part_three"
 RAW_FEATURES_PATH = PART_ONE_DIR / "raw_regime_features.parquet"
 DETERMINISTIC_PATH = PART_TWO_DIR / "deterministic_regime_engines.parquet"
 OUTPUT_PATH = PART_THREE_DIR / "regime_ml_predictions.parquet"
+PREPROCESS_DIR = BASE_DIR / "PRE-PROCESS"
 
 
 # =========================
@@ -114,6 +116,29 @@ def encode_categoricals(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =========================
+# INPUT BOOTSTRAP
+# =========================
+def ensure_inputs():
+    """Ensure raw_regime_features and deterministic engines exist by invoking pre-process and upstream steps when missing."""
+    if not RAW_FEATURES_PATH.exists():
+        if str(PREPROCESS_DIR) not in sys.path:
+            sys.path.insert(0, str(PREPROCESS_DIR))
+        try:
+            from raw_data_layer import load_raw_data  # type: ignore
+        except Exception as exc:  # pragma: no cover - import guard
+            raise FileNotFoundError(f"raw_regime_features missing and failed to import pre-process layer: {exc}")
+        logging.info("raw_regime_features not found; running pre-process raw_data_layer + build_raw_regime_features")
+        load_raw_data()
+        from build_raw_regime_features import main as build_part_one  # type: ignore
+        build_part_one()
+
+    if not DETERMINISTIC_PATH.exists():
+        logging.info("deterministic_regime_engines missing; building via deterministic_regime_engines.main()")
+        from deterministic_regime_engines import main as build_det  # type: ignore
+        build_det()
+
+
+# =========================
 # MODEL
 # =========================
 def train_model(X_train, y_train, X_val, y_val):
@@ -149,6 +174,7 @@ def predict(model, X: pd.DataFrame) -> pd.DataFrame:
 # =========================
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+    ensure_inputs()
     logging.info("Loading inputs")
     raw_feats = pd.read_parquet(RAW_FEATURES_PATH)
     det = pd.read_parquet(DETERMINISTIC_PATH)

@@ -1,4 +1,5 @@
 import logging
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -12,10 +13,12 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = BASE_DIR / "data" / "processed"
 PART_TWO_DIR = DATA_DIR / "part_two"
 PART_THREE_DIR = DATA_DIR / "part_three"
-OUTPUT_PATH = PART_THREE_DIR / "regime_labels_fused.parquet"
+PART_FOUR_DIR = DATA_DIR / "part_four"
+OUTPUT_PATH = PART_FOUR_DIR / "regime_labels_fused.parquet"
 
 DETERMINISTIC_PATH = PART_TWO_DIR / "deterministic_regime_engines.parquet"
 ML_PATH = PART_THREE_DIR / "regime_ml_predictions.parquet"
+PART_THREE_SRC = BASE_DIR / "src" / "part_three"
 
 
 # =========================
@@ -152,6 +155,21 @@ def print_summary(df: pd.DataFrame):
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+    # bootstrap upstream outputs if missing
+    if not DETERMINISTIC_PATH.exists():
+        logging.info("deterministic_regime_engines missing; building via deterministic_regime_engines.main()")
+        from deterministic_regime_engines import main as build_det  # type: ignore
+        build_det()
+    if not ML_PATH.exists():
+        logging.info("regime_ml_predictions missing; building via pillar4_part3_ml_regime_classifier.main()")
+        if str(PART_THREE_SRC) not in sys.path:
+            sys.path.insert(0, str(PART_THREE_SRC))
+        try:
+            from pillar4_part3_ml_regime_classifier import main as build_ml  # type: ignore
+        except Exception as exc:  # pragma: no cover - import guard
+            raise ImportError(f"Failed to import ML classifier script: {exc}")
+        build_ml()
+
     logging.info("Loading deterministic and ML predictions")
     det, ml = load_inputs()
 

@@ -1,4 +1,5 @@
 import logging
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +30,8 @@ PART_TWO_DIR = DATA_DIR / "part_two"
 PART_THREE_DIR = DATA_DIR / "part_three"
 PART_FOUR_DIR = DATA_DIR / "part_four"
 PART_FIVE_DIR = DATA_DIR / "part_five"
+PART_THREE_SRC = BASE_DIR / "src" / "part_three"
+PART_FOUR_SRC = BASE_DIR / "src" / "part_four"
 
 RAW_FEATURES_PATH = PART_ONE_DIR / "raw_regime_features.parquet"
 DETERMINISTIC_PATH = PART_TWO_DIR / "deterministic_regime_engines.parquet"
@@ -206,6 +209,24 @@ def print_summary(df: pd.DataFrame):
 # =========================
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+    # bootstrap upstream outputs if missing
+    if not DETERMINISTIC_PATH.exists():
+        logging.info("deterministic_regime_engines missing; building via deterministic_regime_engines.main()")
+        from deterministic_regime_engines import main as build_det  # type: ignore
+        build_det()
+    if not ML_PATH.exists():
+        logging.info("regime_ml_predictions missing; building via pillar4_part3_ml_regime_classifier.main()")
+        if str(PART_THREE_SRC) not in sys.path:
+            sys.path.insert(0, str(PART_THREE_SRC))
+        from pillar4_part3_ml_regime_classifier import main as build_ml  # type: ignore
+        build_ml()
+    if not FUSED_PATH.exists():
+        logging.info("regime_labels_fused missing; building via pillar4_part4_fusion_layer.main()")
+        if str(PART_FOUR_SRC) not in sys.path:
+            sys.path.insert(0, str(PART_FOUR_SRC))
+        from pillar4_part4_fusion_layer import main as build_fused  # type: ignore
+        build_fused()
+
     logging.info("Loading inputs")
     fused, ml, det = load_inputs()
 

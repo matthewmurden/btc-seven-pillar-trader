@@ -1,30 +1,19 @@
 import logging
+import sys
 from pathlib import Path
 from typing import Dict
 
 import numpy as np
 import pandas as pd
 
+# Pull in pre-process raw data layer
+ROOT = Path(__file__).resolve().parent.parent
+PREPROCESS_DIR = ROOT / "PRE-PROCESS"
+if str(PREPROCESS_DIR) not in sys.path:
+    sys.path.insert(0, str(PREPROCESS_DIR))
+from raw_data_layer import load_raw_data  # type: ignore
 
-# ============================================================
-# PATHS
-# ============================================================
-BASE = Path(__file__).resolve().parent.parent
-DATA = BASE / "data" / "raw"
-
-CANDLE_PATH = DATA / "candles" / "BTCUSDT_1m_2022-11-01_2025-10-31.csv"
-DELTA_PATH = DATA / "delta" / "delta_stream.parquet"
-MICRO_PATH = DATA / "microstructure" / "microstructure_metrics.parquet"
-
-HTF = {
-    "5m": DATA / "htf_candles" / "BTCUSDT_5m.parquet",
-    "15m": DATA / "htf_candles" / "BTCUSDT_15m.parquet",
-    "1h": DATA / "htf_candles" / "BTCUSDT_1h.parquet",
-    "4h": DATA / "htf_candles" / "BTCUSDT_4h.parquet",
-    "1d": DATA / "htf_candles" / "BTCUSDT_1d.parquet",
-}
-
-OUT = BASE / "processed" / "part_one" / "raw_regime_features.parquet"
+OUT = ROOT / "data" / "processed" / "part_one" / "raw_regime_features.parquet"
 
 EPS = 1e-12
 
@@ -32,18 +21,6 @@ EPS = 1e-12
 # ============================================================
 # Helpers
 # ============================================================
-def load_htf() -> Dict[str, pd.DataFrame]:
-    out = {}
-    for key, path in HTF.items():
-        df = pd.read_parquet(path)
-        if "open_time_ms" not in df.columns:
-            df["open_time_ms"] = (
-                pd.to_datetime(df["open_time"]).astype("int64") // 1_000_000
-            )
-        out[key] = df.sort_values("open_time_ms").reset_index(drop=True)
-    return out
-
-
 def rolling_slope(series: pd.Series, window: int) -> pd.Series:
     """Fast linear regression slope."""
     idx = np.arange(window)
@@ -271,24 +248,18 @@ def main():
         format="%(asctime)s | %(levelname)s | %(message)s",
     )
 
-    logging.info("Loading inputs...")
-    candles = pd.read_csv(CANDLE_PATH)
-    if "open_time_ms" not in candles.columns:
-        candles["open_time_ms"] = (
-            pd.to_datetime(candles["open_time"]).astype("int64") // 1_000_000
-        )
-    candles = candles.sort_values("open_time_ms")
-
-    delta = pd.read_parquet(DELTA_PATH)
-    micro = pd.read_parquet(MICRO_PATH)
+    logging.info("Loading canonical raw dataset via pre-process layer")
+    data = load_raw_data()
+    candles = data["ohlcv"]
+    delta = data["delta"]
+    micro = data["microstructure"]
+    htf = data["htf"]
 
     df = (
         candles.merge(delta, on="open_time_ms", how="left")
                .merge(micro, on="open_time_ms", how="left")
                .fillna(0)
     )
-
-    htf = load_htf()
 
     logging.info("Building feature blocks...")
     df = trend_features(df)
