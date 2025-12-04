@@ -5,8 +5,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from drift_detector import DriftDetector
-from normalisation_engine import NormalisationEngine
+from normalisation_engine import NormalisationEngine, EngineConfig
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -15,87 +14,59 @@ NORMALISATION_DIR = DATA_PROCESSED / "normalisation"
 NORMALISATION_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _load_phase0(logger: logging.Logger) -> pd.DataFrame:
+def _load_phase0(logger):
     candidates = [
         DATA_PROCESSED / "phase0" / "canonical_raw_with_utilities.parquet",
         DATA_PROCESSED / "raw_layer" / "canonical_raw_with_utilities.parquet",
     ]
-    for path in candidates:
-        if path.exists():
-            logger.info("Loading Phase 0 output from %s", path)
-            return pd.read_parquet(path)
-    raise FileNotFoundError("canonical_raw_with_utilities.parquet not found in expected locations.")
+    for p in candidates:
+        if p.exists():
+            logger.info("Loading Phase 0 output from %s", p)
+            df = pd.read_parquet(p)
+
+            float_cols = df.select_dtypes(include=["float64"]).columns
+            df[float_cols] = df[float_cols].astype("float32")
+            return df
+
+    raise FileNotFoundError("canonical_raw_with_utilities.parquet not found.")
 
 
-def _log_example_stats(df: pd.DataFrame, logger: logging.Logger) -> None:
-    cols = [c for c in df.columns if c.endswith(("_zscore", "_mad", "_volnorm", "_minmax", "_log", "_regime_norm"))]
-    if not cols:
-        return
-    sample_cols = cols[:5]
-    desc = df[sample_cols].agg(["min", "max", "mean", "std"]).T
-    logger.info("Example stats for normalised features:\n%s", desc)
-
-
-def _log_missing(df: pd.DataFrame, logger: logging.Logger) -> None:
-    missing = df.isna().sum()
-    missing = missing[missing > 0].sort_values(ascending=False)
-    if missing.empty:
-        logger.info("No missing values in output.")
-    else:
-        logger.info("Missing values (top 10):\n%s", missing.head(10))
-
-
-def _log_df_overview(df: pd.DataFrame, label: str, logger: logging.Logger) -> None:
-    mem_mb = df.memory_usage(deep=True).sum() / 1e6
-    logger.info("%s shape=%s cols=%d approx_mem=%.2fMB", label, df.shape, len(df.columns), mem_mb)
-
-
-def run() -> None:
+def run():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-    logger = logging.getLogger("phase0.run_norm")
-    logger.info("Starting normalisation on %s (%s)", platform.system(), platform.machine())
+    logger = logging.getLogger("fast.norm")
+    logger.info("Starting fast normalisation on %s (%s)", platform.system(), platform.machine())
 
-    stage_start = time.time()
-    raw_df = _load_phase0(logger)
-    _log_df_overview(raw_df, "Raw Phase0 data", logger)
+    df = _load_phase0(logger)
+    df = df.sort_values("open_time_ms")
+    logger.info("Sorted Phase 0 data: shape=%s", df.shape)
 
-    engine = NormalisationEngine(logger=logger)
-
-    logger.info(
-        "Fitting normalisation engine on shape %s with progress every %.1fs",
-        raw_df.shape,
-        engine.config.progress_interval_seconds,
+    config = EngineConfig(
+        zscore_window=300,
+        mad_window=300,
+        regime_window=250,
+        minmax_window=200,
+        progress_interval_seconds=60,
+        zscore_clip=5.0,
+        mad_clip=6.0,
     )
-    fit_start = time.time()
-    norm_df = engine.fit_transform(raw_df)
-    logger.info("Fit/transform completed in %.2fs", time.time() - fit_start)
-    _log_df_overview(norm_df, "Normalised data", logger)
-    logger.info("Total features normalised: %d", len(engine.feature_map))
 
-    drift_report_path = NORMALISATION_DIR / "drift_report.txt"
-    drift_start = time.time()
-    DriftDetector(output_path=drift_report_path, logger=logger).run(
-        raw_df, [entry["feature"] for entry in engine.feature_map]
-    )
-    logger.info("Drift detection finished in %.2fs", time.time() - drift_start)
+    engine = NormalisationEngine(config=config, logger=logger)
+    engine.config.progress_interval_seconds = 60
 
-    normalised_path = NORMALISATION_DIR / "normalised_features.parquet"
-    params_path = NORMALISATION_DIR / "normalisation_params.json"
+    start = time.time()
+    logger.info("Fitting + transforming...")
+    norm = engine.fit_transform(df)
+    logger.info("Done in %.2fs", time.time() - start)
 
-    norm_df.to_parquet(normalised_path, index=False)
-    engine.save(params_path)
+    out_parquet = NORMALISATION_DIR / "normalised_features.parquet"
+    out_params = NORMALISATION_DIR / "normalisation_params.json"
 
-    _log_example_stats(norm_df, logger)
-    _log_missing(norm_df, logger)
+    norm.to_parquet(out_parquet, index=False)
+    engine.save(out_params)
 
-    if "vol_regime" in raw_df.columns:
-        counts = raw_df["vol_regime"].value_counts(dropna=False)
-        logger.info("Regime distribution:\n%s", counts)
-
-    logger.info("Saved normalised features to %s", normalised_path)
-    logger.info("Saved normalisation params to %s", params_path)
-    logger.info("Saved drift report to %s", drift_report_path)
-    logger.info("End-to-end normalisation run completed in %.2fs", time.time() - stage_start)
+    logger.info("Wrote: %s", out_parquet)
+    logger.info("Wrote: %s", out_params)
+    logger.info("FAST normalisation complete.")
 
 
 if __name__ == "__main__":

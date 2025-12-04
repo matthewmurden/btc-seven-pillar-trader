@@ -93,6 +93,11 @@ class NormalisationEngine:
         self.scalers: Dict[str, object] = {}
         self.params: Dict[str, Dict] = {}
 
+    def _maybe_sort_by_time(self, df: pd.DataFrame) -> pd.DataFrame:
+        if "open_time_ms" in df.columns and not df["open_time_ms"].is_monotonic_increasing:
+            return df.sort_values("open_time_ms")
+        return df
+
     def _maybe_log_progress(self, phase: str, idx: int, total: int, start_time: float, last_log: float) -> float:
         now = time.time()
         if idx == 1 or idx == total or now - last_log >= self.config.progress_interval_seconds:
@@ -139,7 +144,7 @@ class NormalisationEngine:
     def fit(self, df: pd.DataFrame) -> "NormalisationEngine":
         start = time.time()
         df = df.copy()
-        df = df.sort_values("open_time_ms") if "open_time_ms" in df.columns else df
+        df = self._maybe_sort_by_time(df)
         self._log_df_overview(df, "Fit input")
         self.feature_map = self._resolve_features(df)
         self.scalers = {}
@@ -201,7 +206,7 @@ class NormalisationEngine:
         if not self.feature_map or not self.scalers:
             raise RuntimeError("NormalisationEngine must be fitted before transform.")
         df = df.copy()
-        df = df.sort_values("open_time_ms") if "open_time_ms" in df.columns else df
+        df = self._maybe_sort_by_time(df)
         self._log_df_overview(df, "Transform input")
 
         total = len(self.feature_map)
