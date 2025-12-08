@@ -1,2 +1,0 @@
-# Meta-feature package initializer
-

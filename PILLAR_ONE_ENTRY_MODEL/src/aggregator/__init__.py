@@ -1,2 +1,0 @@
-# Master aggregator package initializer
-

@@ -1,2 +1,0 @@
-# Filters package initializer
-

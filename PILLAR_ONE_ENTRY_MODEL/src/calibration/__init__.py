@@ -1,2 +1,0 @@
-# Calibration package initializer
-
