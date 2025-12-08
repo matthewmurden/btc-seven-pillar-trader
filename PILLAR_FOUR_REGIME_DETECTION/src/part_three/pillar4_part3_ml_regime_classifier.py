@@ -14,8 +14,16 @@ except ImportError as exc:  # pragma: no cover - environment guard
 # =========================
 # PATHS
 # =========================
-BASE_DIR = Path(__file__).resolve().parent.parent.parent
+# Pillar 4 repo root: .../PILLAR_FOUR_REGIME_DETECTION
+BASE_DIR = Path(__file__).resolve().parents[2]
+SRC_DIR = BASE_DIR / "src"
 DATA_DIR = BASE_DIR / "data" / "processed"
+
+# Ensure src root is importable for sibling modules
+for p in (BASE_DIR, SRC_DIR):
+    if str(p) not in sys.path:
+        sys.path.insert(0, str(p))
+
 PART_ONE_DIR = DATA_DIR / "part_one"
 PART_TWO_DIR = DATA_DIR / "part_two"
 PART_THREE_DIR = DATA_DIR / "part_three"
@@ -23,7 +31,6 @@ PART_THREE_DIR = DATA_DIR / "part_three"
 RAW_FEATURES_PATH = PART_ONE_DIR / "raw_regime_features.parquet"
 DETERMINISTIC_PATH = PART_TWO_DIR / "deterministic_regime_engines.parquet"
 OUTPUT_PATH = PART_THREE_DIR / "regime_ml_predictions.parquet"
-PREPROCESS_DIR = BASE_DIR / "PRE-PROCESS"
 
 
 # =========================
@@ -31,10 +38,17 @@ PREPROCESS_DIR = BASE_DIR / "PRE-PROCESS"
 # =========================
 def generate_labels(det: pd.DataFrame) -> pd.Series:
     """
-    Create 8-class labels according to deterministic rules.
-    Classes:
-    0 trend_up, 1 trend_down, 2 chop_low_vol, 3 chop_high_vol,
-    4 volatility_expansion, 5 volatility_compression, 6 liquidity_drought, 7 mean_reversion
+    Create 8-class labels from deterministic engines (no human labels).
+
+    Classes (fixed mapping):
+      0: trend_up
+      1: trend_down
+      2: chop_low_vol
+      3: chop_high_vol
+      4: volatility_expansion
+      5: volatility_compression
+      6: liquidity_drought
+      7: mean_reversion
     """
     n = len(det)
     labels = pd.Series(np.full(n, -1, dtype=int), index=det.index)
@@ -49,31 +63,32 @@ def generate_labels(det: pd.DataFrame) -> pd.Series:
     liq_regime = det["liquidity_regime"]
     mean_rev_flag = det["mean_reversion_flag"]
 
-    # volatility_expansion overrides all if active
+    # 4: volatility_expansion overrides all if active
     mask_exp = (expansion_prob > compression_prob) & (vol_regime == "expansion")
     labels[mask_exp] = 4
 
-    # liquidity_drought overrides unless expansion already set
+    # 6: liquidity_drought overrides unless expansion already set
     mask_liq = (liq_regime == "drought") & (labels == -1)
     labels[mask_liq] = 6
 
-    # trend up/down
+    # 0 / 1: trend up / down
     mask_trend_up = (trend_flag == 1) & (trend_dir > 0) & (labels == -1)
     labels[mask_trend_up] = 0
+
     mask_trend_dn = (trend_flag == 1) & (trend_dir < 0) & (labels == -1)
     labels[mask_trend_dn] = 1
 
-    # chop
+    # 2 / 3: chop_low_vol / chop_high_vol
     mask_chop = (chop_flag == 1) & (labels == -1)
     mask_chop_high = mask_chop & (entropy_norm > 0.6)
     labels[mask_chop_high] = 3
     labels[mask_chop & ~mask_chop_high] = 2
 
-    # mean reversion
+    # 7: mean_reversion
     mask_mean_rev = (mean_rev_flag == 1) & (labels == -1)
     labels[mask_mean_rev] = 7
 
-    # volatility compression
+    # 5: volatility_compression
     mask_comp = (
         (compression_prob > expansion_prob)
         & (vol_regime == "compression")
@@ -81,7 +96,7 @@ def generate_labels(det: pd.DataFrame) -> pd.Series:
     )
     labels[mask_comp] = 5
 
-    # anything still unset defaults to chop_low_vol
+    # anything still unset defaults to chop_low_vol (2)
     labels[labels == -1] = 2
     return labels
 
@@ -89,26 +104,34 @@ def generate_labels(det: pd.DataFrame) -> pd.Series:
 # =========================
 # FEATURES
 # =========================
-def prepare_features(
-    raw_feats: pd.DataFrame, det: pd.DataFrame
-) -> pd.DataFrame:
+def prepare_features(raw_feats: pd.DataFrame, det: pd.DataFrame) -> pd.DataFrame:
+    """
+    Merge raw regime features (Part 1) with deterministic outputs (Part 2)
+    on open_time_ms when present, else by index.
+    """
     # ensure open_time_ms exists and sorted on raw features
     if "open_time_ms" in raw_feats.columns:
         raw_feats = raw_feats.sort_values("open_time_ms").reset_index(drop=True)
 
-    # deterministic engines may not carry timestamps; align by index length
     if "open_time_ms" in det.columns:
         det = det.sort_values("open_time_ms").reset_index(drop=True)
         df = raw_feats.merge(det, on="open_time_ms", how="left")
     else:
         if len(det) != len(raw_feats):
-            raise ValueError("Deterministic engines missing open_time_ms and length mismatch with raw features.")
-        df = pd.concat([raw_feats.reset_index(drop=True), det.reset_index(drop=True)], axis=1)
+            raise ValueError(
+                "Deterministic engines missing open_time_ms and length mismatch with raw features."
+            )
+        df = pd.concat(
+            [raw_feats.reset_index(drop=True), det.reset_index(drop=True)], axis=1
+        )
 
     return df.fillna(0)
 
 
 def encode_categoricals(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Encode any object/category columns as integer categories for LightGBM.
+    """
     cat_cols = df.select_dtypes(include=["object", "category"]).columns
     for col in cat_cols:
         df[col] = df[col].astype("category").cat.codes
@@ -118,23 +141,29 @@ def encode_categoricals(df: pd.DataFrame) -> pd.DataFrame:
 # =========================
 # INPUT BOOTSTRAP
 # =========================
-def ensure_inputs():
-    """Ensure raw_regime_features and deterministic engines exist by invoking pre-process and upstream steps when missing."""
+def ensure_inputs() -> None:
+    """
+    Ensure:
+      - raw_regime_features.parquet exists (Pillar 4 Part 1)
+      - deterministic_regime_engines.parquet exists (Pillar 4 Part 2)
+
+    If missing, call the local build scripts. We assume Phase 0 and
+    PRE_PILLARFOUR have already produced normalised_features upstream.
+    """
     if not RAW_FEATURES_PATH.exists():
-        if str(PREPROCESS_DIR) not in sys.path:
-            sys.path.insert(0, str(PREPROCESS_DIR))
-        try:
-            from raw_data_layer import load_raw_data  # type: ignore
-        except Exception as exc:  # pragma: no cover - import guard
-            raise FileNotFoundError(f"raw_regime_features missing and failed to import pre-process layer: {exc}")
-        logging.info("raw_regime_features not found; running pre-process raw_data_layer + build_raw_regime_features")
-        load_raw_data()
+        logging.info(
+            "raw_regime_features not found; building via build_raw_regime_features.main()"
+        )
         from build_raw_regime_features import main as build_part_one  # type: ignore
+
         build_part_one()
 
     if not DETERMINISTIC_PATH.exists():
-        logging.info("deterministic_regime_engines missing; building via deterministic_regime_engines.main()")
+        logging.info(
+            "deterministic_regime_engines missing; building via deterministic_regime_engines.main()"
+        )
         from deterministic_regime_engines import main as build_det  # type: ignore
+
         build_det()
 
 
@@ -156,25 +185,51 @@ def train_model(X_train, y_train, X_val, y_val):
 
 
 def predict(model, X: pd.DataFrame) -> pd.DataFrame:
-    proba = model.predict_proba(X)
-    regime_pred = np.argmax(proba, axis=1)
-    regime_confidence = proba.max(axis=1)
+    """
+    Predict regime classes and probabilities.
+
+    IMPORTANT:
+    - LightGBM internally maps class labels via model.classes_.
+    - We must map argmax indices back through model.classes_
+      so regime_pred lives in the original label space (0–7),
+      not in [0..num_used_classes-1].
+    """
+    proba = model.predict_proba(X)  # shape: [n_samples, n_classes_used]
+    classes = model.classes_        # e.g. array([2, 3, 4, 5, 6])
+
+    # index of max probability per row
+    pred_idx = np.argmax(proba, axis=1)
+
+    # map back to original label IDs (0–7 scheme, but only 2–6 used in practice)
+    regime_pred = classes[pred_idx]
+
+    # confidence = probability of the chosen class
+    regime_confidence = proba[np.arange(proba.shape[0]), pred_idx]
 
     data = {
         "regime_pred": regime_pred,
         "regime_confidence": regime_confidence,
     }
+
+    # Keep raw probability columns (indexed by internal class index,
+    # which is fine for debugging; fusion only uses regime_confidence).
     for i in range(proba.shape[1]):
         data[f"prob_{i}"] = proba[:, i]
+
     return pd.DataFrame(data, index=X.index)
 
 
 # =========================
 # MAIN
 # =========================
-def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+    )
+
     ensure_inputs()
+
     logging.info("Loading inputs")
     raw_feats = pd.read_parquet(RAW_FEATURES_PATH)
     det = pd.read_parquet(DETERMINISTIC_PATH)
@@ -183,10 +238,12 @@ def main():
     df = prepare_features(raw_feats, det)
     labels = generate_labels(det)
 
-    # drop timestamp columns
-    feature_df = df.drop(columns=[c for c in df.columns if c in ["open_time_ms", "open_time"]], errors="ignore")
-    feature_df = encode_categoricals(feature_df)
-    feature_df = feature_df.fillna(0)
+    # drop timestamp columns from features
+    feature_df = df.drop(
+        columns=[c for c in df.columns if c in ["open_time_ms", "open_time"]],
+        errors="ignore",
+    )
+    feature_df = encode_categoricals(feature_df).fillna(0)
 
     # chronological split 80/20
     split_idx = int(len(feature_df) * 0.8)
@@ -196,7 +253,7 @@ def main():
     logging.info("Training LightGBM model")
     model = train_model(X_train, y_train, X_val, y_val)
 
-    logging.info("Predicting probabilities")
+    logging.info("Predicting probabilities on full history")
     preds = predict(model, feature_df)
 
     logging.info("Saving outputs")

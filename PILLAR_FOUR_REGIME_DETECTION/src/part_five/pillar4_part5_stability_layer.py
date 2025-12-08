@@ -14,6 +14,9 @@ PROB_THRESHOLD_HIGH_BASE = 0.60
 PROB_THRESHOLD_LOW_BASE = 0.40
 MOMENTUM_SPAN = 5
 
+# Volatility-dependent smoothing:
+#  - more smoothing in compression (slower to switch)
+#  - less smoothing in expansion (faster to switch)
 VOL_MULTIPLIER = {
     "compression": 1.5,
     "normal": 1.0,
@@ -50,9 +53,10 @@ def load_inputs():
 
     # align lengths
     if not (len(fused) == len(ml) == len(det)):
-        raise ValueError("Input lengths mismatch between fused, ml, deterministic.")
+        raise ValueError(
+            f"Input lengths mismatch: fused={len(fused)}, ml={len(ml)}, det={len(det)}"
+        )
 
-    # ensure indices aligned
     fused = fused.reset_index(drop=True)
     ml = ml.reset_index(drop=True)
     det = det.reset_index(drop=True)
@@ -63,14 +67,15 @@ def load_inputs():
 # =========================
 # HYSTERESIS / MOMENTUM SUPPORT
 # =========================
-def ema(series: np.ndarray, span: int):
+def ema(series: np.ndarray, span: int) -> np.ndarray:
+    """Simple EMA over a 1D numpy array."""
     if len(series) == 0:
-        return np.array([])
-    alpha = 2 / (span + 1)
+        return np.array([], dtype=float)
+    alpha = 2.0 / (span + 1.0)
     out = np.empty_like(series, dtype=float)
     out[0] = series[0]
     for i in range(1, len(series)):
-        out[i] = alpha * series[i] + (1 - alpha) * out[i - 1]
+        out[i] = alpha * series[i] + (1.0 - alpha) * out[i - 1]
     return out
 
 
@@ -78,25 +83,45 @@ def ema(series: np.ndarray, span: int):
 # SMOOTHING ENGINE
 # =========================
 def smooth(fused: pd.DataFrame, ml: pd.DataFrame, det: pd.DataFrame) -> pd.DataFrame:
+    """
+    Stability layer:
+
+    - Inputs:
+        * fused["regime_label_fused"]    (string / numeric labels)
+        * ml["regime_confidence"]        (probability of chosen ML regime)
+        * det["volatility_regime"]       (compression / normal / expansion)
+
+    - Methods:
+        * Minimum hold time (volatility-scaled)
+        * Hysteresis on regime_confidence (high/low thresholds)
+        * Probability momentum (EMA of regime_confidence)
+        * Cooldown after transitions
+        * Volatility-weighted smoothing
+    """
     n = len(fused)
+    if n == 0:
+        return pd.DataFrame(
+            columns=["regime_label_stable", "regime_label_prev", "hold_length", "smoothing_mode"]
+        )
+
+    # ML confidence over time
     ml_conf = ml["regime_confidence"].to_numpy()
-    regime_pred = ml["regime_pred"].to_numpy()
-    prob_cols = [c for c in ml.columns if c.startswith("prob_")]
-    ml_probs = ml[prob_cols].to_numpy()
+    # EMA of confidence = "probability momentum"
+    ml_conf_ema = ema(ml_conf, MOMENTUM_SPAN)
 
-    volatility_regime = det["volatility_regime"].to_numpy()
+    # Volatility state from deterministic engines
+    volatility_regime = det["volatility_regime"].astype(str).to_numpy()
 
+    # Fused label timeline (already includes deterministic overrides + ML)
     fused_label = fused["regime_label_fused"].astype(str).to_numpy()
 
+    # Output buffers
     stable = np.empty(n, dtype=object)
     prev_label_arr = np.empty(n, dtype=object)
     hold_len_arr = np.zeros(n, dtype=int)
     mode_arr = np.empty(n, dtype=object)
 
-    # momentum buffers per class
-    prob_momentum = np.zeros((n, ml_probs.shape[1]))
-    # compute momentum of probabilities differences relative to current stable over time
-
+    # Initialise with first fused label
     current_label = fused_label[0]
     prev_label = current_label
     hold = 1
@@ -106,58 +131,63 @@ def smooth(fused: pd.DataFrame, ml: pd.DataFrame, det: pd.DataFrame) -> pd.DataF
     prev_label_arr[0] = prev_label
     hold_len_arr[0] = hold
     mode_arr[0] = "none"
-    prob_momentum[0] = ml_probs[0]
 
     for i in range(1, n):
         mode = "none"
-        vol_mult = VOL_MULTIPLIER.get(volatility_regime[i], 1.0)
+
+        # Volatility-weighted parameters
+        vol_reg = volatility_regime[i]
+        vol_mult = VOL_MULTIPLIER.get(vol_reg, 1.0)
+
         min_hold = int(np.ceil(MIN_HOLD_BASE * vol_mult))
         cooldown_req = int(np.ceil(COOLDOWN_BASE * vol_mult))
+
         prob_hi = PROB_THRESHOLD_HIGH_BASE * vol_mult
         prob_lo = PROB_THRESHOLD_LOW_BASE / vol_mult if vol_mult != 0 else PROB_THRESHOLD_LOW_BASE
 
         desired_label = fused_label[i]
-        desired_ml_class = regime_pred[i]
-        desired_prob = ml_probs[i, desired_ml_class]
-        prev_class_prob = ml_probs[i, regime_pred[i - 1]] if i > 0 else desired_prob
+        desired_conf = ml_conf[i]
+        prev_conf = ml_conf[i - 1]
 
-        # update momentum for target class vs current
-        delta_prob = ml_probs[i] - ml_probs[i - 1]
-        prob_momentum[i] = ema(delta_prob, MOMENTUM_SPAN)[-1] if i > 0 else delta_prob
+        # EMA-based momentum of confidence
+        conf_mom_now = ml_conf_ema[i]
+        conf_mom_prev = ml_conf_ema[i - 1]
 
         switch_allowed = True
 
-        # cooldown check
+        # 1) Cooldown after transitions
         if cooldown > 0 and desired_label != current_label:
             switch_allowed = False
             mode = "cooldown"
 
-        # min hold
+        # 2) Minimum hold time
         if switch_allowed and desired_label != current_label and hold < min_hold:
             switch_allowed = False
             mode = "min_hold"
 
-        # hysteresis
+        # 3) Hysteresis on confidence
+        #    Only switch if:
+        #      - the new label is strongly supported (desired_conf > prob_hi)
+        #      OR
+        #      - the previous regime has clearly decayed (prev_conf < prob_lo)
         if switch_allowed and desired_label != current_label:
-            if not (desired_prob > prob_hi or prev_class_prob < prob_lo):
+            if not (desired_conf > prob_hi or prev_conf < prob_lo):
                 switch_allowed = False
                 mode = "hysteresis"
 
-        # probability momentum
+        # 4) Probability momentum (EMA-based)
+        #    Only allow switch if confidence momentum is *rising*.
         if switch_allowed and desired_label != current_label:
-            # momentum of target class relative to current class
-            tgt_mom = prob_momentum[i, desired_ml_class]
-            cur_class = regime_pred[i - 1] if i > 0 else desired_ml_class
-            cur_mom = prob_momentum[i, cur_class]
-            if tgt_mom - cur_mom <= 0:
+            if conf_mom_now - conf_mom_prev <= 0:
                 switch_allowed = False
                 mode = "prob_momentum"
 
-        # volatility-weighted smoothing note
+        # If we get here with switch_allowed and label differs, we mark it as
+        # a volatility-weighted transition (since thresholds depend on vol_reg).
         if switch_allowed and desired_label != current_label:
             mode = "volatility_weighted"
 
-        # apply decision
+        # Apply decision
         if switch_allowed and desired_label != current_label:
             prev_label = current_label
             current_label = desired_label
@@ -209,17 +239,20 @@ def print_summary(df: pd.DataFrame):
 # =========================
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+
     # bootstrap upstream outputs if missing
     if not DETERMINISTIC_PATH.exists():
         logging.info("deterministic_regime_engines missing; building via deterministic_regime_engines.main()")
         from deterministic_regime_engines import main as build_det  # type: ignore
         build_det()
+
     if not ML_PATH.exists():
         logging.info("regime_ml_predictions missing; building via pillar4_part3_ml_regime_classifier.main()")
         if str(PART_THREE_SRC) not in sys.path:
             sys.path.insert(0, str(PART_THREE_SRC))
         from pillar4_part3_ml_regime_classifier import main as build_ml  # type: ignore
         build_ml()
+
     if not FUSED_PATH.exists():
         logging.info("regime_labels_fused missing; building via pillar4_part4_fusion_layer.main()")
         if str(PART_FOUR_SRC) not in sys.path:

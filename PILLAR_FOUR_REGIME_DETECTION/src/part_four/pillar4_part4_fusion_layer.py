@@ -44,20 +44,49 @@ def load_inputs():
     ml = pd.read_parquet(ML_PATH)
     det = det.reset_index(drop=True)
     ml = ml.reset_index(drop=True)
+
+    if len(det) != len(ml):
+        raise ValueError(
+            f"Length mismatch between deterministic and ML outputs: "
+            f"det={len(det)}, ml={len(ml)}"
+        )
     return det, ml
 
 
 def build_deterministic_label(det: pd.DataFrame) -> pd.Series:
+    """
+    Build a coarse, interpretable deterministic label.
+
+    Priority order (later masks override earlier ones):
+      - volatility_expansion
+      - liquidity_drought
+      - trend
+      - chop
+      - mean_reversion
+      - neutral
+    """
     label = pd.Series("neutral", index=det.index)
-    label = label.mask(det["volatility_regime"] == "expansion", "vol_expansion")
-    label = label.mask(det["liquidity_regime"] == "drought", "liq_drought")
+
+    # Vol expansion dominates
+    label = label.mask(det["volatility_regime"] == "expansion", "volatility_expansion")
+    # Liquidity drought dominates (unless expansion already set)
+    label = label.mask(det["liquidity_regime"] == "drought", "liquidity_drought")
+    # Trend regimes
     label = label.mask(det["trend_flag"] == 1, "trend")
+    # Chop
     label = label.mask(det["chop_flag"] == 1, "chop")
+    # Mean reversion
     label = label.mask(det["mean_reversion_flag"] == 1, "mean_reversion")
+
     return label
 
 
 def forced_overrides(det: pd.DataFrame, fused: pd.Series, mode: pd.Series):
+    """
+    Hard rules that always win, regardless of ML:
+      - volatility expansion
+      - liquidity drought
+    """
     mask_vol_exp = det["volatility_regime"] == "expansion"
     fused[mask_vol_exp] = "volatility_expansion"
     mode[mask_vol_exp] = "forced_override"
@@ -65,25 +94,50 @@ def forced_overrides(det: pd.DataFrame, fused: pd.Series, mode: pd.Series):
     mask_liq = det["liquidity_regime"] == "drought"
     fused[mask_liq] = "liquidity_drought"
     mode[mask_liq] = "forced_override"
+
     return fused, mode
 
 
-def conflict_resolver(det_row, ml_prob):
+def conflict_resolver(det_row, ml_prob: float) -> bool:
+    """
+    Decide whether deterministic logic should win over ML in medium-confidence conflicts.
+
+    Returns True if deterministic should win, False if ML should win.
+    """
     score = 0.0
     score += WEIGHTS["trend"] * (1 if det_row.get("trend_flag", 0) == 1 else 0)
     score += WEIGHTS["volatility"] * (1 if det_row.get("volatility_regime") == "expansion" else 0)
     score += WEIGHTS["liquidity"] * (1 if det_row.get("liquidity_regime") == "drought" else 0)
     score += WEIGHTS["chop"] * (1 if det_row.get("chop_flag", 0) == 1 else 0)
     score += WEIGHTS["mean_reversion"] * (1 if det_row.get("mean_reversion_flag", 0) == 1 else 0)
+
+    # If deterministic "weight score" is stronger than ML confidence, we keep deterministic.
     return score > ml_prob
 
 
 def fuse(det: pd.DataFrame, ml: pd.DataFrame) -> pd.DataFrame:
+    """
+    Fusion logic:
+
+    1) Forced overrides:
+         - volatility expansion
+         - liquidity drought
+
+    2) Low confidence ML -> deterministic wins
+         ml_conf < THETA_LOW
+
+    3) High confidence ML -> ML wins
+         ml_conf > THETA_HIGH
+
+    4) Medium confidence conflicts -> conflict resolver
+         use deterministic weights vs ml_confidence
+    """
     ml_conf = ml["regime_confidence"]
-    regime_pred = ml["regime_pred"]
+    ml_label = ml["regime_pred"]
 
     det_label = build_deterministic_label(det)
 
+    # Start fused label as deterministic
     fused = det_label.copy()
     fusion_mode = pd.Series("deterministic", index=det.index)
 
@@ -92,43 +146,51 @@ def fuse(det: pd.DataFrame, ml: pd.DataFrame) -> pd.DataFrame:
 
     # 2) Low confidence -> deterministic
     low_conf_mask = ml_conf < THETA_LOW
-    fusion_mode[low_conf_mask] = fusion_mode.where(~low_conf_mask, "deterministic")[low_conf_mask]
+    # Only update where not already forced_override
+    low_conf_mask &= fusion_mode != "forced_override"
+    fusion_mode[low_conf_mask] = "deterministic"
     fused[low_conf_mask] = det_label[low_conf_mask]
 
     # 3) High confidence -> ML
     high_conf_mask = ml_conf > THETA_HIGH
+    # Again, don't override forced overrides
+    high_conf_mask &= fusion_mode != "forced_override"
     fusion_mode[high_conf_mask] = "ml"
-    fused[high_conf_mask] = regime_pred[high_conf_mask]
+    # Here we take the raw regime_pred (numeric 0–7 label space)
+    fused[high_conf_mask] = ml_label[high_conf_mask]
 
     # 4) Conflict resolver for medium confidence
     med_conf_mask = (~low_conf_mask) & (~high_conf_mask) & (fusion_mode != "forced_override")
-    det_differs = det_label != regime_pred
-    resolver_mask = med_conf_mask & det_differs
-    if resolver_mask.any():
-        ml_prob_cols = [c for c in ml.columns if c.startswith("prob_")]
-        ml_probs = ml.loc[resolver_mask, ml_prob_cols].to_numpy()
-        ml_pred_idx = regime_pred[resolver_mask].to_numpy().astype(int)
-        chosen_ml_prob = ml_probs[np.arange(len(ml_probs)), ml_pred_idx]
 
+    # conflict only matters where deterministic label (string) differs from ML numeric label
+    # (we treat any difference as "conflict")
+    det_differs = det_label != ml_label.astype(str)
+    resolver_mask = med_conf_mask & det_differs
+
+    if resolver_mask.any():
+        chosen_ml_prob = ml_conf[resolver_mask].to_numpy()
         det_rows = det.loc[resolver_mask]
+
         take_det_mask = []
         for row, p in zip(det_rows.to_dict("records"), chosen_ml_prob):
             take_det_mask.append(conflict_resolver(row, p))
         take_det_mask = np.array(take_det_mask, dtype=bool)
 
-        # apply decisions
         idx_resolver = resolver_mask[resolver_mask].index
+
+        # deterministic wins
         fused.loc[idx_resolver[take_det_mask]] = det_label.loc[idx_resolver[take_det_mask]]
-        fused.loc[idx_resolver[~take_det_mask]] = regime_pred.loc[idx_resolver[~take_det_mask]]
+        # ML wins (numeric label)
+        fused.loc[idx_resolver[~take_det_mask]] = ml_label.loc[idx_resolver[~take_det_mask]]
         fusion_mode.loc[idx_resolver] = "conflict_resolved"
 
     result = pd.DataFrame(
         {
-            "regime_label_fused": fused,
+            "regime_label_fused": fused.astype(str),
             "ml_confidence": ml_conf,
-            "fusion_mode": fusion_mode,
-            "regime_pred": regime_pred,
-            "deterministic_label": det_label,
+            "fusion_mode": fusion_mode.astype(str),
+            "regime_pred": ml_label,         # raw ML label (0–7 space)
+            "deterministic_label": det_label.astype(str),
         },
         index=det.index,
     )
@@ -147,19 +209,24 @@ def save_output(df: pd.DataFrame):
 
 def print_summary(df: pd.DataFrame):
     print("\n=== Fusion Summary ===")
+    print("Fusion mode counts:")
     print(df["fusion_mode"].value_counts())
-    print("\nML confidence:")
+    print("\nML confidence stats:")
     print(df["ml_confidence"].agg(["min", "max", "mean"]))
+    print("\nFused label sample:")
+    print(df["regime_label_fused"].value_counts().head())
     print("=====================\n")
 
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+
     # bootstrap upstream outputs if missing
     if not DETERMINISTIC_PATH.exists():
         logging.info("deterministic_regime_engines missing; building via deterministic_regime_engines.main()")
         from deterministic_regime_engines import main as build_det  # type: ignore
         build_det()
+
     if not ML_PATH.exists():
         logging.info("regime_ml_predictions missing; building via pillar4_part3_ml_regime_classifier.main()")
         if str(PART_THREE_SRC) not in sys.path:
