@@ -1,0 +1,353 @@
+import json
+import logging
+from pathlib import Path
+from typing import Any, Dict, Optional, Union
+
+# =============================================================================
+# CONFIG
+# =============================================================================
+
+DEFAULT_CONFIG: Dict[str, Dict[str, Any]] = {
+    "0": {
+        "entry_multiplier": 1.2,
+        "trend_alignment_weight": 1.0,
+        "chop_suppression_factor": 0.2,
+        "tp_multiplier": 1.1,
+        "sl_multiplier": 0.9,
+        "decay_rate": 0.01,
+        "directional_bias": "long",
+        "sizing_multiplier": 1.1,
+        "volatility_adjustment": 0.9,
+        "risk_scaling_mode": "pro_cyclical",
+    },
+    "1": {
+        "entry_multiplier": 1.2,
+        "trend_alignment_weight": 1.0,
+        "chop_suppression_factor": 0.2,
+        "tp_multiplier": 1.1,
+        "sl_multiplier": 0.9,
+        "decay_rate": 0.01,
+        "directional_bias": "short",
+        "sizing_multiplier": 1.1,
+        "volatility_adjustment": 0.9,
+        "risk_scaling_mode": "pro_cyclical",
+    },
+    "2": {
+        "entry_multiplier": 0.8,
+        "trend_alignment_weight": 0.4,
+        "chop_suppression_factor": 0.8,
+        "tp_multiplier": 0.9,
+        "sl_multiplier": 1.1,
+        "decay_rate": 0.02,
+        "directional_bias": "neutral",
+        "sizing_multiplier": 0.8,
+        "volatility_adjustment": 1.1,
+        "risk_scaling_mode": "counter_cyclical",
+    },
+    "3": {
+        "entry_multiplier": 0.7,
+        "trend_alignment_weight": 0.3,
+        "chop_suppression_factor": 0.9,
+        "tp_multiplier": 0.85,
+        "sl_multiplier": 1.15,
+        "decay_rate": 0.02,
+        "directional_bias": "neutral",
+        "sizing_multiplier": 0.7,
+        "volatility_adjustment": 1.2,
+        "risk_scaling_mode": "counter_cyclical",
+    },
+    "4": {
+        "entry_multiplier": 1.0,
+        "trend_alignment_weight": 0.8,
+        "chop_suppression_factor": 0.3,
+        "tp_multiplier": 1.15,
+        "sl_multiplier": 0.95,
+        "decay_rate": 0.015,
+        "directional_bias": "long",
+        "sizing_multiplier": 1.0,
+        "volatility_adjustment": 1.0,
+        "risk_scaling_mode": "neutral",
+    },
+    "5": {
+        "entry_multiplier": 0.9,
+        "trend_alignment_weight": 0.6,
+        "chop_suppression_factor": 0.4,
+        "tp_multiplier": 0.95,
+        "sl_multiplier": 1.05,
+        "decay_rate": 0.015,
+        "directional_bias": "short",
+        "sizing_multiplier": 0.9,
+        "volatility_adjustment": 1.05,
+        "risk_scaling_mode": "neutral",
+    },
+    "6": {
+        "entry_multiplier": 0.5,
+        "trend_alignment_weight": 0.2,
+        "chop_suppression_factor": 1.0,
+        "tp_multiplier": 0.8,
+        "sl_multiplier": 1.2,
+        "decay_rate": 0.03,
+        "directional_bias": "neutral",
+        "sizing_multiplier": 0.5,
+        "volatility_adjustment": 1.3,
+        "risk_scaling_mode": "defensive",
+    },
+    "7": {
+        "entry_multiplier": 0.9,
+        "trend_alignment_weight": 0.5,
+        "chop_suppression_factor": 0.6,
+        "tp_multiplier": 1.0,
+        "sl_multiplier": 1.0,
+        "decay_rate": 0.02,
+        "directional_bias": "mean_revert",
+        "sizing_multiplier": 0.9,
+        "volatility_adjustment": 1.0,
+        "risk_scaling_mode": "neutral",
+    },
+}
+
+
+def write_config(path: Path, config: Dict[str, Dict[str, Any]]) -> None:
+    """
+    One-off helper to materialise regime_effects_config.json.
+
+    The integration functions below are pure; they never write to disk.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
+    logging.info("Wrote regime effects config to %s", path)
+
+
+def load_config(path: Optional[Path] = None) -> Dict[str, Dict[str, Any]]:
+    """
+    Load regime effects config. If path is None or missing, fall back to DEFAULT_CONFIG.
+    """
+    if path is None:
+        return DEFAULT_CONFIG
+
+    if not path.exists():
+        logging.warning("Config path %s missing, using DEFAULT_CONFIG.", path)
+        return DEFAULT_CONFIG
+
+    with path.open("r", encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    # ensure string keys
+    return {str(k): v for k, v in cfg.items()}
+
+
+# =============================================================================
+# REGIME LABEL NORMALISATION
+# =============================================================================
+
+# Canonical mapping: class id -> semantic name (for reference only)
+REGIME_ID_TO_NAME = {
+    0: "trend_up",
+    1: "trend_down",
+    2: "chop_low_vol",
+    3: "chop_high_vol",
+    4: "volatility_expansion",
+    5: "volatility_compression",
+    6: "liquidity_drought",
+    7: "mean_reversion",
+}
+
+# Reverse mapping and some aliases to cope with fused/stable labels:
+_REGIME_NAME_TO_ID: Dict[str, int] = {
+    "trend_up": 0,
+    "trend_down": 1,
+    "chop_low_vol": 2,
+    "chop_high_vol": 3,
+    "volatility_expansion": 4,
+    "vol_expansion": 4,
+    "volatility_compression": 5,
+    "vol_compression": 5,
+    "liquidity_drought": 6,
+    "mean_reversion": 7,
+    "mean_revert": 7,
+    # some fused outputs may come through literally as "2.0", "3.0", "5.0"
+    "2.0": 2,
+    "3.0": 3,
+    "5.0": 5,
+}
+
+
+def normalise_regime_label(label: Union[int, float, str]) -> int:
+    """
+    Normalise whatever comes out of Pillar 4 (stable/fused labels) to 0..7.
+
+    Accepts:
+      - integer/float IDs: 0, 1, 2, 3, 4, 5, 6, 7 (or 2.0, etc.)
+      - string IDs: "0", "1", ... "7"
+      - named labels: "liquidity_drought", "volatility_expansion", etc.
+    """
+    # If it's already an int in range, just return it
+    if isinstance(label, int) and 0 <= label <= 7:
+        return label
+
+    # If it's a float like 2.0, convert
+    if isinstance(label, float) and 0 <= label <= 7 and float(int(label)) == float(label):
+        return int(label)
+
+    # If it's a string, try multiple interpretations
+    if isinstance(label, str):
+        stripped = label.strip()
+
+        # Try direct int parse first ("2", "3", etc.)
+        try:
+            as_int = int(float(stripped))  # handles "2", "2.0"
+            if 0 <= as_int <= 7:
+                return as_int
+        except ValueError:
+            pass
+
+        # Try lookup by semantic name or alias
+        lowered = stripped.lower()
+        if lowered in _REGIME_NAME_TO_ID:
+            return _REGIME_NAME_TO_ID[lowered]
+
+    raise ValueError(f"Cannot normalise regime label '{label}' to 0..7.")
+
+
+# =============================================================================
+# INTEGRATION: PILLAR 1 (ENTRY)
+# =============================================================================
+
+def compute_entry_adjustments(
+    regime_label: Union[int, float, str],
+    regime_confidence: float,
+    config: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Map a regime label to Pillar 1 entry adjustments.
+
+    Parameters
+    ----------
+    regime_label :
+        Regime identifier (0..7) OR fused/stable label string (e.g. "liquidity_drought").
+    regime_confidence : float
+        Confidence score from Pillar 4 ML / fusion (0..1). Currently not used to
+        fade the config, but kept for future extension.
+    config : dict
+        Configuration loaded from regime_effects_config.json (or DEFAULT_CONFIG).
+
+    Returns
+    -------
+    dict
+        {
+          "entry_multiplier": float,
+          "trend_alignment_weighting": float,
+          "chop_suppression_factor": float,
+        }
+    """
+    regime_id = normalise_regime_label(regime_label)
+    key = str(regime_id)
+    if key not in config:
+        raise ValueError(f"Unknown regime_label '{regime_label}' (normalised={regime_id}) in entry adjustments.")
+
+    entry_cfg = config[key]
+    return {
+        "entry_multiplier": entry_cfg["entry_multiplier"],
+        "trend_alignment_weighting": entry_cfg["trend_alignment_weight"],
+        "chop_suppression_factor": entry_cfg["chop_suppression_factor"],
+    }
+
+
+# =============================================================================
+# INTEGRATION: PILLAR 2 (EXIT)
+# =============================================================================
+
+def compute_exit_adjustments(
+    regime_label: Union[int, float, str],
+    regime_confidence: float,
+    config: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Map a regime label to Pillar 2 exit adjustments.
+
+    Parameters
+    ----------
+    regime_label :
+        Regime identifier (0..7) OR fused/stable label string.
+    regime_confidence : float
+        Confidence score from Pillar 4 (currently unused; hook for future).
+    config : dict
+        Configuration loaded from regime_effects_config.json (or DEFAULT_CONFIG).
+
+    Returns
+    -------
+    dict
+        {
+          "tp_multiplier": float,
+          "sl_multiplier": float,
+          "decay_rate": float,
+          "directional_bias": str,
+        }
+    """
+    regime_id = normalise_regime_label(regime_label)
+    key = str(regime_id)
+    if key not in config:
+        raise ValueError(f"Unknown regime_label '{regime_label}' (normalised={regime_id}) in exit adjustments.")
+
+    exit_cfg = config[key]
+    return {
+        "tp_multiplier": exit_cfg["tp_multiplier"],
+        "sl_multiplier": exit_cfg["sl_multiplier"],
+        "decay_rate": exit_cfg["decay_rate"],
+        "directional_bias": exit_cfg["directional_bias"],
+    }
+
+
+# =============================================================================
+# INTEGRATION: PILLAR 3 (RISK)
+# =============================================================================
+
+def compute_risk_adjustments(
+    regime_label: Union[int, float, str],
+    regime_confidence: float,
+    config: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Map a regime label to Pillar 3 risk/sizing adjustments.
+
+    Parameters
+    ----------
+    regime_label :
+        Regime identifier (0..7) OR fused/stable label string.
+    regime_confidence : float
+        Confidence score from Pillar 4 (currently unused; hook for future).
+    config : dict
+        Configuration loaded from regime_effects_config.json (or DEFAULT_CONFIG).
+
+    Returns
+    -------
+    dict
+        {
+          "sizing_multiplier": float,
+          "volatility_adjustment": float,
+          "risk_scaling_mode": str,
+        }
+    """
+    regime_id = normalise_regime_label(regime_label)
+    key = str(regime_id)
+    if key not in config:
+        raise ValueError(f"Unknown regime_label '{regime_label}' (normalised={regime_id}) in risk adjustments.")
+
+    risk_cfg = config[key]
+    return {
+        "sizing_multiplier": risk_cfg["sizing_multiplier"],
+        "volatility_adjustment": risk_cfg["volatility_adjustment"],
+        "risk_scaling_mode": risk_cfg["risk_scaling_mode"],
+    }
+
+
+# =============================================================================
+# OPTIONAL: one-off generator for regime_effects_config.json
+# =============================================================================
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+    base_dir = Path(__file__).resolve().parent
+    out_path = base_dir / "regime_effects_config.json"
+    write_config(out_path, DEFAULT_CONFIG)
