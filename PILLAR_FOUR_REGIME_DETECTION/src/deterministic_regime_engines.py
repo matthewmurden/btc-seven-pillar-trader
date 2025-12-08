@@ -1,5 +1,4 @@
 import logging
-import sys
 from pathlib import Path
 
 import pandas as pd
@@ -13,22 +12,14 @@ from engines.mean_reversion_engine import compute_mean_reversion_engine
 BASE_DIR = Path(__file__).resolve().parent.parent
 INPUT_PATH = BASE_DIR / "data" / "processed" / "part_one" / "raw_regime_features.parquet"
 OUTPUT_PATH = BASE_DIR / "data" / "processed" / "part_two" / "deterministic_regime_engines.parquet"
-PRE_PROCESS_DIR = BASE_DIR / "PRE-PROCESS"
 
 
 def load_raw_features() -> pd.DataFrame:
     if not INPUT_PATH.exists():
-        # ensure pre-process layer builds prerequisites
-        if str(PRE_PROCESS_DIR) not in sys.path:
-            sys.path.insert(0, str(PRE_PROCESS_DIR))
-        try:
-            from raw_data_layer import load_raw_data  # type: ignore
-        except Exception as exc:
-            raise FileNotFoundError(f"raw_regime_features missing at {INPUT_PATH} and failed to load pre-process layer: {exc}")
-        logging.info("raw_regime_features not found; running pre-process raw_data_layer + build_raw_regime_features")
-        load_raw_data()
-        # regenerate part_one features
+        # regenerate part_one features from normalised inputs
         from build_raw_regime_features import main as build_part_one  # type: ignore
+
+        logging.info("raw_regime_features missing; regenerating from normalised_features")
         build_part_one()
     df = pd.read_parquet(INPUT_PATH)
     if "open_time_ms" in df.columns:
