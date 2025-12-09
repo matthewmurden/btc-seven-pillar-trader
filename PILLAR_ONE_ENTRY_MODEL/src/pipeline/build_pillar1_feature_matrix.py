@@ -11,9 +11,10 @@ Adds leakage-free primitive feature groups:
 - Momentum, Trend, Volatility, Reversion, Orderflow, Structure,
   Micro-pattern, Regime-derived.
 
-Debug mode:
-- For faster iteration, you can limit to the last N rows (default 50_000).
-  Set limit=None to use the full dataset.
+Streaming mode:
+- Phase 0 + Pillar 4 base is loaded once.
+- Primitive features are computed in overlapping chunks and streamed
+  to parquet, so we never materialise the full primitive matrix in RAM.
 """
 
 from pathlib import Path
@@ -22,6 +23,8 @@ import logging
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 # ---------------------------------------------------------------------
 # Paths & constants
@@ -38,20 +41,19 @@ DEFAULT_OUTPUT = Path("data/processed/features_pillar1_primitives.parquet")
 
 EPS = 1e-9
 
+# Max lookback across all rolling windows (RSI 14, rolling 20/50/200/1000,
+# hold_length 2000, etc.). We use this for chunk overlap so windowed
+# features are correct at chunk boundaries.
+MAX_LOOKBACK = 2000
+
+# Reasonable default chunk size for a 1.5M row dataset on a laptop
+DEFAULT_CHUNK_SIZE = 200_000
+
 
 # ---------------------------------------------------------------------
 # Merge utilities
 # ---------------------------------------------------------------------
 def _merge_by_index(df: pd.DataFrame, other: pd.DataFrame, tag: str) -> pd.DataFrame:
-    """
-    Fast index-based merge when upstream outputs don't carry timestamps.
-
-    Assumes df and other refer to the same chronological timeline.
-
-    Debug-friendly:
-      - If 'other' is longer than df (e.g. full history vs limited df),
-        we automatically take the last len(df) rows of 'other'.
-    """
     df = df.reset_index(drop=True)
     other = other.reset_index(drop=True)
 
@@ -67,6 +69,24 @@ def _merge_by_index(df: pd.DataFrame, other: pd.DataFrame, tag: str) -> pd.DataF
 def _log_mem(df: pd.DataFrame, msg: str) -> None:
     mb = df.memory_usage(deep=True).sum() / (1024 ** 2)
     logging.info("%s | shape=%s | approx_mem=%.1f MB", msg, df.shape, mb)
+
+
+def _downcast_numeric(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aggressively downcast numeric columns to reduce memory footprint.
+    Keeps semantics the same for this pipeline.
+    """
+    num_cols = df.select_dtypes(include=["float64", "int64"]).columns
+    if not len(num_cols):
+        return df
+
+    for col in num_cols:
+        s = df[col]
+        if pd.api.types.is_float_dtype(s):
+            df[col] = pd.to_numeric(s, downcast="float")
+        elif pd.api.types.is_integer_dtype(s):
+            df[col] = pd.to_numeric(s, downcast="integer")
+    return df
 
 
 def load_base(limit_rows: Optional[int] = None) -> pd.DataFrame:
@@ -97,7 +117,6 @@ def load_base(limit_rows: Optional[int] = None) -> pd.DataFrame:
         df = df.iloc[-limit_rows:].reset_index(drop=True)
     _log_mem(df, "[Base] After normalised load (possibly limited)")
 
-    # We'll use the min timestamp in this subset to filter Pillar 4 inputs.
     min_ts = df["open_time_ms"].iloc[0]
 
     logging.info("Merging deterministic regime engines: %s", DET_PATH)
@@ -133,6 +152,11 @@ def load_base(limit_rows: Optional[int] = None) -> pd.DataFrame:
     _log_mem(df, "[Base] After stable merge")
 
     df = df.ffill().bfill()
+
+    # Shrink memory before primitive feature computation
+    df = _downcast_numeric(df)
+    _log_mem(df, "[Base] After downcast_numeric")
+
     return df
 
 
@@ -140,17 +164,9 @@ def load_base(limit_rows: Optional[int] = None) -> pd.DataFrame:
 # Core helpers (reused across engines)
 # ---------------------------------------------------------------------
 def _ensure_core_series(df: pd.DataFrame) -> None:
-    """
-    Compute core series (returns, volatility) ONCE and reuse across engines.
-
-    Adds:
-    - ret_1m
-    - vol_atr_14 (canonical volatility source)
-    """
     if "ret_1m" not in df.columns:
         df["ret_1m"] = df["close"].pct_change().fillna(0)
 
-    # Canonical volatility: prefer atr_14, then atr_14_norm, then rv_15m, then rv_5m.
     if "vol_atr_14" not in df.columns:
         vol_src = None
         for cand in ["atr_14", "atr_14_norm", "rv_15m", "rv_5m"]:
@@ -163,12 +179,6 @@ def _ensure_core_series(df: pd.DataFrame) -> None:
 
 
 def _rolling_slope(arr: np.ndarray, window: int) -> np.ndarray:
-    """
-    Efficient rolling linear regression slope using raw NumPy.
-
-    - arr: 1D numpy array
-    - window: int window size
-    """
     n = len(arr)
     out = np.zeros(n, dtype=float)
     if window <= 1:
@@ -196,19 +206,16 @@ def add_momentum_primitives(df: pd.DataFrame) -> None:
     ret = df["ret_1m"].to_numpy()
     volume = df.get("volume", pd.Series(0.0, index=df.index)).to_numpy()
 
-    # ROC
     for w in (1, 5, 15):
         roc = (close / np.roll(close, w) - 1.0)
         roc[:w] = 0.0
         df[f"mom_roc_{w}"] = roc
 
-    # z-score of returns over 20 bars
     ret_s = pd.Series(ret)
     mean20 = ret_s.rolling(20).mean()
     std20 = ret_s.rolling(20).std()
     df["mom_ret_z_20"] = ((ret_s - mean20) / (std20 + EPS)).fillna(0.0)
 
-    # OBV and slope over 20 bars
     price_dir = np.sign(np.diff(close, prepend=close[0]))
     obv = (price_dir * volume).cumsum()
     df["mom_obv"] = obv
@@ -216,11 +223,9 @@ def add_momentum_primitives(df: pd.DataFrame) -> None:
     obv_slope_20 = _rolling_slope(obv, window=20)
     df["mom_obv_slope_20"] = obv_slope_20
 
-    # Volatility-adjusted 1-bar momentum
     vol = df["vol_atr_14"].to_numpy()
     df["mom_vol_adj_1"] = ret / (vol + EPS)
 
-    # Momentum acceleration (5-bar ROC change)
     roc_5 = df["mom_roc_5"].to_numpy()
     accel_5 = roc_5 - np.roll(roc_5, 5)
     accel_5[:5] = 0.0
@@ -231,15 +236,12 @@ def add_trend_primitives(df: pd.DataFrame) -> None:
     close = df["close"].to_numpy()
     ret = df["ret_1m"].to_numpy()
 
-    # Rolling slope 20
     df["trend_slope_20"] = _rolling_slope(close, window=20)
 
-    # Trend strength: |slope| / std(ret over 20)
     ret_s = pd.Series(ret)
     std20 = ret_s.rolling(20).std()
     df["trend_strength_20"] = (np.abs(df["trend_slope_20"].to_numpy()) / (std20.to_numpy() + EPS))
 
-    # Efficiency ratio
     s_close = pd.Series(close)
     net_change = (s_close - s_close.shift(20)).abs()
     vol_sum = s_close.diff().abs().rolling(20).sum()
@@ -247,12 +249,10 @@ def add_trend_primitives(df: pd.DataFrame) -> None:
     df["trend_efficiency_20"] = eff
     df["trend_noise_ratio_20"] = 1.0 - eff
 
-    # MA distance: fast vs slow
     ema_fast = s_close.ewm(span=20, adjust=False).mean()
     ema_slow = s_close.ewm(span=50, adjust=False).mean()
     df["trend_ma_dist_fast_slow"] = (ema_fast - ema_slow) / (df["vol_atr_14"] + EPS)
 
-    # HTF trend alignment: use close_5m if available
     if "close_5m" in df.columns:
         htf_close = df["close_5m"].to_numpy()
         htf_slope_5m = _rolling_slope(htf_close, window=20)
@@ -267,15 +267,13 @@ def add_volatility_primitives(df: pd.DataFrame) -> None:
     vol = df["vol_atr_14"]
     ret_s = pd.Series(df["ret_1m"].to_numpy())
 
-    df["vol_atr_14"] = vol  # explicit canonical name
+    df["vol_atr_14"] = vol
 
-    # ATR expansion/contraction
     vol_mean_50 = vol.rolling(50).mean()
     vol_mean_200 = vol.rolling(200).mean()
     df["vol_atr_expansion_50"] = (vol / (vol_mean_50 + EPS)).fillna(1.0)
     df["vol_atr_contraction_200"] = (vol / (vol_mean_200 + EPS)).fillna(1.0)
 
-    # Realised vol 5m / 15m (prefer Phase 0 rv_? if available)
     if "rv_5m" in df.columns:
         df["vol_realised_5m"] = df["rv_5m"].fillna(0.0)
     else:
@@ -286,11 +284,9 @@ def add_volatility_primitives(df: pd.DataFrame) -> None:
     else:
         df["vol_realised_15m"] = ret_s.rolling(15).std().fillna(0.0)
 
-    # Volatility percentile over a long window
     vol_s = vol.astype(float)
     df["vol_percentile_1000"] = vol_s.rolling(1000, min_periods=50).rank(pct=True).fillna(0.5)
 
-    # Vol clustering: ratio of fast vs slow realised vol
     rv_fast = ret_s.rolling(50).std()
     rv_slow = ret_s.rolling(200).std()
     df["vol_cluster_score_50"] = (rv_fast / (rv_slow + EPS)).fillna(1.0)
@@ -299,7 +295,6 @@ def add_volatility_primitives(df: pd.DataFrame) -> None:
 def add_reversion_primitives(df: pd.DataFrame) -> None:
     close = pd.Series(df["close"].to_numpy())
 
-    # RSI(14)
     delta = close.diff()
     gain = delta.clip(lower=0).rolling(14).mean()
     loss = (-delta.clip(upper=0)).rolling(14).mean()
@@ -311,20 +306,17 @@ def add_reversion_primitives(df: pd.DataFrame) -> None:
     df["rev_rsi_overbought"] = np.maximum(0.0, rsi - 70.0)
     df["rev_rsi_oversold"] = np.maximum(0.0, 30.0 - rsi)
 
-    # Z-score deviation over 50
     mean50 = close.rolling(50).mean()
     std50 = close.rolling(50).std()
     z = (close - mean50) / (std50 + EPS)
     z = z.fillna(0.0)
     df["rev_zscore_50"] = z
 
-    # Reversion acceleration (change in z-score over 5 bars)
     z_arr = z.to_numpy()
     accel_5 = z_arr - np.roll(z_arr, 5)
     accel_5[:5] = 0.0
     df["rev_accel_5"] = accel_5
 
-    # Volatility-normalised mean reversion metric
     df["rev_vol_norm"] = z / (df["vol_atr_14"] + EPS)
 
 
@@ -338,21 +330,17 @@ def add_orderflow_primitives(df: pd.DataFrame) -> None:
     df["of_delta"] = delta
     df["of_delta_ema_20"] = delta.ewm(span=20, adjust=False).mean()
 
-    # Taker imbalance proxy
     denom_vol = taker_buy + taker_sell
     df["of_taker_imbalance"] = ((taker_buy - taker_sell) / (denom_vol + EPS)).fillna(0.0)
 
-    # CVD slope 50
     cvd = delta.cumsum()
     df["of_cvd"] = cvd
     df["of_cvd_slope_50"] = (cvd.diff(50) / 50.0).fillna(0.0)
 
-    # Sweep detection: large trades vs rolling median
     roll_tr = trades.rolling(50, min_periods=10)
     med_tr = roll_tr.median()
     df["of_sweep_flag"] = (trades > med_tr * 3.0).astype(int)
 
-    # Absorption: large trades, small net delta
     df["of_absorption_flag"] = (
         (trades > med_tr * 2.0) & (delta.abs() < volume * 0.01)
     ).astype(int)
@@ -369,12 +357,10 @@ def add_structure_primitives(df: pd.DataFrame) -> None:
     df["struct_swing_high_flag_20"] = (high > prev_high_20).astype(int)
     df["struct_swing_low_flag_20"] = (low < prev_low_20).astype(int)
 
-    # Range width 50
     df["struct_range_width_50"] = (
         high.rolling(50).max() - low.rolling(50).min()
     ).fillna(0.0)
 
-    # BOS / CHOCH proxies
     df["struct_bos_flag"] = (
         (df["struct_swing_high_flag_20"] == 1) & (close > close.shift(1))
     ).astype(int)
@@ -383,7 +369,6 @@ def add_structure_primitives(df: pd.DataFrame) -> None:
         (df["struct_swing_low_flag_20"] == 1) & (close < close.shift(1))
     ).astype(int)
 
-    # Liquidity sweep: take out prior extremes with quick rejection
     df["struct_liquidity_sweep_flag"] = (
         (high > prev_high_20 * 1.001) | (low < prev_low_20 * 0.999)
     ).astype(int)
@@ -404,13 +389,11 @@ def add_pattern_primitives(df: pd.DataFrame) -> None:
     upper_ratio = upper_wick / rng
     lower_ratio = lower_wick / rng
 
-    # Pin bars
     pin_bull = (lower_ratio > 0.6) & (body_ratio < 0.2)
     pin_bear = (upper_ratio > 0.6) & (body_ratio < 0.2)
     df["pat_pin_bar_bull"] = pin_bull.astype(int)
     df["pat_pin_bar_bear"] = pin_bear.astype(int)
 
-    # Engulfing patterns
     prev_o = np.roll(o, 1)
     prev_c = np.roll(c, 1)
     prev_body = np.abs(prev_c - prev_o)
@@ -424,12 +407,10 @@ def add_pattern_primitives(df: pd.DataFrame) -> None:
     df["pat_engulfing_bull"] = engulfing_bull.astype(int)
     df["pat_engulfing_bear"] = engulfing_bear.astype(int)
 
-    # Momentum bar: body >> median body
     body_s = pd.Series(body)
     med_body_20 = body_s.rolling(20).median()
     df["pat_momentum_bar"] = (body_s > med_body_20 * 2.0).astype(int)
 
-    # Pattern cluster score over last 10 bars
     pattern_hits = (
         df["pat_pin_bar_bull"]
         + df["pat_pin_bar_bear"]
@@ -441,57 +422,17 @@ def add_pattern_primitives(df: pd.DataFrame) -> None:
         pattern_hits.rolling(10).sum().astype(float).fillna(0.0)
     )
 
-def _drop_constant_numeric_features(df: pd.DataFrame, std_eps: float = 1e-12) -> pd.DataFrame:
-    """
-    Drop constant (or numerically almost-constant) numeric feature columns.
-
-    Rationale:
-    - Constant columns carry no information for ML.
-    - They usually indicate dead inputs, missing upstream data, or
-      placeholder fields that can safely be removed.
-    """
-    numeric = df.select_dtypes(include=[np.number])
-    if numeric.empty:
-        logging.info("[P1] No numeric columns found when checking for constants.")
-        return df
-
-    std = numeric.std()
-    const_cols = std[std <= std_eps].index.tolist()
-
-    if const_cols:
-        logging.warning(
-            "[P1] Dropping %d constant numeric columns: %s",
-            len(const_cols),
-            const_cols,
-        )
-        df = df.drop(columns=const_cols)
-
-    return df
 
 def _coerce_regime_id(series: pd.Series) -> pd.Series:
-    """
-    Convert mixed regime labels (e.g. '2.0', 'volatility_expansion') into
-    canonical integer regime IDs 0..7.
-
-    Mapping (from your pillar 4 plan):
-        0: trend_up
-        1: trend_down
-        2: chop_low_vol
-        3: chop_high_vol
-        4: volatility_expansion
-        5: volatility_compression
-        6: liquidity_drought
-        7: mean_reversion
-    """
     name_to_id = {
         "trend_up": 0,
         "trend_down": 1,
         "chop_low_vol": 2,
         "chop_high_vol": 3,
         "volatility_expansion": 4,
-        "vol_expansion": 4,        # just in case
+        "vol_expansion": 4,
         "volatility_compression": 5,
-        "vol_compression": 5,      # just in case
+        "vol_compression": 5,
         "liquidity_drought": 6,
         "mean_reversion": 7,
     }
@@ -502,47 +443,26 @@ def _coerce_regime_id(series: pd.Series) -> pd.Series:
         v = v.strip()
         if v in name_to_id:
             return name_to_id[v]
-        # Try numeric-ish strings like "2", "3.0", etc.
         try:
             return int(float(v))
         except Exception:
-            # Unknown label → treat as neutral / fallback bucket
             return -1
 
     return s.map(parse).astype(int)
 
-def add_regime_primitives(df: pd.DataFrame) -> None:
-    """
-    Regime-derived primitives (from Pillar 4):
-    - regime_id_stable (regime_final)
-    - regime_confidence
-    - regime_is_trend
-    - regime_is_chop
-    - regime_is_liq_drought
-    - regime_is_vol_expansion
-    - regime_is_mean_reversion
-    - regime_hold_length_norm
-    - regime_chop_mask
-    """
 
-    # ------------------------------------------------------------------
-    # regime_final id (handle direct + index-merged cases)
-    # ------------------------------------------------------------------
+def add_regime_primitives(df: pd.DataFrame) -> None:
     if "regime_label_stable" in df.columns:
         src = df["regime_label_stable"]
-    elif "stable_regime_label_stable" in df.columns:  # index-merged suffix case
+    elif "stable_regime_label_stable" in df.columns:
         src = df["stable_regime_label_stable"]
     elif "regime_label_fused" in df.columns:
-        # Fallback: use fused label if for some reason stable not present
         src = df["regime_label_fused"]
     else:
         src = pd.Series(-1, index=df.index)
 
     df["regime_id_stable"] = _coerce_regime_id(src)
 
-    # ------------------------------------------------------------------
-    # regime_confidence (prefer existing, then ml_confidence variants)
-    # ------------------------------------------------------------------
     for cand in ["regime_confidence", "ml_confidence", "fused_ml_confidence", "stable_ml_confidence"]:
         if cand in df.columns:
             df["regime_confidence"] = (
@@ -552,9 +472,6 @@ def add_regime_primitives(df: pd.DataFrame) -> None:
             )
             break
 
-    # ------------------------------------------------------------------
-    # deterministic flags
-    # ------------------------------------------------------------------
     trend_flag = df.get("trend_flag", pd.Series(0, index=df.index)).astype(int)
     chop_flag = df.get("chop_flag", pd.Series(0, index=df.index)).astype(int)
     mean_rev_flag = df.get("mean_reversion_flag", pd.Series(0, index=df.index)).astype(int)
@@ -567,9 +484,6 @@ def add_regime_primitives(df: pd.DataFrame) -> None:
     df["regime_is_vol_expansion"] = (vol_regime == "expansion").astype(int)
     df["regime_is_liq_drought"] = (liq_regime == "drought").astype(int)
 
-    # ------------------------------------------------------------------
-    # Hold length normalised (use stable_hold_length when index-merged)
-    # ------------------------------------------------------------------
     hold_len = None
     for hc in ["hold_length", "stable_hold_length"]:
         if hc in df.columns:
@@ -590,69 +504,135 @@ def add_regime_primitives(df: pd.DataFrame) -> None:
         .fillna(0.0)
     )
 
-    # ------------------------------------------------------------------
-    # Chop mask: down-weight momentum during chop
-    # ------------------------------------------------------------------
     chop_score = df.get("chop_score", pd.Series(0.0, index=df.index)).astype(float)
     df["regime_chop_mask"] = (1.0 - chop_score.clip(0.0, 1.0))
 
+
 # ---------------------------------------------------------------------
-# Orchestration
+# Chunked orchestration
 # ---------------------------------------------------------------------
+def _compute_primitives_on_chunk(chunk: pd.DataFrame) -> pd.DataFrame:
+    """
+    Apply all primitive engines in-place to a single chunk.
+    """
+    add_momentum_primitives(chunk)
+    add_trend_primitives(chunk)
+    add_volatility_primitives(chunk)
+    add_reversion_primitives(chunk)
+    add_orderflow_primitives(chunk)
+    add_structure_primitives(chunk)
+    add_pattern_primitives(chunk)
+    add_regime_primitives(chunk)
+
+    chunk.replace([np.inf, -np.inf], 0.0, inplace=True)
+    chunk.fillna(0.0, inplace=True)
+    return chunk
+
+
 def build_pillar1_feature_matrix(
     save_path: Optional[Path] = DEFAULT_OUTPUT,
-    limit: Optional[int] = 50_000,
+    limit: Optional[int] = None,       # None => full history
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    overlap: int = MAX_LOOKBACK,
 ) -> pd.DataFrame:
     """
-    High-level builder for Pillar 1 primitive feature matrix.
+    High-level builder for Pillar 1 primitive feature matrix (chunked).
 
     Steps:
-    1) Load Phase 0 + Pillar 4 base dataset (optionally limited).
-    2) Compute core series (returns, volatility) once.
-    3) Apply all primitive feature engines, in-place:
-       - Momentum, Trend, Volatility, Reversion,
-         Orderflow, Structure, Micro-pattern, Regime-derived.
-    4) Clean NaNs/inf, drop constant numeric columns, save parquet, return df.
+    1) Load Phase 0 + Pillar 4 base dataset (optionally limited) into memory.
+    2) Compute core series (returns, volatility) once on the full base.
+    3) Stream over the base in overlapping chunks:
+       - For each chunk, slice [start_overlap:end)
+       - Compute all primitive features on the chunk
+       - Drop the leading overlap rows (except for the first chunk)
+       - Append to a parquet file via pyarrow.ParquetWriter
+    4) Return a lightweight DataFrame with only the last chunk (for debug),
+       while the full primitive matrix is persisted on disk.
     """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-    logging.info("Building Pillar 1 primitive feature matrix (limit=%s)...", limit)
+    logging.info(
+        "Building Pillar 1 primitive feature matrix (limit=%s, chunk_size=%d, overlap=%d)...",
+        limit,
+        chunk_size,
+        overlap,
+    )
 
-    # ✅ FIX: use limit_rows keyword to match load_base definition
-    df = load_base(limit_rows=limit)
-    _ensure_core_series(df)
-    _log_mem(df, "[P1] After base + core series")
+    base = load_base(limit_rows=limit)
+    if "open_time_ms" in base.columns:
+        base = base.sort_values("open_time_ms").reset_index(drop=True)
 
-    # Primitive engines (in-place)
-    add_momentum_primitives(df)
-    add_trend_primitives(df)
-    add_volatility_primitives(df)
-    add_reversion_primitives(df)
-    add_orderflow_primitives(df)
-    add_structure_primitives(df)
-    add_pattern_primitives(df)
-    add_regime_primitives(df)
+    _ensure_core_series(base)
+    _log_mem(base, "[P1] Base after core series")
 
-    # Final clean-up: no NaN/inf
-    df.replace([np.inf, -np.inf], 0.0, inplace=True)
-    df.fillna(0.0, inplace=True)
+    n = len(base)
+    if n == 0:
+        raise ValueError("No rows in base dataset after load_base().")
 
-    # Drop constant numeric features (e.g. rv_5m_reg, of_taker_imbalance)
-    df = _drop_constant_numeric_features(df)
+    if overlap < 0:
+        overlap = 0
+    if overlap > n:
+        overlap = n
 
-    # Ensure sorted by time
-    if "open_time_ms" in df.columns:
-        df.sort_values("open_time_ms", inplace=True)
-        df.reset_index(drop=True, inplace=True)
+    if save_path is None:
+        save_path = DEFAULT_OUTPUT
+    save_path.parent.mkdir(parents=True, exist_ok=True)
 
-    _log_mem(df, "[P1] Final primitive feature matrix")
+    writer = None
+    schema = None
+    last_chunk_df = None
 
-    if save_path is not None:
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        df.to_parquet(save_path, index=False)
-        logging.info("Saved Pillar 1 primitive feature matrix -> %s", save_path)
+    for chunk_idx, start in enumerate(range(0, n, chunk_size)):
+        end = min(n, start + chunk_size)
+        chunk_start = max(0, start - overlap)
 
-    return df
+        logging.info(
+            "[P1] Processing chunk %d: global rows [%d, %d), with warmup [%d, %d)",
+            chunk_idx,
+            start,
+            end,
+            chunk_start,
+            start,
+        )
+
+        # Slice base with overlap and copy so we don't mutate the big base df
+        chunk = base.iloc[chunk_start:end].copy()
+
+        # Compute primitives on this chunk
+        chunk = _compute_primitives_on_chunk(chunk)
+
+        # Drop warmup / overlap rows at the front (except for the very first chunk)
+        if chunk_idx > 0:
+            trim = start - chunk_start
+            if trim > 0:
+                chunk = chunk.iloc[trim:].reset_index(drop=True)
+        else:
+            chunk = chunk.reset_index(drop=True)
+
+        if "open_time_ms" in chunk.columns:
+            chunk = chunk.sort_values("open_time_ms").reset_index(drop=True)
+
+        _log_mem(chunk, f"[P1] Chunk {chunk_idx} after primitives")
+
+        # Initialise writer on first chunk with its schema
+        table = pa.Table.from_pandas(chunk, preserve_index=False)
+        if writer is None:
+            schema = table.schema
+            writer = pq.ParquetWriter(str(save_path), schema=schema, compression="snappy")
+        else:
+            # Ensure consistent schema across chunks
+            table = pa.Table.from_pandas(chunk, schema=schema, preserve_index=False)
+
+        writer.write_table(table)
+        last_chunk_df = chunk  # keep last one around for return/debug
+
+    if writer is not None:
+        writer.close()
+        logging.info("Saved Pillar 1 primitive feature matrix (streamed) -> %s", save_path)
+
+    # Return last chunk for interactive inspection; full dataset is on disk.
+    return last_chunk_df if last_chunk_df is not None else base
 
 
 if __name__ == "__main__":
-    build_pillar1_feature_matrix()
+    # Full history by default; set limit=50_000 if you want debug mode again.
+    build_pillar1_feature_matrix(limit=None)
