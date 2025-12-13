@@ -351,3 +351,23 @@ if __name__ == "__main__":
     base_dir = Path(__file__).resolve().parent
     out_path = base_dir / "regime_effects_config.json"
     write_config(out_path, DEFAULT_CONFIG)
+
+# """ example usage in pillar
+# from pathlib import Path
+# from regime_integration import (
+#     load_config,
+#     compute_entry_adjustments,
+#     compute_exit_adjustments,
+#     compute_risk_adjustments,
+# )
+#
+# cfg = load_config(Path("path/to/regime_effects_config.json"))
+#
+# # In live loop, given stable regime + confidence from Pillar 4:
+# regime_label = stable_row["regime_label_stable"]          # can be 2.0 or "liquidity_drought"
+# regime_conf  = stable_row["ml_confidence"] if "ml_confidence" in stable_row else 1.0
+#
+# entry_adj = compute_entry_adjustments(regime_label, regime_conf, cfg)
+# exit_adj  = compute_exit_adjustments(regime_label, regime_conf, cfg)
+# risk_adj  = compute_risk_adjustments(regime_label, regime_conf, cfg)
+# """
