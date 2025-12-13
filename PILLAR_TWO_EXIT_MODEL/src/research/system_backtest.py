@@ -1,5 +1,5 @@
 """
-System backtest for Pillars 1, 2, 4 (simplified).
+System backtest for Pillars 1, 2, 4 (simplified, diagnostics-heavy).
 
 Uses:
   - Price stream from Pillar 1:
@@ -18,7 +18,14 @@ Outputs:
   - Trade-level PnL (gross & net)
   - Hit distribution (TP / SL / timeout)
   - Win rate, expectancy, Sharpe-like, max drawdown
-  - Simple regime breakdown (by regime_id_stable if available)
+  - Rich diagnostics to tell you WHAT to optimise:
+      * Long vs short breakdown
+      * Regime breakdown (PnL, Sharpe, contribution)
+      * Holding-period buckets
+      * TP/SL distance & R-multiple stats
+      * Entry-confidence & global-gate buckets (if available)
+      * Volatility / expected_exit_time buckets (if available)
+      * Correlations of ret_net with key features
 
 Run:
   python -m src.research.system_backtest
@@ -28,7 +35,7 @@ import gc
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 
 import numpy as np
 import pandas as pd
@@ -61,6 +68,10 @@ class SystemBacktestConfig:
     col_entry_decision: str = "entry_decision"   # 'long' / 'short' / 'none'
     col_entry_direction: str = "entry_direction" # +1 / -1 / 0
 
+    # System-level filter coming from Pillar 2
+    col_system_filter: str = "system_filter_v1"
+    use_system_filter_v1: bool = True
+
     # Preferred (but optional) column names for TP/SL levels
     # If these aren't found, we fall back to distance columns.
     col_tp_level: Optional[str] = "final_tp_level"
@@ -72,6 +83,15 @@ class SystemBacktestConfig:
 
     # Optional extra info
     col_regime_id: str = "regime_id_stable"  # for regime breakdown; optional
+
+    # Common “meta” / feature cols that may exist in trades_df
+    col_entry_conf: str = "entry_confidence"
+    col_global_gate: str = "agg_global_gate"
+    col_expected_exit_time: str = "expected_exit_time"
+    col_tp_distance_alt: str = "optimal_tp_distance"
+    col_sl_distance_alt: str = "optimal_sl_distance"
+    col_volatility_score: str = "volatility_score"
+    col_exit_label: str = "exit_outcome"  # e.g. tp_first / sl_first / timeout (labels)
 
     # Backtest behavior
     max_holding_bars: int = 100        # if TP/SL not hit within this, timeout
@@ -131,15 +151,52 @@ def run_system_backtest(
     n_price = len(price_df)
     logging.info("[SysBT] Price stream length: %d bars", n_price)
 
-    # Filter trades to active decisions (long/short only)
+    # --------------------------------------------------------------
+    # Filter trades: long/short only, then apply system_filter_v1
+    # --------------------------------------------------------------
     mask_active = trades_df[cfg.col_entry_decision].isin(["long", "short"])
     trades_df = trades_df.loc[mask_active].copy()
+
+    if cfg.use_system_filter_v1 and cfg.col_system_filter in trades_df.columns:
+        mask_sys = trades_df[cfg.col_system_filter].astype(bool)
+        n_before = len(trades_df)
+        n_after = int(mask_sys.sum())
+        logging.info(
+            "[SysBT] Applying system_filter_v1: %d / %d trades kept (%.2f%%)",
+            n_after,
+            n_before,
+            100.0 * n_after / max(n_before, 1),
+        )
+        trades_df = trades_df.loc[mask_sys].copy()
+    else:
+        logging.info(
+            "[SysBT] system_filter_v1 not applied (use_system_filter_v1=%s, present=%s)",
+            cfg.use_system_filter_v1,
+            cfg.col_system_filter in trades_df.columns,
+        )
+
     trades_df = trades_df.sort_values(cfg.col_entry_time).reset_index(drop=True)
 
-    _log_mem(trades_df, "[SysBT] Active trades (from exit_final_targets)")
+    _log_mem(trades_df, "[SysBT] Active trades (from exit_final_targets after filter)")
 
     n_trades = len(trades_df)
     logging.info("[SysBT] Number of candidate trades: %d", n_trades)
+
+    if n_trades == 0:
+        logging.warning("[SysBT] No candidate trades after filters; returning empty DataFrame.")
+        out = trades_df.copy()
+        for col in [
+            "bt_entry_idx",
+            "bt_exit_idx",
+            "bt_exit_type",
+            "bt_bars_held",
+            "bt_entry_price",
+            "bt_exit_price",
+            "bt_ret_gross",
+            "bt_ret_net",
+        ]:
+            out[col] = np.nan
+        return out
 
     entry_times = trades_df[cfg.col_entry_time].to_numpy()
     directions = trades_df[cfg.col_entry_direction].to_numpy(dtype=float)
@@ -148,7 +205,7 @@ def run_system_backtest(
     # ------------------------------------------------------------------
     # Detect TP/SL level or distance columns
     # ------------------------------------------------------------------
-    def _pick_col(candidates):
+    def _pick_col(candidates: List[Optional[str]]) -> Optional[str]:
         for col in candidates:
             if col is not None and col in trades_df.columns:
                 return col
@@ -179,6 +236,7 @@ def run_system_backtest(
             "final_tp_distance",
             "fused_tp",
             "fused_tp_distance",
+            cfg.col_tp_distance_alt,
             "optimal_tp_distance",
         ]
     )
@@ -188,6 +246,7 @@ def run_system_backtest(
             "final_sl_distance",
             "fused_sl",
             "fused_sl_distance",
+            cfg.col_sl_distance_alt,
             "optimal_sl_distance",
         ]
     )
@@ -222,7 +281,7 @@ def run_system_backtest(
             raise ValueError(
                 "[SysBT] Could not find suitable TP/SL columns. "
                 "Looked for levels (e.g. final_tp_level/final_sl_level) and "
-                "distances (e.g. final_tp_distance/fused_tp)."
+                "distances (e.g. final_tp_distance/fused_tp/optimal_tp_distance)."
             )
 
     # Result buffers
@@ -424,6 +483,56 @@ def _max_drawdown(equity: np.ndarray) -> float:
     return float(dd.min())
 
 
+def _bucket_stats(
+    series: pd.Series,
+    ret: pd.Series,
+    bucket_edges: List[float],
+    label: str,
+) -> None:
+    """
+    Generic helper to log stats of ret by buckets of a numeric feature.
+    """
+    valid = series.replace([np.inf, -np.inf], np.nan).dropna()
+    if valid.empty:
+        logging.info("[SysBT] %s: no valid values for bucketing.", label)
+        return
+
+    s = series.copy()
+    r = ret.reindex_like(series)
+
+    try:
+        buckets = pd.cut(s, bins=bucket_edges, include_lowest=True)
+    except ValueError:
+        # e.g. all values identical
+        logging.info("[SysBT] %s: cannot bucket (probably all values equal).", label)
+        return
+
+    logging.info("===== %s BUCKET STATS =====", label)
+    grp = pd.DataFrame({"bucket": buckets, "ret": r}).dropna()
+    if grp.empty:
+        logging.info("[SysBT] %s: no data after dropping NaNs.", label)
+        return
+
+    for b, sub in grp.groupby("bucket"):
+        n = len(sub)
+        if n == 0:
+            continue
+        m = float(sub["ret"].mean())
+        sdev = float(sub["ret"].std(ddof=1)) if n > 1 else 0.0
+        wr = float((sub["ret"] > 0).mean())
+        sharpe_like = m / sdev if sdev > 0 else 0.0
+        logging.info(
+            "%s: bucket=%s, n=%d, mean=%.5f (%.2f bps), win_rate=%.4f, sharpe_like=%.3f",
+            label,
+            str(b),
+            n,
+            m,
+            m * 1e4,
+            wr,
+            sharpe_like,
+        )
+
+
 def summarize_backtest(bt_df: pd.DataFrame, cfg: SystemBacktestConfig) -> None:
     # Only trades that actually got simulated (exit_type != 'skipped' / 'overlap_skip')
     mask_valid = bt_df["bt_exit_type"].isin(["tp", "sl", "timeout"])
@@ -438,8 +547,14 @@ def summarize_backtest(bt_df: pd.DataFrame, cfg: SystemBacktestConfig) -> None:
         return
 
     # Basic distributions
-    logging.info("[SysBT] Exit type distribution: %s", bt["bt_exit_type"].value_counts().to_dict())
-    logging.info("[SysBT] Side distribution: %s", bt[cfg.col_entry_decision].value_counts().to_dict())
+    logging.info(
+        "[SysBT] Exit type distribution: %s",
+        bt["bt_exit_type"].value_counts().to_dict(),
+    )
+    logging.info(
+        "[SysBT] Side distribution: %s",
+        bt[cfg.col_entry_decision].value_counts().to_dict(),
+    )
 
     ret_net = bt["bt_ret_net"].to_numpy(dtype=float)
     ret_gross = bt["bt_ret_gross"].to_numpy(dtype=float)
@@ -465,39 +580,310 @@ def summarize_backtest(bt_df: pd.DataFrame, cfg: SystemBacktestConfig) -> None:
     logging.info("max_drawdown   = %.4f (%.2f %%)", mdd, mdd * 100.0)
     logging.info("final_equity   = %.4f (x initial)", equity[-1])
 
+    # ------------------------------------------------------------------
+    # Long vs short performance
+    # ------------------------------------------------------------------
+    logging.info("===== SIDE PERFORMANCE (NET RETURNS) =====")
+    for side, sub in bt.groupby(cfg.col_entry_decision):
+        r = sub["bt_ret_net"].to_numpy(dtype=float)
+        if len(r) == 0:
+            continue
+        m = float(r.mean())
+        sdev = float(r.std(ddof=1)) if len(r) > 1 else 0.0
+        wr_side = float((r > 0).mean())
+        sharpe_side = m / sdev if sdev > 0 else 0.0
+        logging.info(
+            "Side=%s: n=%d, mean=%.5f (%.2f bps), win_rate=%.4f, std=%.5f, sharpe_like=%.3f",
+            side,
+            len(r),
+            m,
+            m * 1e4,
+            wr_side,
+            sdev,
+            sharpe_side,
+        )
+
+    # ------------------------------------------------------------------
     # Regime breakdown if available
+    # ------------------------------------------------------------------
     if cfg.col_regime_id in bt.columns:
         logging.info("===== REGIME BREAKDOWN (by %s) =====", cfg.col_regime_id)
         grp = bt.groupby(cfg.col_regime_id)["bt_ret_net"]
         stats = grp.agg(["count", "mean", "std"])
+        total_pnl = float(bt["bt_ret_net"].sum())
         for reg_id, row in stats.iterrows():
-            mean_r = row["mean"]
-            std_r_reg = row["std"]
+            mean_r = float(row["mean"])
+            std_r_reg = float(row["std"])
             sharpe_reg = mean_r / std_r_reg if std_r_reg and std_r_reg > 0 else 0.0
+            n_reg = int(row["count"])
+            pnl_reg = float(grp.get_group(reg_id).sum())
+            contrib = pnl_reg / total_pnl if total_pnl != 0 else np.nan
             logging.info(
-                "Regime %s: n=%d, mean=%.5f (%.2f bps), std=%.5f, sharpe_like=%.3f",
+                "Regime %s: n=%d, mean=%.5f (%.2f bps), std=%.5f, sharpe_like=%.3f, pnl_contrib=%.2f%%",
                 str(reg_id),
-                int(row["count"]),
+                n_reg,
                 mean_r,
                 mean_r * 1e4,
                 std_r_reg,
                 sharpe_reg,
+                contrib * 100.0 if np.isfinite(contrib) else np.nan,
             )
 
-    # Exit-type breakdown
+    # ------------------------------------------------------------------
+    # Exit-type breakdown (already net)
+    # ------------------------------------------------------------------
     logging.info("===== EXIT-TYPE BREAKDOWN (NET RETURNS) =====")
     for etype in ["tp", "sl", "timeout"]:
         sub = bt.loc[bt["bt_exit_type"] == etype, "bt_ret_net"]
         if len(sub) == 0:
             continue
+        m = float(sub.mean())
         logging.info(
             "Exit=%s: n=%d, mean=%.5f (%.2f bps), win_rate=%.4f",
             etype,
             len(sub),
-            float(sub.mean()),
-            float(sub.mean()) * 1e4,
+            m,
+            m * 1e4,
             float((sub > 0).mean()),
         )
+
+    # ------------------------------------------------------------------
+    # Holding-period buckets (bars_held)
+    # ------------------------------------------------------------------
+    if "bt_bars_held" in bt.columns:
+        bars = bt["bt_bars_held"].astype(float)
+        _bucket_stats(
+            series=bars,
+            ret=bt["bt_ret_net"],
+            bucket_edges=[0, 5, 20, 50, 100, np.inf],
+            label="HOLDING_BARS",
+        )
+
+    # ------------------------------------------------------------------
+    # TP/SL distance & R-multiple diagnostics (from original columns)
+    # ------------------------------------------------------------------
+    # Prefer explicit distance columns if present
+    tp_dist_col = None
+    sl_dist_col = None
+    for col in [
+        "final_tp_distance",
+        "fused_tp_distance",
+        cfg.col_tp_distance_alt,
+        cfg.col_tp_dist,
+        "optimal_tp_distance",
+    ]:
+        if col in bt.columns:
+            tp_dist_col = col
+            break
+    for col in [
+        "final_sl_distance",
+        "fused_sl_distance",
+        cfg.col_sl_distance_alt,
+        cfg.col_sl_dist,
+        "optimal_sl_distance",
+    ]:
+        if col in bt.columns:
+            sl_dist_col = col
+            break
+
+    if tp_dist_col and sl_dist_col:
+        logging.info(
+            "===== TP/SL DISTANCE DIAGNOSTICS: tp=%s, sl=%s =====",
+            tp_dist_col,
+            sl_dist_col,
+        )
+        tp_d = pd.to_numeric(bt[tp_dist_col], errors="coerce")
+        sl_d = pd.to_numeric(bt[sl_dist_col], errors="coerce")
+
+        # R-multiple approx: TP distance / SL distance
+        with np.errstate(divide="ignore", invalid="ignore"):
+            r_mult = tp_d / sl_d
+        bt["bt_r_multiple"] = r_mult.replace([np.inf, -np.inf], np.nan)
+
+        _bucket_stats(
+            series=bt["bt_r_multiple"],
+            ret=bt["bt_ret_net"],
+            bucket_edges=[-np.inf, 0.5, 1.0, 1.5, 2.0, np.inf],
+            label="R_MULTIPLE",
+        )
+
+        # Also see if very tiny SL / TP trades are junk
+        _bucket_stats(
+            series=sl_d,
+            ret=bt["bt_ret_net"],
+            bucket_edges=[0.0, 0.001, 0.003, 0.01, np.inf],
+            label="SL_DISTANCE",
+        )
+        _bucket_stats(
+            series=tp_d,
+            ret=bt["bt_ret_net"],
+            bucket_edges=[0.0, 0.001, 0.003, 0.01, np.inf],
+            label="TP_DISTANCE",
+        )
+
+    # ------------------------------------------------------------------
+    # Entry-confidence & global-gate diagnostics (if available)
+    # ------------------------------------------------------------------
+    if cfg.col_entry_conf in bt.columns:
+        conf = pd.to_numeric(bt[cfg.col_entry_conf], errors="coerce")
+        logging.info("===== ENTRY_CONFIDENCE BUCKET STATS =====")
+        # Quantile buckets (deciles)
+        try:
+            q = pd.qcut(conf, q=10, duplicates="drop")
+            df_conf = pd.DataFrame(
+                {"bucket": q, "ret": bt["bt_ret_net"], "entry_conf": conf}
+            ).dropna()
+            for b, sub in df_conf.groupby("bucket"):
+                n = len(sub)
+                if n == 0:
+                    continue
+                m = float(sub["ret"].mean())
+                sdev = float(sub["ret"].std(ddof=1)) if n > 1 else 0.0
+                wr = float((sub["ret"] > 0).mean())
+                sharpe = m / sdev if sdev > 0 else 0.0
+                logging.info(
+                    "entry_conf bucket=%s, n=%d, mean=%.5f (%.2f bps), win_rate=%.4f, sharpe_like=%.3f",
+                    str(b),
+                    n,
+                    m,
+                    m * 1e4,
+                    wr,
+                    sharpe,
+                )
+        except ValueError:
+            logging.info("[SysBT] entry_confidence: not enough variation for qcut.")
+
+        # Threshold sweep (rough idea which gate to use)
+        for thr in [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]:
+            sub = bt.loc[conf >= thr, "bt_ret_net"]
+            if len(sub) == 0:
+                continue
+            m = float(sub.mean())
+            sdev = float(sub.std(ddof=1)) if len(sub) > 1 else 0.0
+            wr = float((sub > 0).mean())
+            sharpe_thr = m / sdev if sdev > 0 else 0.0
+            logging.info(
+                "entry_conf >= %.2f: n=%d, mean=%.5f (%.2f bps), win_rate=%.4f, sharpe_like=%.3f",
+                thr,
+                len(sub),
+                m,
+                m * 1e4,
+                wr,
+                sharpe_thr,
+            )
+
+    if cfg.col_global_gate in bt.columns:
+        gg = pd.to_numeric(bt[cfg.col_global_gate], errors="coerce")
+        # Simple split: gate > 0 vs <= 0
+        for label, mask in [
+            ("agg_global_gate > 0", gg > 0.0),
+            ("agg_global_gate <= 0", gg <= 0.0),
+        ]:
+            sub = bt.loc[mask, "bt_ret_net"]
+            if len(sub) == 0:
+                continue
+            m = float(sub.mean())
+            sdev = float(sub.std(ddof=1)) if len(sub) > 1 else 0.0
+            wr = float((sub > 0).mean())
+            sharpe_sub = m / sdev if sdev > 0 else 0.0
+            logging.info(
+                "%s: n=%d, mean=%.5f (%.2f bps), win_rate=%.4f, sharpe_like=%.3f",
+                label,
+                len(sub),
+                m,
+                m * 1e4,
+                wr,
+                sharpe_sub,
+            )
+
+    # ------------------------------------------------------------------
+    # Volatility & expected-exit-time diagnostics (if available)
+    # ------------------------------------------------------------------
+    if cfg.col_volatility_score in bt.columns:
+        vol_s = pd.to_numeric(bt[cfg.col_volatility_score], errors="coerce")
+        _bucket_stats(
+            series=vol_s,
+            ret=bt["bt_ret_net"],
+            bucket_edges=[-np.inf, -1.0, -0.3, 0.3, 1.0, np.inf],
+            label="VOLATILITY_SCORE",
+        )
+
+    if cfg.col_expected_exit_time in bt.columns:
+        eet = pd.to_numeric(bt[cfg.col_expected_exit_time], errors="coerce")
+        _bucket_stats(
+            series=eet,
+            ret=bt["bt_ret_net"],
+            bucket_edges=[0.0, 10.0, 30.0, 60.0, 120.0, np.inf],
+            label="EXPECTED_EXIT_TIME",
+        )
+
+    # ------------------------------------------------------------------
+    # Time-of-day / weekday diagnostics (if the time column looks like ms)
+    # ------------------------------------------------------------------
+    try:
+        dt = pd.to_datetime(bt[cfg.col_entry_time], unit="ms")
+        bt["bt_hour"] = dt.dt.hour
+        bt["bt_weekday"] = dt.dt.dayofweek  # 0=Mon
+
+        _bucket_stats(
+            series=bt["bt_hour"].astype(float),
+            ret=bt["bt_ret_net"],
+            bucket_edges=[-0.5, 3.5, 7.5, 11.5, 15.5, 19.5, 23.5],
+            label="ENTRY_HOUR",
+        )
+
+        logging.info("===== WEEKDAY PERFORMANCE (0=Mon) =====")
+        for wd, sub in bt.groupby("bt_weekday"):
+            r = sub["bt_ret_net"].to_numpy(dtype=float)
+            if len(r) == 0:
+                continue
+            m = float(r.mean())
+            sdev = float(r.std(ddof=1)) if len(r) > 1 else 0.0
+            wr = float((r > 0).mean())
+            sharpe_wd = m / sdev if sdev > 0 else 0.0
+            logging.info(
+                "weekday=%d: n=%d, mean=%.5f (%.2f bps), win_rate=%.4f, sharpe_like=%.3f",
+                int(wd),
+                len(r),
+                m,
+                m * 1e4,
+                wr,
+                sharpe_wd,
+            )
+    except Exception:
+        logging.info("[SysBT] Could not derive datetime-based hour/weekday diagnostics.")
+
+    # ------------------------------------------------------------------
+    # Simple correlations: which features line up with edge?
+    # ------------------------------------------------------------------
+    logging.info("===== FEATURE CORRELATIONS WITH bt_ret_net =====")
+    feature_candidates = [
+        cfg.col_entry_conf,
+        cfg.col_global_gate,
+        cfg.col_volatility_score,
+        cfg.col_expected_exit_time,
+        tp_dist_col if "tp_dist_col" in locals() else None,
+        sl_dist_col if "sl_dist_col" in locals() else None,
+        "bt_r_multiple" if "bt_r_multiple" in bt.columns else None,
+    ]
+    ret_series = bt["bt_ret_net"].astype(float)
+
+    for col in feature_candidates:
+        if col is None or col not in bt.columns:
+            continue
+        x = pd.to_numeric(bt[col], errors="coerce")
+        df_corr = pd.concat([x, ret_series], axis=1).dropna()
+        if df_corr.empty:
+            continue
+        x_arr = df_corr.iloc[:, 0].to_numpy(dtype=float)
+        y_arr = df_corr.iloc[:, 1].to_numpy(dtype=float)
+        if len(x_arr) < 5:
+            continue
+        try:
+            corr = float(np.corrcoef(x_arr, y_arr)[0, 1])
+        except Exception:
+            continue
+        logging.info("corr(bt_ret_net, %s) = %.4f", col, corr)
 
 
 # ---------------------------------------------------------------------
@@ -529,6 +915,7 @@ def main() -> None:
         max_holding_bars=100,
         allow_overlap=False,
         fee_per_side=0.00025,  # 2.5 bps per side
+        # use_system_filter_v1=True by default; flip to False if you want full-unfiltered diagnostics
     )
 
     bt_df = run_system_backtest(price_df, trades_df, cfg=cfg)
@@ -539,7 +926,7 @@ def main() -> None:
     bt_df.to_parquet(out_path, index=False, compression="zstd")
     logging.info("Saved trade-level backtest -> %s", out_path)
 
-    # Print summary metrics
+    # Print summary metrics + rich diagnostics
     summarize_backtest(bt_df, cfg)
 
     # Help GC a bit
