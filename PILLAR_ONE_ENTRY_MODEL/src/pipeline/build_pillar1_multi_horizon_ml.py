@@ -6,20 +6,24 @@ Loads:
   - data/processed/labels_pillar1.parquet
 
 Trains 5 models (short_dir, dir_5_10, dir_15_30, breakout, mean_reversion),
-evaluates on a chronological hold-out, saves models, and writes predictions to:
+evaluates on a chronological hold-out, saves models, and writes SLIM predictions to:
   - data/processed/features_pillar1_with_ml.parquet
 
 Run:
   python -m src.pipeline.build_pillar1_multi_horizon_ml
 """
 
+import gc
 import logging
 from pathlib import Path
+from typing import List
 
+import numpy as np
 import pandas as pd
 
 from src.models.pillar1_multi_horizon_ml import (
     MultiHorizonTrainingConfig,
+    MultiHorizonModelSpec,
     default_model_specs,
     train_and_predict,
 )
@@ -36,6 +40,89 @@ MODEL_DIR = P1_BASE / "models" / "pillar1_multi_horizon"
 def _log_mem(df: pd.DataFrame, msg: str) -> None:
     mb = df.memory_usage(deep=True).sum() / (1024 ** 2)
     logging.info("%s | shape=%s | approx_mem=%.1f MB", msg, df.shape, mb)
+
+
+def _slim_ml_output(df: pd.DataFrame, specs: List[MultiHorizonModelSpec]) -> pd.DataFrame:
+    """
+    Cut the saved ML file down to what later stages actually need:
+
+    - time index: open_time_ms
+    - label columns (y_*)
+    - mini-engine scores
+    - regime_* columns
+    - all model prediction columns (per spec.name)
+
+    This keeps disk usage small and avoids dragging thousands of raw primitives
+    through every later pillar.
+    """
+
+    keep_cols: List[str] = []
+
+    # Time column
+    if "open_time_ms" in df.columns:
+        keep_cols.append("open_time_ms")
+
+    # Label columns
+    label_cols = sorted({spec.label_col for spec in specs if spec.label_col in df.columns})
+    keep_cols.extend(label_cols)
+
+    # Mini-engine scores (from pillar1_mini_engines)
+    for col in [
+        "momentum_score",
+        "trend_score",
+        "volatility_score",
+        "reversion_score",
+        "orderflow_score",
+        "structure_score",
+        "pattern_score",
+    ]:
+        if col in df.columns:
+            keep_cols.append(col)
+
+    # Regime-derived features (used in aggregator / decision layer)
+    regime_cols = [c for c in df.columns if c.startswith("regime_")]
+    keep_cols.extend(regime_cols)
+
+    # All prediction / confidence columns from each model spec
+    pred_prefixes = [spec.name for spec in specs]
+    pred_cols = [c for c in df.columns if any(c.startswith(pfx) for pfx in pred_prefixes)]
+    keep_cols.extend(pred_cols)
+
+    # Remove duplicates but keep order
+    seen = set()
+    ordered_keep = []
+    for c in keep_cols:
+        if c not in seen:
+            seen.add(c)
+            ordered_keep.append(c)
+
+    # Filter to existing columns only
+    missing = [c for c in ordered_keep if c not in df.columns]
+    if missing:
+        logging.warning(
+            "[MH] Some expected columns for slim output are missing and will be skipped: %s",
+            missing,
+        )
+    final_keep = [c for c in ordered_keep if c in df.columns]
+
+    slim = df[final_keep].copy()
+
+    # Downcast float64 -> float32 to save disk space
+    float_cols = slim.select_dtypes(include=["float64"]).columns
+    if len(float_cols) > 0:
+        slim[float_cols] = slim[float_cols].astype("float32")
+
+    # Optionally downcast small ints as well (e.g. labels, regimes)
+    int_cols = slim.select_dtypes(include=["int64"]).columns
+    for col in int_cols:
+        col_max = slim[col].max()
+        col_min = slim[col].min()
+        # fits in int16? fine. this is just disk optimisation.
+        if col_min >= np.iinfo("int16").min and col_max <= np.iinfo("int16").max:
+            slim[col] = slim[col].astype("int16")
+
+    _log_mem(slim, "[MH] Slimmed ML output")
+    return slim
 
 
 def main() -> None:
@@ -73,6 +160,10 @@ def main() -> None:
     df = feats.merge(labels, on="open_time_ms", how="inner", suffixes=("", "_lbl"))
     _log_mem(df, "[MH] After merge")
 
+    # Free raw feats/labels; all info is now in df
+    del feats, labels
+    gc.collect()
+
     logging.info(
         "[MH] Row counts: features=%d, labels=%d, merged=%d",
         n_feats_before,
@@ -80,30 +171,32 @@ def main() -> None:
         len(df),
     )
 
-    # Basic sanity: if we lost a huge number of rows, warn loudly
     if len(df) < min(n_feats_before, n_labels_before) * 0.5:
         logging.warning(
             "[MH] Merged dataset has < 50%% of rows of min(features, labels). "
             "Check label alignment and horizons."
         )
 
-    # Model specs + training config
     specs = default_model_specs()
     cfg = MultiHorizonTrainingConfig(
         model_dir=MODEL_DIR,
     )
-
-    # Ensure model dir exists before training/saving
     cfg.model_dir.mkdir(parents=True, exist_ok=True)
 
-    logging.info("Training multi-horizon models...")
-    df_out = train_and_predict(df, specs=specs, cfg=cfg)
+    logging.info("Training multi-horizon models (RAM-optimised, class-weighted)...")
+    df_with_preds = train_and_predict(df, specs=specs, cfg=cfg)
 
-    _log_mem(df_out, "[MH] Final df with predictions")
+    # We don't need the full monster file on disk – slim it down
+    df_slim = _slim_ml_output(df_with_preds, specs=specs)
 
+    # Save compressed parquet (ZSTD gives good ratio)
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    df_out.to_parquet(OUTPUT_PATH, index=False)
-    logging.info("Saved features + ML predictions -> %s", OUTPUT_PATH)
+    df_slim.to_parquet(OUTPUT_PATH, index=False, compression="zstd")
+    logging.info("Saved SLIM features + ML predictions -> %s", OUTPUT_PATH)
+
+    # Optional: help GC for the rest of the process
+    del df, df_with_preds, df_slim
+    gc.collect()
 
 
 if __name__ == "__main__":
