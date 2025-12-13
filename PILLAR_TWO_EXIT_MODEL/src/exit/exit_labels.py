@@ -18,8 +18,8 @@ class ExitLabelConfig:
     intrabar extremes (high/low) in *directional PnL* space.
 
     Key ideas:
-      - mfe_dir:    max directional excursion (best possible gain)
-      - mae_dir:    min directional excursion (worst drawdown)
+      - mfe_dir:    max directional excursion (best possible gain), >= 0
+      - mae_dir:    min directional excursion (worst drawdown), <= 0
       - expected_exit_time:
             bars until the "dominant" event (tp_first/sl_first/timeout)
       - exit_outcome:
@@ -203,22 +203,45 @@ def build_exit_labels(
         high_slice = high_all[sl_start:sl_end]
         low_slice = low_all[sl_start:sl_end]
 
-        # Directional intrabar extremes:
-        # favourables use high for longs, low for shorts
-        # adverses use low for longs, high for shorts
-        dir_high_ret = direction * (high_slice / entry_price - 1.0)
-        dir_low_ret = direction * (low_slice / entry_price - 1.0)
+        if high_slice.size == 0 or low_slice.size == 0:
+            continue
 
-        # MFE / MAE over the window
-        max_fav = float(np.max(dir_high_ret)) if dir_high_ret.size > 0 else 0.0
-        min_adv = float(np.min(dir_low_ret)) if dir_low_ret.size > 0 else 0.0
+        # Raw returns at intrabar extremes (price-space)
+        high_ret = high_slice / entry_price - 1.0
+        low_ret = low_slice / entry_price - 1.0
+
+        # Directional returns in *trade PnL* space:
+        #   For longs (direction=+1):
+        #       favourable  ~ high_ret
+        #       adverse     ~ low_ret
+        #   For shorts (direction=-1):
+        #       favourable  ~ -low_ret  (price down => profit)
+        #       adverse     ~ -high_ret (price up   => loss)
+        if direction > 0:
+            fav_rets = high_ret
+            adv_rets = low_ret
+        else:
+            fav_rets = -low_ret
+            adv_rets = -high_ret
+
+        if fav_rets.size == 0 or adv_rets.size == 0:
+            continue
+
+        raw_mfe = float(fav_rets.max())
+        raw_mae = float(adv_rets.min())
+
+        # Enforce conventions:
+        #   - MFE >= 0 (no favourable move → 0)
+        #   - MAE <= 0 (no adverse move   → 0)
+        max_fav = max(raw_mfe, 0.0)
+        min_adv = min(raw_mae, 0.0)
 
         mfe_dir[i] = max_fav
         mae_dir[i] = min_adv
 
         # Find when they occur (bars from entry)
-        idx_mfe_rel = int(np.argmax(dir_high_ret)) if dir_high_ret.size > 0 else 0
-        idx_mae_rel = int(np.argmin(dir_low_ret)) if dir_low_ret.size > 0 else 0
+        idx_mfe_rel = int(fav_rets.argmax())
+        idx_mae_rel = int(adv_rets.argmin())
         bars_to_mfe = idx_mfe_rel + 1
         bars_to_mae = idx_mae_rel + 1
 
@@ -250,7 +273,7 @@ def build_exit_labels(
         exit_outcome[i] = outcome
         expected_exit_time[i] = exit_time
 
-        # Optimal TP/SL distances (ex-post)
+        # Optimal TP/SL distances (ex-post, in directional PnL units)
         tp_dist = max(max_fav, 0.0)
         sl_dist = max(-min_adv, move_thr * 0.2)  # small floor so it's never 0
 
