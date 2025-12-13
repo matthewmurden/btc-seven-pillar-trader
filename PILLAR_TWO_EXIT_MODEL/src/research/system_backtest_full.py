@@ -1,5 +1,3 @@
-# src/research/system_backtest_full.py
-
 """
 Full end-to-end backtest (Pillars 1–3):
 
@@ -99,7 +97,9 @@ class SystemBacktestConfig:
     # Gating thresholds
     min_entry_conf: float = 0.0        # require entry_confidence > this
     min_risk_per_trade: float = 0.001  # require at least 0.1% risk to bother trading
-    allowed_risk_modes: Tuple[str, ...] = ("normal", "defensive", "aggressive")
+
+    # Only trade normal + defensive; aggressive & crisis do nothing for now
+    allowed_risk_modes: Tuple[str, ...] = ("normal", "defensive")
 
     # Equity / risk model (for stats; *not* recalculating P3)
     initial_equity: float = 1.0        # base unit equity for P&L accounting
@@ -379,7 +379,9 @@ def run_system_backtest_full(
         len(df),
     )
 
-    # 7) Risk-mode gating: disable trades in 'crisis' risk mode
+    # 7) Risk-mode gating:
+    #    For now, only trade 'normal' and 'defensive'.
+    #    'aggressive' and 'crisis' modes are treated as "do nothing".
     if cfg.col_risk_mode in df.columns:
         risk_mode = df[cfg.col_risk_mode].astype(str)
         risk_mode_mask = risk_mode.isin(cfg.allowed_risk_modes)
