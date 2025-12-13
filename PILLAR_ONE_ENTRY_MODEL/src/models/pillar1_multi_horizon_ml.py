@@ -152,7 +152,6 @@ def chronological_indices(n_rows: int, val_fraction: float) -> Tuple[np.ndarray,
     val_idx = np.arange(split_idx, n_rows, dtype=np.int64)
     return train_idx, val_idx
 
-
 def compute_class_weight(y: np.ndarray) -> Dict:
     """
     Compute simple inverse-frequency class weights:
@@ -160,18 +159,24 @@ def compute_class_weight(y: np.ndarray) -> Dict:
         w_c = n_samples / (n_classes * count_c)
 
     Works for binary and multiclass. Labels can be ints or floats.
+    Keys are converted to plain Python scalars to keep things clean.
     """
     classes, counts = np.unique(y, return_counts=True)
     n_samples = y.shape[0]
     n_classes = len(classes)
     weights: Dict = {}
+
     for c, cnt in zip(classes, counts):
-        # avoid division by zero, though it shouldn't happen
         if cnt <= 0:
             continue
-        weights[c] = float(n_samples) / (float(n_classes) * float(cnt))
-    return weights
+        # NumPy scalar -> Python scalar
+        if hasattr(c, "item"):
+            cls_key = c.item()
+        else:
+            cls_key = c
+        weights[cls_key] = float(n_samples) / (float(n_classes) * float(cnt))
 
+    return weights
 
 def fit_model(
     X_train: np.ndarray,
@@ -180,28 +185,35 @@ def fit_model(
     cfg: MultiHorizonTrainingConfig,
 ) -> HistGradientBoostingClassifier:
     """
-    Fit a HistGradientBoostingClassifier with:
-    - base params from cfg.default_model_params
-    - optional overrides from spec.model_params
-    - optional class_weight inferred from y_train
+    Fit a HistGradientBoostingClassifier with **per-sample weights** instead of
+    using the estimator's class_weight parameter (which is fiddly for multiclass).
+
+    - We compute a class -> weight dict via compute_class_weight(y_train).
+    - Then build sample_weight[i] = weight[y_train[i]] for each row.
     """
     params = cfg.default_model_params.copy()
     if spec.model_params:
         params.update(spec.model_params)
 
-    # Only set class_weight if the user hasn't explicitly provided one.
-    if cfg.use_class_weight and "class_weight" not in params:
-        class_weight = compute_class_weight(y_train)
-        params["class_weight"] = class_weight
-        logging.info(
-            "[MH] Using class_weight for '%s' (%s): %s",
-            spec.name,
-            spec.label_col,
-            class_weight,
-        )
+    # Build class -> weight mapping from the actual training labels
+    class_weight = compute_class_weight(y_train)
+    logging.info(
+        "[MH] Using class_weight for '%s' (%s): %s",
+        spec.name,
+        spec.label_col,
+        class_weight,
+    )
+
+    # Per-sample weights
+    sample_weight = np.empty_like(y_train, dtype=np.float32)
+    for i, cls in enumerate(y_train):
+        # cls may be numpy scalar; normalize to Python scalar for dict lookup
+        key = cls.item() if hasattr(cls, "item") else cls
+        sample_weight[i] = class_weight[key]
 
     model = HistGradientBoostingClassifier(**params)
-    model.fit(X_train, y_train)
+    model.fit(X_train, y_train, sample_weight=sample_weight)
+
     return model
 
 

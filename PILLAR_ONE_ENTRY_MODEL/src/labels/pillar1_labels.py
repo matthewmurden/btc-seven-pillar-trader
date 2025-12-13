@@ -4,11 +4,11 @@ Pillar 1 — Label Construction
 Builds the label set used by the multi-horizon ML predictors (Section 3.4):
 
 Labels produced:
-  - y_dir_1_2      : multi-class direction label for 1–2 bar horizon (-1, 0, 1)
-  - y_dir_5_10     : multi-class direction label for 5–10 bar horizon (-1, 0, 1)
-  - y_dir_15_30    : multi-class direction label for 15–30 bar horizon (-1, 0, 1)
-  - y_breakout     : binary breakout label (0/1)
-  - y_mean_reversion: binary mean-reversion label (0/1)
+  - y_dir_1_2        : multi-class direction label for 1–2 bar horizon (-1, 0, 1)
+  - y_dir_5_10       : multi-class direction label for 5–10 bar horizon (-1, 0, 1)
+  - y_dir_15_30      : multi-class direction label for 15–30 bar horizon (-1, 0, 1)
+  - y_breakout       : binary breakout label (0/1)
+  - y_mean_reversion : binary mean-reversion label (0/1)
 
 All labels are:
   - strictly forward-looking (no leakage)
@@ -39,10 +39,16 @@ class Pillar1LabelConfig:
     breakout_horizon: int = 30
     breakout_range_mult: float = 0.75  # fraction of recent range to qualify as breakout
 
-    # Mean reversion label settings
-    mr_horizon: int = 10
-    mr_z_threshold: float = 1.5       # |z| >= this to be considered an "extreme"
-    mr_return_mult: float = 0.5       # fraction of vol_scale to require as snap-back move
+    # Mean reversion label settings (LOOSENED)
+    #
+    # - mr_horizon: how far ahead we look for a snap-back (in bars)
+    # - mr_z_threshold: how "extreme" rev_zscore_50 must be to count as a candidate
+    # - mr_return_mult: how large the snap-back move must be, as a fraction of vol_scale
+    #
+    # New defaults are intentionally more permissive so we actually get positive labels.
+    mr_horizon: int = 15
+    mr_z_threshold: float = 1.2       # was 1.5
+    mr_return_mult: float = 0.35      # was 0.5
 
     def __post_init__(self):
         if self.dir_horizons is None:
@@ -211,14 +217,23 @@ def _compute_mean_reversion_label(
     ret_mult: float,
 ) -> np.ndarray:
     """
-    Mean reversion label (binary):
+    Mean reversion label (binary, LOOSENED DEFINITION):
 
     Idea:
-      - At time t, we are at an extreme if |zscore_t| >= z_threshold.
-      - Look horizon bars forward to close_{t+h}.
-      - If z_t >= z_threshold (overbought) and forward_return <= -ret_mult * vol_scale_t → 1
-      - If z_t <= -z_threshold (oversold) and forward_return >=  ret_mult * vol_scale_t → 1
-      - Otherwise → 0
+      - At time t, we are a *candidate* for reversion if |zscore_t| >= z_threshold.
+      - For such extremes, look forward up to `horizon` bars.
+      - Let vol_scale_t be our volatility scale; threshold_thr = ret_mult * vol_scale_t.
+      - Overbought (z_t >= z_threshold):
+          If min forward return over [t+1, t+horizon] <= -threshold_thr → label 1
+        (i.e., price snaps back down by at least that much at some point).
+      - Oversold (z_t <= -z_threshold):
+          If max forward return over [t+1, t+horizon] >=  threshold_thr → label 1
+        (i.e., price snaps back up by that much at some point).
+      - Otherwise (extreme but no decent snap-back) → label 0.
+      - Non-extreme bars (|z_t| < z_threshold) → NaN (excluded from training).
+
+    This keeps the label focused on "does an extreme actually mean-revert soon?" rather than
+    polluting it with non-extreme bars.
     """
     close_arr = np.asarray(close, float)
     z_arr = np.asarray(zscore, float)
@@ -228,23 +243,43 @@ def _compute_mean_reversion_label(
     labels = np.full(n, np.nan, dtype=float)
 
     for i in range(n):
-        j = i + horizon
-        if j >= n:
-            continue
-
-        fr = close_arr[j] / close_arr[i] - 1.0
         z = z_arr[i]
-        thr = ret_mult * vol_arr[i]
-
-        if np.isnan(z) or np.isnan(thr) or thr <= 0:
+        if np.isnan(z):
             continue
 
-        if z >= z_threshold and fr <= -thr:
-            labels[i] = 1.0
-        elif z <= -z_threshold and fr >= thr:
-            labels[i] = 1.0
-        else:
-            labels[i] = 0.0
+        # Only label genuine extremes; others stay NaN.
+        if abs(z) < z_threshold:
+            continue
+
+        j_end = min(n, i + horizon + 1)
+        if i + 1 >= j_end:
+            continue  # insufficient future
+
+        base = close_arr[i]
+        fut_slice = close_arr[i + 1 : j_end]
+        # forward returns to all future points within horizon
+        rets = fut_slice / base - 1.0
+
+        thr = ret_mult * vol_arr[i]
+        if np.isnan(thr) or thr <= 0:
+            continue
+
+        max_up = np.max(rets)
+        min_dn = np.min(rets)
+
+        if z >= z_threshold:
+            # Overbought: we want a decent move DOWN at SOME point
+            if min_dn <= -thr:
+                labels[i] = 1.0
+            else:
+                labels[i] = 0.0
+        elif z <= -z_threshold:
+            # Oversold: we want a decent move UP at SOME point
+            if max_up >= thr:
+                labels[i] = 1.0
+            else:
+                labels[i] = 0.0
+        # (If z was between thresholds we already continued above.)
 
     return labels
 
@@ -265,7 +300,8 @@ def build_pillar1_labels(
        'y_breakout', 'y_mean_reversion']
 
     Tail rows without full future horizon are NaN and will be dropped
-    by the training pipeline.
+    by the training pipeline. For y_mean_reversion, only "extreme" bars are
+    labelled (1 or 0); non-extreme bars remain NaN.
     """
     _ensure_required_columns(df)
 
@@ -293,7 +329,7 @@ def build_pillar1_labels(
         range_mult=cfg.breakout_range_mult,
     )
 
-    # Mean reversion label
+    # Mean reversion label (using loosened settings + new logic)
     mean_rev = _compute_mean_reversion_label(
         close=close,
         zscore=zscore,
