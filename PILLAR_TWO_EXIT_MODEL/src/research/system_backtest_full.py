@@ -57,12 +57,11 @@ P2_BASE = BASE_DIR / "PILLAR_TWO_EXIT_MODEL"
 P3_BASE = BASE_DIR / "PILLAR_THREE_RISK_MODEL"
 
 # Make Pillar 3's *src* importable, and import via `risk.risk_surface`
-# (we avoid `src.risk...` because `src` already points at Pillar 2)
 P3_SRC = P3_BASE / "src"
 if str(P3_SRC) not in sys.path:
     sys.path.insert(0, str(P3_SRC))
 
-# Import Pillar 3 risk surface dynamically to avoid static import-path lint issues
+# Import Pillar 3 risk surface dynamically
 try:
     _risk_module = importlib.import_module("risk.risk_surface")
 except ModuleNotFoundError as e:
@@ -734,7 +733,6 @@ def summarize_backtest(bt_df: pd.DataFrame, cfg: SystemBacktestConfig) -> None:
     # ------------------------------------------------------------------
     # TP/SL distance & R-multiple diagnostics (from original columns)
     # ------------------------------------------------------------------
-    # Prefer explicit distance columns if present
     tp_dist_col = None
     sl_dist_col = None
     for col in [
@@ -799,7 +797,6 @@ def summarize_backtest(bt_df: pd.DataFrame, cfg: SystemBacktestConfig) -> None:
     if cfg.col_entry_conf in bt.columns:
         conf = pd.to_numeric(bt[cfg.col_entry_conf], errors="coerce")
         logging.info("===== ENTRY_CONFIDENCE BUCKET STATS =====")
-        # Quantile buckets (deciles)
         try:
             q = pd.qcut(conf, q=10, duplicates="drop")
             df_conf = pd.DataFrame(
@@ -825,7 +822,7 @@ def summarize_backtest(bt_df: pd.DataFrame, cfg: SystemBacktestConfig) -> None:
         except ValueError:
             logging.info("[SysBT] entry_confidence: not enough variation for qcut.")
 
-        # Threshold sweep (rough idea which gate to use)
+        # Threshold sweep
         for thr in [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]:
             sub = bt.loc[conf >= thr, "bt_ret_net"]
             if len(sub) == 0:
@@ -846,7 +843,6 @@ def summarize_backtest(bt_df: pd.DataFrame, cfg: SystemBacktestConfig) -> None:
 
     if cfg.col_global_gate in bt.columns:
         gg = pd.to_numeric(bt[cfg.col_global_gate], errors="coerce")
-        # Simple split: gate > 0 vs <= 0
         for label, mask in [
             ("agg_global_gate > 0", gg > 0.0),
             ("agg_global_gate <= 0", gg <= 0.0),
@@ -890,7 +886,7 @@ def summarize_backtest(bt_df: pd.DataFrame, cfg: SystemBacktestConfig) -> None:
         )
 
     # ------------------------------------------------------------------
-    # Time-of-day / weekday diagnostics (if the time column looks like ms)
+    # Time-of-day / weekday diagnostics
     # ------------------------------------------------------------------
     try:
         dt = pd.to_datetime(bt[cfg.col_entry_time], unit="ms")
@@ -974,6 +970,12 @@ def main() -> None:
     if not TRADES_PATH.exists():
         raise FileNotFoundError(f"Trades parquet not found: {TRADES_PATH}")
 
+    cfg = SystemBacktestConfig(
+        max_holding_bars=None,
+        allow_overlap=True,
+        fee_per_side=0.00025,  # 2.5 bps per side
+    )
+
     logging.info("Loading price stream (Pillar 1 final): %s", PRICE_PATH)
     price_df = pd.read_parquet(PRICE_PATH)
     _log_mem(price_df, "[SysBT] Loaded price_df")
@@ -982,26 +984,38 @@ def main() -> None:
     trades_df = pd.read_parquet(TRADES_PATH)
     _log_mem(trades_df, "[SysBT] Loaded exit_final_targets")
 
-    # No holding-bar cap, overlap allowed
-    cfg = SystemBacktestConfig(
-        max_holding_bars=None,
-        allow_overlap=True,
-        fee_per_side=0.00025,  # 2.5 bps per side
+    # --------------------------------------------------------------
+    # OOS split: last 20% of *all* trades (before any filters)
+    # --------------------------------------------------------------
+    col_time = cfg.col_entry_time
+    trades_sorted = trades_df.sort_values(col_time).reset_index(drop=True)
+    n_all_trades = len(trades_sorted)
+    start_idx = int(n_all_trades * 0.8)
+    cutoff_time = trades_sorted[col_time].iloc[start_idx]
+
+    trades_oos = trades_df.loc[trades_df[col_time] >= cutoff_time].copy()
+    logging.info(
+        "[SysBT] Time-based OOS split: using last 20%% of trades_df "
+        "(%d / %d rows) with %s >= %s",
+        len(trades_oos),
+        n_all_trades,
+        col_time,
+        cutoff_time,
     )
 
-    bt_df = run_system_backtest(price_df, trades_df, cfg=cfg)
+    bt_df = run_system_backtest(price_df, trades_oos, cfg=cfg)
 
-    # Optional: save full trade-level backtest
-    out_path = P2_BASE / "data" / "processed" / "system_backtest_trades.parquet"
+    # Save trade-level backtest for this OOS segment
+    out_path = P2_BASE / "data" / "processed" / "system_backtest_trades_oos.parquet"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     bt_df.to_parquet(out_path, index=False, compression="zstd")
-    logging.info("Saved trade-level backtest -> %s", out_path)
+    logging.info("Saved OOS trade-level backtest -> %s", out_path)
 
     # Print summary metrics + rich diagnostics
     summarize_backtest(bt_df, cfg)
 
     # Help GC a bit
-    del price_df, trades_df, bt_df
+    del price_df, trades_df, trades_oos, bt_df
     gc.collect()
 
 

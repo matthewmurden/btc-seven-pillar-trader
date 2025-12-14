@@ -6,7 +6,7 @@ Loads:
   - data/processed/labels_pillar1.parquet
 
 Trains 5 models (short_dir, dir_5_10, dir_15_30, breakout, mean_reversion),
-evaluates on a chronological hold-out, saves models, and writes SLIM predictions to:
+evaluates on a chronological hold-out, saves SLIM predictions to:
   - data/processed/features_pillar1_with_ml.parquet
 
 Run:
@@ -47,26 +47,55 @@ def _slim_ml_output(df: pd.DataFrame, specs: List[MultiHorizonModelSpec]) -> pd.
     Cut the saved ML file down to what later stages actually need:
 
     - time index: open_time_ms
+    - base OHLCV + key primitives needed for exits
     - label columns (y_*)
     - mini-engine scores
     - regime_* columns
+    - orderflow / structure columns used by Pillar 2
     - all model prediction columns (per spec.name)
 
-    This keeps disk usage small and avoids dragging thousands of raw primitives
-    through every later pillar.
+    This keeps enough context for Pillar 2+ while avoiding dragging thousands
+    of raw primitives through every later pillar.
     """
-
     keep_cols: List[str] = []
 
-    # Time column
+    # ---- Time column (always) ----
     if "open_time_ms" in df.columns:
         keep_cols.append("open_time_ms")
 
-    # Label columns
+    # ---- Base price & core primitives we STILL need downstream (Pillar 2, etc.) ----
+    base_cols = [
+        "open",
+        "close",
+        "high",
+        "low",
+        "volume",
+        "vol_atr_14",
+        "rev_zscore_50",
+    ]
+    for col in base_cols:
+        if col in df.columns:
+            keep_cols.append(col)
+
+    # ---- Orderflow + microstructure columns used in ExitRawConfig ----
+    of_struct_cols = [
+        "of_delta",
+        "of_delta_ema_20",
+        "of_imbalance",
+        "of_sweep_flag",
+        "struct_fair_value",
+        "struct_nearest_level_dist",
+        "struct_last_sweep_dir",
+    ]
+    for col in of_struct_cols:
+        if col in df.columns:
+            keep_cols.append(col)
+
+    # ---- Label columns ----
     label_cols = sorted({spec.label_col for spec in specs if spec.label_col in df.columns})
     keep_cols.extend(label_cols)
 
-    # Mini-engine scores (from pillar1_mini_engines)
+    # ---- Mini-engine scores (from pillar1_mini_engines) ----
     for col in [
         "momentum_score",
         "trend_score",
@@ -79,45 +108,44 @@ def _slim_ml_output(df: pd.DataFrame, specs: List[MultiHorizonModelSpec]) -> pd.
         if col in df.columns:
             keep_cols.append(col)
 
-    # Regime-derived features (used in aggregator / decision layer)
+    # ---- Regime-derived features (used across Pillar 1 & 2) ----
     regime_cols = [c for c in df.columns if c.startswith("regime_")]
     keep_cols.extend(regime_cols)
 
-    # All prediction / confidence columns from each model spec
+    # ---- All prediction / confidence columns from each model spec ----
     pred_prefixes = [spec.name for spec in specs]
     pred_cols = [c for c in df.columns if any(c.startswith(pfx) for pfx in pred_prefixes)]
     keep_cols.extend(pred_cols)
 
-    # Remove duplicates but keep order
+    # Remove duplicates but keep order, and drop anything that doesn't exist
     seen = set()
-    ordered_keep = []
+    ordered_keep: List[str] = []
     for c in keep_cols:
-        if c not in seen:
+        if c not in seen and c in df.columns:
             seen.add(c)
             ordered_keep.append(c)
 
-    # Filter to existing columns only
-    missing = [c for c in ordered_keep if c not in df.columns]
+    # Warn if something we expected isn't present (not fatal)
+    expected = set(base_cols + of_struct_cols + label_cols)
+    missing = [c for c in expected if c not in df.columns]
     if missing:
         logging.warning(
             "[MH] Some expected columns for slim output are missing and will be skipped: %s",
             missing,
         )
-    final_keep = [c for c in ordered_keep if c in df.columns]
 
-    slim = df[final_keep].copy()
+    slim = df[ordered_keep].copy()
 
     # Downcast float64 -> float32 to save disk space
     float_cols = slim.select_dtypes(include=["float64"]).columns
     if len(float_cols) > 0:
         slim[float_cols] = slim[float_cols].astype("float32")
 
-    # Optionally downcast small ints as well (e.g. labels, regimes)
+    # Downcast small ints where safe (labels, regimes, etc.)
     int_cols = slim.select_dtypes(include=["int64"]).columns
     for col in int_cols:
         col_max = slim[col].max()
         col_min = slim[col].min()
-        # fits in int16? fine. this is just disk optimisation.
         if col_min >= np.iinfo("int16").min and col_max <= np.iinfo("int16").max:
             slim[col] = slim[col].astype("int16")
 

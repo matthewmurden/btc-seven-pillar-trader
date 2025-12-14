@@ -3,93 +3,21 @@
 """
 Pillar 3 — Risk Model (Position Sizing)
 
-Implements the full Pillar 3 spec:
+Implements the full Pillar 3 spec and is now aligned with the
+Pillar 2 + backtest behaviour:
 
-  5.1 Inputs
-      - Consumes Pillar 1, Pillar 2, Pillar 4 features and normalised context.
+  - Uses Pillar 2's system_filter_v1 as a first-class gate (optional)
+    so that, by default, Pillar 3 only sizes trades that the backtester
+    actually evaluated (system-quality subset).
 
-  5.2 Core Principles
-      - Never exceed max risk per trade
-      - Volatility- and liquidity-aware sizing
-      - Scale up only when signal + regime support it
-      - Scale down in chop, extremes, low liquidity, or drawdown
-      - Avoid size spikes via smoothing and governors
+  - Volatility-weighted sizing now reflects the empirical finding
+    from system_backtest: higher volatility_score regimes are where
+    the system tends to make more money, so they get (slightly)
+    larger size instead of being automatically shrunk.
 
-  5.3 Risk Surface Estimator
-      - Baseline allowable risk per trade from:
-          * equity fraction (max_risk_pct)
-          * leverage caps
-          * SL distance
-          * ATR-based volatility factor
-          * liquidity factor
-      - Produces a safe, volatility-aware baseline size.
-
-  5.4 Volatility-Weighted Position Sizing
-      - size_volatility_multiplier from:
-          * volatility_score (P1/P4)
-          * expected_exit_time
-          * variance proxy of MFE distribution (mfe_dir^2)
-          * sl_risk_factor (from Pillar 2)
-
-  5.5 Signal-Aligned Scaling
-      - signal_alignment_multiplier from:
-          * direction-calibrated entry probability
-          * meta agreement/conflict
-          * trend alignment
-          * breakout vs mean-reversion weighting
-
-  5.6 Regime-Aware Risk Adjustments
-      - regime_multiplier from:
-          * trend/chop/mean-reversion flags
-          * vol expansion / compression
-          * liquidity drought / regimes
-
-  5.7 Drawdown Governor
-      - drawdown_multiplier from:
-          * time-ordered realised label-based returns
-          * rolling equity / max-equity → drawdown
-      - Higher drawdown → smaller max risk per trade
-      - Recovery → gradual scaling up (implemented as discrete states)
-
-  5.8 Exposure Caps and Leverage Governor
-      - leverage_multiplier based on volatility regime
-      - exposure_cap_multiplier placeholder (per-trade) for Pillar 5
-        to enforce portfolio-level exposure / concurrency limits.
-
-  5.9 Final Position Size Generator
-      Final size multiplier:
-
-          position_size_multiplier
-            = volatility_multiplier
-            * signal_strength_multiplier
-            * regime_multiplier
-            * drawdown_multiplier
-            * leverage_multiplier
-            * exposure_cap_multiplier
-
-      Final risk per trade:
-
-          risk_per_trade_frac
-            = clamp(
-                 baseline_risk * position_size_multiplier,
-                 [min_risk_pct, max_risk_pct]
-              )
-
-      Position notional & leverage:
-
-          position_notional ≈ risk_per_trade_frac / sl_distance
-          position_leverage = clip(position_notional, 0, max_leverage)
-
-  5.10 Outputs
-      Adds (among others):
-
-          position_size              (alias of position_notional)
-          position_leverage
-          volatility_adjustment_flag
-          risk_mode
-          drawdown_state
-          scaling_metadata
-          position_risk_score
+  - Leverage governor is nudged in the same direction: low-vol regimes
+    get a mild cut, clearly positive volatility_score regimes get a
+    mild boost, all within hard leverage caps.
 """
 
 import logging
@@ -123,6 +51,8 @@ class RiskSurfaceConfig:
     liq_drought_multiplier: float = 0.3  # extra cut in liq drought regime
 
     # Volatility score weighting (used in 5.4)
+    # NOTE: positive volatility_score is empirically good for this system
+    # (higher mean returns), so we now map higher scores → larger size.
     vol_score_weight: float = 0.2
 
     # Exit-time & MFE scaling
@@ -177,6 +107,14 @@ class RiskSurfaceConfig:
     # Validity flag (optional)
     col_valid_flag: str = "signal_is_valid"
 
+    # Pillar 2 system filter
+    # By default, Pillar 3 *gates* by system_filter_v1 to mirror the
+    # system_backtest pipeline (1.33M → ~202k → ~18k trades).
+    col_system_filter: str = "system_filter_v1"
+    use_system_filter_as_gate: bool = True
+    # If gate is off, we can still downweight non-system trades:
+    non_system_risk_downscale: float = 0.2  # 20% of baseline risk
+
     # Signal-aligned scaling (5.5)
     col_entry_prob_up: str = "entry_prob_up"
     col_entry_prob_down: str = "entry_prob_down"
@@ -223,7 +161,8 @@ def _compute_volatility_size_multiplier(
     5.4 Volatility-Weighted Position Sizing
 
     Uses:
-      - volatility_score          → high vol → shrink size
+      - volatility_score          → empirically, higher is better for this system
+                                    so we scale *up* with positive scores.
       - expected_exit_time        → longer hold → shrink size
       - mfe_dir^2 (variance proxy)→ fatter tails → shrink size
       - sl_risk_factor            → direct Pillar 2 risk hint
@@ -238,8 +177,11 @@ def _compute_volatility_size_multiplier(
             df_active[cfg.col_volatility_score], errors="coerce"
         ).fillna(0.0)
         vol_score_clip = vol_score.clip(-3.0, 3.0)
-        # Positive vol_score => high vol => reduce size
-        vol_component = 1.0 - cfg.vol_score_weight * vol_score_clip
+        # Positive vol_score => empirically higher edge → increase size a bit.
+        #  score ≈ 0   → ~1.0
+        #  score ≈ 0.5 → ~1.10
+        #  score ≈ 1.0 → ~1.20 (capped later)
+        vol_component = 1.0 + cfg.vol_score_weight * vol_score_clip
     else:
         vol_component = np.ones(n, dtype=float)
 
@@ -471,7 +413,7 @@ def _compute_regime_multiplier(
     # Mean-reversion zone: slightly conservative
     mult = np.where(mean_rev > 0.5, mult * 0.8, mult)
 
-    # Vol expansion: reduce size moderately
+    # Vol expansion: reduce size moderately (kept conservative)
     mult = np.where(vol_exp > 0.5, mult * 0.8, mult)
 
     # Vol compression: reduce size sharply (no aggressive sizing)
@@ -643,11 +585,14 @@ def _compute_leverage_multiplier(
     """
     Leverage governor (per-trade).
 
-    Higher leverage only in relatively low-vol, non-expansion regimes.
+    Updated to be consistent with backtest diagnostics:
+
+      - Low volatility_score  → mild leverage *cut*
+      - Clearly positive score→ mild leverage *boost*
+      - Vol expansion extremes still kept conservative overall.
     """
     idx = df_active.index
     n = len(df_active)
-    eps = cfg.eps
 
     if cfg.col_volatility_score in df_active.columns:
         vol_score = pd.to_numeric(
@@ -660,16 +605,19 @@ def _compute_leverage_multiplier(
         df_active.get(cfg.col_regime_vol_expansion_flag, 0.0), errors="coerce"
     ).fillna(0.0)
 
-    # Base: 1.0
     mult = np.ones(n, dtype=float)
 
-    # Low-vol, no expansion → allow mild leverage expansion
-    low_vol_mask = (vol_score < -0.5) & (vol_exp <= 0.5)
-    mult[low_vol_mask] *= 1.2
+    # Low-vol regimes: cut leverage a bit
+    low_vol_mask = vol_score < -0.5
+    mult[low_vol_mask] *= 0.8
 
-    # High-vol or expansion → cut leverage
-    high_vol_mask = (vol_score > 1.0) | (vol_exp > 0.5)
-    mult[high_vol_mask] *= 0.8
+    # Clearly positive vol_score: allow mild leverage expansion
+    high_vol_mask = vol_score > 0.3
+    mult[high_vol_mask] *= 1.1
+
+    # In strong expansion + high vol, temper a little to avoid going nuts
+    exp_extreme_mask = (vol_exp > 0.5) & (vol_score > 0.8)
+    mult[exp_extreme_mask] *= 0.9
 
     mult = np.clip(mult, cfg.leverage_mult_min, cfg.leverage_mult_max)
     return pd.Series(mult.astype("float32"), index=idx)
@@ -740,6 +688,13 @@ def compute_risk_surface_and_sizing(
     """
     Build Pillar 3 risk surface + position sizing.
 
+    *Now aligned with backtester logic:*
+
+      - If col_system_filter exists and use_system_filter_as_gate=True,
+        only trades with system_filter_v1 == True are treated as "active"
+        and get non-zero size. This mirrors the system_backtest where
+        you first filter by system_filter_v1 and then simulate trades.
+
     Adds (among others):
 
         sl_distance
@@ -787,12 +742,22 @@ def compute_risk_surface_and_sizing(
     active_mask = (df[cfg.col_decision] != "none") & (
         pd.to_numeric(df[cfg.col_direction], errors="coerce") != 0
     )
+
     if cfg.col_valid_flag in df.columns:
         valid_flag = pd.to_numeric(df[cfg.col_valid_flag], errors="coerce").fillna(1.0)
         active_mask &= valid_flag != 0
 
+    # Pillar 2 system_filter_v1 alignment
+    system_filter = None
+    if cfg.col_system_filter in df.columns:
+        system_filter = df[cfg.col_system_filter].astype(bool)
+        if cfg.use_system_filter_as_gate:
+            # Mirror system_backtest: only trades that pass system_filter_v1
+            # are considered "tradable" for P3 sizing.
+            active_mask &= system_filter
+
     if not active_mask.any():
-        logging.warning("[RiskSurface] No active trades found in trades_df.")
+        logging.warning("[RiskSurface] No active trades found in trades_df after gating.")
         # Add empty output columns for consistency
         for col in [
             "sl_distance",
@@ -886,6 +851,12 @@ def compute_risk_surface_and_sizing(
     baseline_risk = np.clip(
         baseline_risk, cfg.min_risk_pct, cfg.max_risk_pct * 1.5
     )
+
+    # If we are NOT using system_filter_v1 as a hard gate, we can still
+    # downweight non-system trades (so they exist but with tiny risk).
+    if (system_filter is not None) and (not cfg.use_system_filter_as_gate):
+        sf_arr = system_filter.loc[df_active.index].to_numpy(dtype=bool)
+        baseline_risk = baseline_risk * np.where(sf_arr, 1.0, cfg.non_system_risk_downscale)
 
     # --------------------------------------------------------------
     # 5.4 Volatility-weighted position sizing multiplier

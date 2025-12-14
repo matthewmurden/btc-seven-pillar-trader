@@ -24,9 +24,11 @@ Outputs per row:
   - expected_exit_time        (bars; from fusion)
   - sl_risk_factor            (how much SL was scaled vs fused base)
   - tp_extension_factor       (how much TP was scaled vs fused base)
-  - system_filter_v1          (bool; high-quality trade according to v1 rules)
 
-Everything is leakage-free: only uses information available at entry.
+NOTE:
+  This pillar NO LONGER decides which trades are eligible to trade.
+  All trade-level safety / filters (including the old system_filter_v1)
+  now live in Pillar 6 (safety layer).
 """
 
 import logging
@@ -59,7 +61,7 @@ class ExitFinalConfig:
     col_regime_volexp: str = "regime_is_vol_expansion"
     col_regime_liq_drought: str = "regime_is_liq_drought"
     col_regime_conf: str = "regime_confidence"
-    # Stable regime ID (for diagnostics / system filters)
+    # Stable regime ID (for diagnostics; no filtering here)
     col_regime_id_stable: Optional[str] = "regime_id_stable"
 
     # Pillar 1 confidence / probabilities
@@ -116,32 +118,6 @@ class ExitFinalConfig:
     min_sl_factor: float = 0.5
     max_sl_factor: float = 3.0
 
-    # ---- System-level optimisation knobs (for system_filter_v1) ----
-    # These DO NOT change TP/SL levels; they just tag "good" trades.
-
-    # R-multiple = tp_dist / sl_dist
-    min_r_multiple_for_system: float = 2.0
-
-    # SL/TP distance quality bands (from diagnostics)
-    max_sl_dist_for_system: float = 0.003   # SL <= 0.3%
-    min_tp_dist_for_system: float = 0.003   # TP >= 0.3%
-
-    # Entry confidence threshold
-    min_entry_conf_for_system: float = 0.40
-
-    # Expected horizon in bars
-    min_expected_exit_time_for_system: float = 30.0
-    max_expected_exit_time_for_system: float = 60.0
-
-    # Whether to exclude regime_id_stable == 5 in system filter
-    exclude_regime_id_for_system: Optional[List[int]] = (5,)
-
-    # Whether to exclude Saturdays (weekday=5) in system filter
-    exclude_saturday_in_system: bool = True
-
-    # Toggle for tagging system_filter_v1
-    enable_system_filter_v1: bool = True
-
     # Numerical eps
     eps: float = 1e-8
 
@@ -183,7 +159,9 @@ def build_final_exit_targets(df: pd.DataFrame, cfg: Optional[ExitFinalConfig] = 
           - expected_exit_time
           - sl_risk_factor
           - tp_extension_factor
-          - system_filter_v1 (bool flag marking high-quality trades)
+
+        NOTE: No eligibility filters are applied here. All safety /
+        eligibility tagging is handled by Pillar 6.
     """
     if cfg is None:
         cfg = ExitFinalConfig()
@@ -365,80 +343,9 @@ def build_final_exit_targets(df: pd.DataFrame, cfg: Optional[ExitFinalConfig] = 
     out["r_multiple"] = r_multiple.astype("float32")
 
     # ------------------------------------------------------------------
-    # 10) System-level quality tag: system_filter_v1
+    # 10) Logging stats (purely diagnostic now)
     # ------------------------------------------------------------------
-    if cfg.enable_system_filter_v1:
-        # Base "active trade" mask: has a decision, valid price and levels
-        valid_levels = np.isfinite(optimal_tp) & np.isfinite(optimal_sl)
-        base_active = active & valid_levels
-
-        # Geometry: high R, tight enough SL, sufficiently far TP
-        cond_rr = r_multiple >= cfg.min_r_multiple_for_system
-        cond_sl = final_sl_dist <= cfg.max_sl_dist_for_system
-        cond_tp = final_tp_dist >= cfg.min_tp_dist_for_system
-
-        # Entry confidence (if available)
-        if cfg.col_entry_conf in out.columns:
-            conf_col = pd.to_numeric(out[cfg.col_entry_conf], errors="coerce").fillna(0.0)
-            cond_conf = conf_col >= cfg.min_entry_conf_for_system
-        else:
-            cond_conf = pd.Series(True, index=out.index)
-
-        # Expected exit time window
-        exp_t = pd.to_numeric(out["expected_exit_time"], errors="coerce").fillna(0.0)
-        cond_exit = (exp_t >= cfg.min_expected_exit_time_for_system) & (
-            exp_t <= cfg.max_expected_exit_time_for_system
-        )
-
-        # Regime filter (if regime_id_stable exists)
-        if cfg.col_regime_id_stable and cfg.col_regime_id_stable in out.columns:
-            reg = out[cfg.col_regime_id_stable]
-            cond_regime = pd.Series(True, index=out.index)
-            if cfg.exclude_regime_id_for_system:
-                cond_regime &= ~reg.isin(cfg.exclude_regime_id_for_system)
-        else:
-            cond_regime = pd.Series(True, index=out.index)
-
-        # Weekday filter (optional)
-        if cfg.exclude_saturday_in_system:
-            # Assume col_time is ms since epoch
-            ts = pd.to_datetime(out[cfg.col_time], unit="ms", utc=True)
-            weekday = ts.dt.weekday  # Monday=0, Saturday=5
-            cond_weekday = weekday != 5
-        else:
-            cond_weekday = pd.Series(True, index=out.index)
-
-        system_filter_v1 = (
-            base_active
-            & cond_rr
-            & cond_sl
-            & cond_tp
-            & cond_conf
-            & cond_exit
-            & cond_regime
-            & cond_weekday
-        )
-
-        out["system_filter_v1"] = system_filter_v1.astype(bool)
-
-        # Some logging for sanity
-        n_active = int(base_active.sum())
-        n_filtered = int(system_filter_v1.sum())
-        logging.info(
-            "[ExitFinal] system_filter_v1: %d / %d active trades kept (%.2f%%)",
-            n_filtered,
-            n_active,
-            100.0 * (n_filtered / max(n_active, 1)),
-        )
-    else:
-        out["system_filter_v1"] = False
-
-    # ------------------------------------------------------------------
-    # 11) Logging stats
-    # ------------------------------------------------------------------
-    _log_mem(out, "[ExitFinal] Output with final TP/SL targets")
-
-    valid_mask = active & (np.isfinite(optimal_tp)) & (np.isfinite(optimal_sl))
+    valid_mask = active & np.isfinite(optimal_tp) & np.isfinite(optimal_sl)
     if valid_mask.any():
         rr_valid = r_multiple[valid_mask]
         logging.info(
