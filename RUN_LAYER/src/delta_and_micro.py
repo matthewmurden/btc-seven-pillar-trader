@@ -1,5 +1,3 @@
-# RUN_LAYER/src/delta_history.py
-
 import logging
 import sys
 import time
@@ -18,6 +16,7 @@ from requests.exceptions import HTTPError
 BASE_DIR = Path(__file__).resolve().parent
 RAW_DIR = BASE_DIR / "raw"
 OUTPUT_PATH = RAW_DIR / "delta.csv"
+TRADES_DIR = RAW_DIR / "trades"   # where we store per-run trades
 
 SYMBOL = "BTCUSDT"
 BASE_URL = "https://fapi.binance.com"
@@ -33,11 +32,14 @@ REQUEST_SLEEP = 1.0     # pause after each successful request (seconds)
 WINDOW_HOURS = 1        # size of each time window (1h chunks)
 WINDOW_SLEEP = 1.0      # pause after finishing each window (seconds)
 
-# Retry safety so we don't get stuck forever on 429s
-MAX_429_RETRIES_PER_WINDOW = 6      # after this, skip the rest of the window
-MAX_GENERIC_RETRIES_PER_WINDOW = 6  # same for other errors
+# Retry safety so we don't get stuck forever on 429s / glitches
+MAX_429_RETRIES_PER_WINDOW = 6
+MAX_GENERIC_RETRIES_PER_WINDOW = 6
 
-EPS = 1e-12  # kept for compatibility if you extend later
+EPS = 1e-12  # safety epsilon
+
+# Global accumulator for per-trade data across the whole run
+TRADES_CHUNKS: List[pd.DataFrame] = []
 
 
 # ============================================================
@@ -45,7 +47,7 @@ EPS = 1e-12  # kept for compatibility if you extend later
 # ============================================================
 def setup_logging():
     logging.basicConfig(
-        level=logging.INFO,   # keep at INFO, no debug spam
+        level=logging.INFO,   # no debug spam
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
@@ -54,21 +56,21 @@ def setup_logging():
 # ============================================================
 # API CALL
 # ============================================================
-def get_agg_trades(symbol: str, start_ms: int, end_ms: int, limit: int = LIMIT) -> List[list]:
+def get_agg_trades(symbol: str, start_ms: int, end_ms: int, limit: int = LIMIT) -> List[dict]:
     """
     Fetch a batch of aggregated trades from Binance Futures.
 
-    Response (aggTrades):
-    [
-      aggTradeId (a),
-      price      (p),
-      qty        (q),
-      firstTradeId (f),
-      lastTradeId  (l),
-      timestamp    (T, ms),
-      isBuyerMaker (m),
-      isBestMatch  (not used here)
-    ]
+    Response objects (aggTrades):
+      {
+        "a": aggTradeId,
+        "p": price,
+        "q": qty,
+        "f": firstTradeId,
+        "l": lastTradeId,
+        "T": timestamp (ms),
+        "m": isBuyerMaker,
+        "M": isBestMatch
+      }
     """
     url = f"{BASE_URL}{ENDPOINT}"
     params = {
@@ -92,7 +94,7 @@ def get_agg_trades(symbol: str, start_ms: int, end_ms: int, limit: int = LIMIT) 
 # ============================================================
 def stream_trades_range(start_ms: int, end_ms: int) -> Iterable[pd.DataFrame]:
     """
-    Streams aggTrades between [start_ms, end_ms] in WINDOW_HOURS chunks.
+    Streams aggTrades between [start_ms, end_ms) in WINDOW_HOURS chunks.
 
     Yields DataFrames with columns:
       - price
@@ -137,7 +139,6 @@ def stream_trades_range(start_ms: int, end_ms: int) -> Iterable[pd.DataFrame]:
                     cursor = min(cursor + 60_000, window_end)
                     continue
 
-                # trades is a list of dicts with keys: a, p, q, f, l, T, m, (bestMatch)
                 df_raw = pd.DataFrame(trades)
 
                 # Map Binance fields → our schema
@@ -277,113 +278,247 @@ def stream_trades_range(start_ms: int, end_ms: int) -> Iterable[pd.DataFrame]:
 
 
 # ============================================================
-# AGGREGATE DELTA PER MINUTE
+# MICROSTRUCTURE HELPERS
 # ============================================================
-def aggregate_delta(
-    chunks: Iterable[pd.DataFrame],
-    expected_start_ms: Optional[int] = None,
-    expected_end_ms: Optional[int] = None,
-) -> pd.DataFrame:
-    """
-    Builds the 1-minute delta stream from streamed trades.
+def longest_run(delta_signs: np.ndarray) -> int:
+    """Longest consecutive run of the same sign in an array of {-1,0,1}."""
+    longest = 0
+    cur = 0
+    prev = 0
+    for s in delta_signs:
+        if s == prev:
+            cur += 1
+        else:
+            cur = 1
+            prev = s
+        if cur > longest:
+            longest = cur
+    return longest
 
-    Output columns:
+
+def alternation_index(prices: np.ndarray) -> float:
+    """
+    Fraction of sign flips in price differences within the minute.
+    """
+    if len(prices) < 2:
+        return 0.0
+    diffs = np.diff(prices)
+    signs = np.sign(diffs)
+    signs = signs[signs != 0]
+    if len(signs) < 2:
+        return 0.0
+    return float(np.mean(signs[1:] != signs[:-1]))
+
+
+def compute_minute_microstructure(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Given a per-trade DataFrame with columns:
+      - price
+      - qty
+      - timestamp
+      - is_buyer_maker
+      - delta        (net taker volume per trade)
+      - minute       (bucketed ms)
+    compute per-minute microstructure stats.
+    """
+    if df.empty:
+        return pd.DataFrame(
+            columns=[
+                "delta",
+                "trade_count",
+                "buy_count",
+                "sell_count",
+                "entropy",
+                "delta_persistence",
+                "micro_clustering",
+                "alternation_index",
+            ]
+        )
+
+    g = df.groupby("minute")
+
+    out = pd.DataFrame(index=g.size().index)
+
+    # Net volume per minute
+    out["delta"] = g["delta"].sum()
+
+    # Counts
+    out["trade_count"] = g.size()
+    out["buy_count"] = g.apply(lambda x: (x["delta"] > 0).sum())
+    out["sell_count"] = g.apply(lambda x: (x["delta"] < 0).sum())
+
+    # Entropy of buy/sell mix
+    pb = out["buy_count"] / out["trade_count"]
+    ps = out["sell_count"] / out["trade_count"]
+    entropy = -(pb * np.log2(pb + EPS) + ps * np.log2(ps + EPS))
+    entropy[out["trade_count"] < 5] = 0.0
+    out["entropy"] = entropy
+
+    # Delta persistence: longest same-sign streak / trade_count
+    out["delta_persistence"] = g.apply(
+        lambda x: (
+            longest_run(np.sign(x["delta"].values)) / len(x)
+            if len(x) >= 3 else 0.0
+        )
+    )
+
+    # Micro clustering: std of price changes inside the minute
+    out["micro_clustering"] = g.apply(
+        lambda x: float(np.std(np.diff(x["price"].values))) if len(x) > 1 else 0.0
+    )
+
+    # Alternation index: how often price diff sign flips
+    out["alternation_index"] = g["price"].apply(
+        lambda p: float(alternation_index(p.values))
+    )
+
+    return out
+
+
+def build_empty_micro_frame(start_ms: int, end_ms: int) -> pd.DataFrame:
+    """
+    Build an all-zero microstructure frame for [start_ms, end_ms) at 1m resolution.
+    """
+    idx = np.arange(start_ms, end_ms, 60_000, dtype="int64")
+    return pd.DataFrame(
+        {
+            "open_time_ms": idx,
+            "delta": np.zeros(len(idx), dtype="float64"),
+            "trade_count": np.zeros(len(idx), dtype="float64"),
+            "buy_count": np.zeros(len(idx), dtype="float64"),
+            "sell_count": np.zeros(len(idx), dtype="float64"),
+            "entropy": np.zeros(len(idx), dtype="float64"),
+            "delta_persistence": np.zeros(len(idx), dtype="float64"),
+            "micro_clustering": np.zeros(len(idx), dtype="float64"),
+            "alternation_index": np.zeros(len(idx), dtype="float64"),
+        }
+    )
+
+
+# ============================================================
+# SAVE TRADES
+# ============================================================
+def save_trades_csv(df_all: pd.DataFrame, start_ms: int, end_ms: int):
+    """
+    Save the raw trades used for this run as a single CSV under raw/trades.
+    File name includes symbol + UTC start/end for readability.
+    """
+    TRADES_DIR.mkdir(parents=True, exist_ok=True)
+
+    start_dt = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc)
+    end_dt = datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc)
+
+    start_str = start_dt.strftime("%Y%m%d_%H%M")
+    end_str = end_dt.strftime("%Y%m%d_%H%M")
+
+    fname = f"trades_{SYMBOL}_{start_str}_{end_str}.csv"
+    out_path = TRADES_DIR / fname
+
+    df_to_save = df_all.copy()
+    # Handy readable timestamp column
+    df_to_save["timestamp_utc"] = pd.to_datetime(
+        df_to_save["timestamp"], unit="ms", utc=True
+    )
+
+    # Put the useful columns first
+    cols_order = [
+        "timestamp",
+        "timestamp_utc",
+        "price",
+        "qty",
+        "is_buyer_maker",
+        "delta",
+        "minute",
+    ]
+    existing_cols = [c for c in cols_order if c in df_to_save.columns]
+    other_cols = [c for c in df_to_save.columns if c not in existing_cols]
+    df_to_save = df_to_save[existing_cols + other_cols]
+
+    df_to_save.to_csv(out_path, index=False)
+    logging.info(
+        "Saved raw trades used for this run → %s (%s rows)",
+        out_path,
+        len(df_to_save),
+    )
+
+
+# ============================================================
+# MICROSTRUCTURE FOR RANGE
+# ============================================================
+def compute_micro_for_range(start_ms: int, end_ms: int) -> pd.DataFrame:
+    """
+    Fetch trades in [start_ms, end_ms), compute per-trade delta and
+    per-minute microstructure, and return a continuous 1-minute frame.
+
+    Columns:
       - open_time_ms
       - delta
+      - trade_count
+      - buy_count
+      - sell_count
+      - entropy
+      - delta_persistence
+      - micro_clustering
+      - alternation_index
 
-    expected_start_ms / expected_end_ms are treated as:
-      [expected_start_ms, expected_end_ms)  (end EXCLUSIVE)
-
-    If no trades are found at all and expected_start_ms/expected_end_ms are given,
-    returns a zero-delta frame over that range instead of raising.
+    Also appends the per-trade data used into the global TRADES_CHUNKS
+    list, so we can save a single CSV at the end of the run.
     """
-    agg = None
+    chunks = list(stream_trades_range(start_ms, end_ms))
 
-    for chunk in chunks:
-        # Signed delta: +qty if buyer is taker, -qty if seller is taker
-        chunk["delta_signed"] = np.where(
-            ~chunk["is_buyer_maker"], chunk["qty"], -chunk["qty"]
+    if not chunks:
+        logging.warning(
+            "No trades found for range %s → %s. Returning zero micro frame.",
+            start_ms,
+            end_ms,
         )
+        return build_empty_micro_frame(start_ms, end_ms)
 
-        # Minute bucket (ms)
-        chunk["minute"] = (chunk["timestamp"] // 60_000) * 60_000
+    df_all = pd.concat(chunks, ignore_index=True)
 
-        # Aggregate within this chunk
-        chunk_agg = (
-            chunk.groupby("minute")["delta_signed"]
-            .sum()
-            .astype("float64")
-            .to_frame("delta")
-        )
+    # Binance semantics:
+    # is_buyer_maker == True  → buyer is maker → SELL TAKER → delta = -qty
+    # is_buyer_maker == False → buyer is taker → BUY TAKER  → delta = +qty
+    df_all["delta"] = np.where(~df_all["is_buyer_maker"], df_all["qty"], -df_all["qty"])
 
-        if agg is None:
-            agg = chunk_agg
-        else:
-            common_index = agg.index.union(chunk_agg.index)
-            agg = agg.reindex(common_index, fill_value=0.0)
-            chunk_agg = chunk_agg.reindex(common_index, fill_value=0.0)
-            agg["delta"] = agg["delta"] + chunk_agg["delta"]
+    # Minute bucket
+    df_all["minute"] = (df_all["timestamp"] // 60_000) * 60_000
 
-    # If no trades at all, fall back to zero-delta frame for expected window
-    if agg is None:
-        if expected_start_ms is not None and expected_end_ms is not None:
-            logging.warning(
-                "No trade data fetched; building zero-delta frame "
-                "from %s to %s (end exclusive).",
-                expected_start_ms,
-                expected_end_ms,
-            )
-            full_idx = np.arange(
-                expected_start_ms,
-                expected_end_ms,          # end EXCLUSIVE
-                60_000,
-                dtype="int64",
-            )
-            df_zero = pd.DataFrame(
-                {
-                    "open_time_ms": full_idx,
-                    "delta": np.zeros_like(full_idx, dtype="float64"),
-                }
-            )
-            return df_zero
-        else:
-            raise ValueError("No trade data fetched for delta computation.")
+    # Accumulate trades for this run (we'll save them once in main())
+    TRADES_CHUNKS.append(df_all)
 
-    # Ensure continuous minute timeline
-    agg = agg.sort_index()
+    micro = compute_minute_microstructure(df_all)
 
-    if expected_start_ms is None:
-        start_idx = agg.index.min()
-    else:
-        start_idx = expected_start_ms
+    # Make continuous timeline [start_ms, end_ms) at 1m
+    full_idx = np.arange(start_ms, end_ms, 60_000, dtype="int64")
+    micro = micro.reindex(full_idx, fill_value=0.0)
+    micro.index.name = "open_time_ms"
 
-    if expected_end_ms is None:
-        # Make end exclusive by adding one minute past the last index
-        end_idx = agg.index.max() + 60_000
-    else:
-        end_idx = expected_end_ms
+    logging.info("Microstructure minute count: %s", f"{len(micro):,}")
 
-    full_idx = np.arange(
-        start_idx,
-        end_idx,            # end EXCLUSIVE
-        60_000,
-        dtype="int64",
-    )
-    agg = agg.reindex(full_idx, fill_value=0.0)
-    agg.index.name = "open_time_ms"
-
-    logging.info("Delta minute count: %s", f"{len(agg):,}")
-    return agg.reset_index()
+    return micro.reset_index()
 
 
 # ============================================================
-# SAVE
+# SAVE DELTA + MICRO
 # ============================================================
 def save_delta_csv(df: pd.DataFrame):
     RAW_DIR.mkdir(parents=True, exist_ok=True)
-    df = df[["open_time_ms", "delta"]]
 
-    logging.info("Saving delta stream → %s", OUTPUT_PATH)
+    cols = [
+        "open_time_ms",
+        "delta",
+        "trade_count",
+        "buy_count",
+        "sell_count",
+        "entropy",
+        "delta_persistence",
+        "micro_clustering",
+        "alternation_index",
+    ]
+    df = df[cols]
+
+    logging.info("Saving delta + microstructure → %s", OUTPUT_PATH)
     df.to_csv(OUTPUT_PATH, index=False)
     logging.info("DONE — saved %s rows", f"{len(df):,}")
 
@@ -393,7 +528,7 @@ def save_delta_csv(df: pd.DataFrame):
 # ============================================================
 def main():
     setup_logging()
-    logging.info("=== DELTA GENERATOR START ===")
+    logging.info("=== DELTA + MICROSTRUCTURE GENERATOR START ===")
 
     # ---- 1) Initial window based on LOOKBACK_DAYS at script START ----
     wall_start = datetime.now(timezone.utc).replace(second=0, microsecond=0)
@@ -411,19 +546,14 @@ def main():
     )
 
     try:
-        # ---- 2) Fetch & aggregate main window ----
-        chunks_main = stream_trades_range(initial_start_ms, initial_end_ms)
-        agg_main = aggregate_delta(
-            chunks_main,
-            expected_start_ms=initial_start_ms,
-            expected_end_ms=initial_end_ms,
-        )
+        # ---- 2) Fetch & compute microstructure for main window ----
+        agg_main = compute_micro_for_range(initial_start_ms, initial_end_ms)
 
         # ---- 3) Compute gap between script start and now, and top-up ----
         wall_finish = datetime.now(timezone.utc).replace(second=0, microsecond=0)
         final_end_ms = int(wall_finish.timestamp() * 1000)   # end EXCLUSIVE
 
-        logging.info("Initial aggregation finished at %s", wall_finish)
+        logging.info("Initial computation finished at %s", wall_finish)
 
         if final_end_ms > initial_end_ms:
             # There is a gap between the initial end and "now"
@@ -438,12 +568,7 @@ def main():
             gap_start_ms = initial_end_ms           # start from old end (no overlap)
             gap_end_ms = final_end_ms               # end EXCLUSIVE
 
-            chunks_gap = stream_trades_range(gap_start_ms, gap_end_ms)
-            agg_gap = aggregate_delta(
-                chunks_gap,
-                expected_start_ms=gap_start_ms,
-                expected_end_ms=gap_end_ms,
-            )
+            agg_gap = compute_micro_for_range(gap_start_ms, gap_end_ms)
 
             # Merge main + gap, favouring gap data on overlaps
             main_idxed = agg_main.set_index("open_time_ms")
@@ -461,30 +586,36 @@ def main():
 
             agg_final = combined.reset_index()
         else:
-            logging.info("No significant gap; using initial aggregation only.")
+            logging.info("No significant gap; using initial computation only.")
             agg_final = agg_main
 
         logging.info(
-            "Final delta window: %s rows from %s to %s (end exclusive)",
+            "Final window: %s rows from %s to %s (end exclusive)",
             len(agg_final),
             datetime.fromtimestamp(
                 int(agg_final["open_time_ms"].iloc[0]) / 1000, tz=timezone.utc
             ),
-            datetime.fromtimestamp(
-                initial_end_ms / 1000, tz=timezone.utc
-            )
-            if final_end_ms == initial_end_ms
-            else datetime.fromtimestamp(
-                final_end_ms / 1000, tz=timezone.utc
-            ),
+            datetime.fromtimestamp(final_end_ms / 1000, tz=timezone.utc),
         )
 
-        # ---- 4) Save final, exact-length window ----
+        # ---- 4) Save all raw trades used in this run as a single CSV ----
+        if TRADES_CHUNKS:
+            trades_all = pd.concat(TRADES_CHUNKS, ignore_index=True)
+            trades_all.sort_values("timestamp", inplace=True)
+
+            start_ms_final = int(agg_final["open_time_ms"].min())
+            end_ms_final = int(agg_final["open_time_ms"].max()) + 60_000  # end exclusive
+
+            save_trades_csv(trades_all, start_ms_final, end_ms_final)
+        else:
+            logging.warning("No trades collected; skipping trades CSV save.")
+
+        # ---- 5) Save final, exact-length minute window ----
         save_delta_csv(agg_final)
-        logging.info("=== DELTA GENERATOR FINISHED ===")
+        logging.info("=== DELTA + MICROSTRUCTURE GENERATOR FINISHED ===")
 
     except Exception as exc:
-        logging.exception("Delta pipeline failure: %s", exc)
+        logging.exception("Delta + microstructure pipeline failure: %s", exc)
         sys.exit(1)
 
 

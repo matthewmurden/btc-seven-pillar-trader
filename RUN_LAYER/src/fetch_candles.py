@@ -122,8 +122,8 @@ def download_last_14_days():
     # Final duplicate prevention
     df = df.drop_duplicates(subset=["open_time"]).sort_values("open_time")
 
-    # Auto name with actual start/end date
-    outfile = OUTPUT_DIR / f"{SYMBOL}_{INTERVAL}_{start_dt.date()}_{end_dt.date()}.csv"
+    # Fixed filename
+    outfile = OUTPUT_DIR / "BTC_CANDLES.csv"
     df.to_csv(outfile, index=False)
 
     print("\n==============================")
