@@ -16,7 +16,7 @@ OUTPUT_DIR = DATA_DIR / "raw" / "candles"
 
 LIMIT = 1500  # Binance max rows per request
 
-LOOKBACK_DAYS = 1  # <-- 14-day rolling window
+LOOKBACK_DAYS = 1  # can be fractional (e.g., 30 minutes = 30/1440)
 
 
 def ensure_output_dir(path: Path):
@@ -56,9 +56,10 @@ def get_klines(symbol, interval, start_ms, end_ms, limit=LIMIT):
 def download_last_14_days():
     ensure_output_dir(OUTPUT_DIR)
 
-    # Now (UTC) and 14 days ago
+    # Now (UTC) and start based on lookback; end is exclusive
     end_dt = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-    start_dt = end_dt - timedelta(days=LOOKBACK_DAYS)
+    window_minutes = int(LOOKBACK_DAYS * 24 * 60)
+    start_dt = end_dt - timedelta(minutes=window_minutes)
 
     start_ms = int(start_dt.timestamp() * 1000)
     end_ms = int(end_dt.timestamp() * 1000)
@@ -67,7 +68,7 @@ def download_last_14_days():
     rows = []
 
     print(f"\nDownloading {SYMBOL} {INTERVAL} klines")
-    print(f"From {start_dt} to {end_dt} (~{LOOKBACK_DAYS} days)")
+    print(f"From {start_dt} to {end_dt} (~{window_minutes} minutes)")
 
     while cursor < end_ms:
         try:
@@ -121,6 +122,9 @@ def download_last_14_days():
 
     # Final duplicate prevention
     df = df.drop_duplicates(subset=["open_time"]).sort_values("open_time")
+
+    # Enforce exact window size (end exclusive), keep last N minutes
+    df = df.tail(window_minutes)
 
     # Fixed filename
     outfile = OUTPUT_DIR / "BTC_CANDLES.csv"

@@ -15,8 +15,10 @@ from requests.exceptions import HTTPError
 # ============================================================
 BASE_DIR = Path(__file__).resolve().parent
 RAW_DIR = BASE_DIR / "raw"
-OUTPUT_PATH = RAW_DIR / "delta.csv"
+DELTA_OUT = RAW_DIR / "delta.parquet"
+MICRO_OUT = RAW_DIR / "microstructure.parquet"
 TRADES_DIR = RAW_DIR / "trades"   # where we store per-run trades
+CANDLES_PATH = RAW_DIR / "candles" / "BTC_CANDLES.csv"
 
 SYMBOL = "BTCUSDT"
 BASE_URL = "https://fapi.binance.com"
@@ -27,8 +29,8 @@ ENDPOINT = "/fapi/v1/aggTrades"
 LOOKBACK_DAYS = 1 / 24  # 1 hour
 
 # Binance / rate control
-LIMIT = 1000            # max trades per aggTrades request
-REQUEST_SLEEP = 1.0     # pause after each successful request (seconds)
+LIMIT = 1000           # max trades per aggTrades request
+REQUEST_SLEEP = 0     # pause after each successful request (seconds)
 WINDOW_HOURS = 1        # size of each time window (1h chunks)
 WINDOW_SLEEP = 1.0      # pause after finishing each window (seconds)
 
@@ -372,6 +374,8 @@ def compute_minute_microstructure(df: pd.DataFrame) -> pd.DataFrame:
         lambda p: float(alternation_index(p.values))
     )
 
+    out["micro_delta"] = out["delta"]
+
     return out
 
 
@@ -384,6 +388,7 @@ def build_empty_micro_frame(start_ms: int, end_ms: int) -> pd.DataFrame:
         {
             "open_time_ms": idx,
             "delta": np.zeros(len(idx), dtype="float64"),
+            "micro_delta": np.zeros(len(idx), dtype="float64"),
             "trade_count": np.zeros(len(idx), dtype="float64"),
             "buy_count": np.zeros(len(idx), dtype="float64"),
             "sell_count": np.zeros(len(idx), dtype="float64"),
@@ -499,28 +504,62 @@ def compute_micro_for_range(start_ms: int, end_ms: int) -> pd.DataFrame:
     return micro.reset_index()
 
 
-# ============================================================
-# SAVE DELTA + MICRO
-# ============================================================
-def save_delta_csv(df: pd.DataFrame):
+def _merge_with_candles(micro: pd.DataFrame) -> pd.DataFrame:
+    """
+    Merge per-minute micro stats with candle features to derive:
+      wick_body_ratio, micro_volatility, micro_return, order_imbalance, no_trend_stat
+    """
+    if not CANDLES_PATH.exists():
+        raise FileNotFoundError(f"Candles file missing: {CANDLES_PATH}")
+
+    candles = pd.read_csv(CANDLES_PATH)
+    candles["open_time_ms"] = pd.to_datetime(candles["open_time"], utc=True).astype("int64") // 1_000_000
+    candles = candles.drop_duplicates("open_time_ms").sort_values("open_time_ms")
+
+    merged = candles.merge(micro, left_on="open_time_ms", right_on="open_time_ms", how="left").fillna(0)
+
+    body = (merged.close - merged.open).abs()
+    wick = (merged.high - merged.low) - body
+
+    merged["wick_body_ratio"] = wick / (body + EPS)
+    merged["micro_volatility"] = body / merged.close.shift(1).replace(0, np.nan).fillna(0)
+    merged["micro_return"] = (merged.close - merged.open) / merged.open.replace(0, np.nan).fillna(1)
+    merged["order_imbalance"] = (
+        merged.taker_buy_base - (merged.volume - merged.taker_buy_base)
+    ) / merged.volume.replace(0, np.nan).fillna(1)
+    merged["no_trend_stat"] = ((merged.high - merged.low) /
+                               merged.close.replace(0, np.nan).fillna(1) < 0.0003).astype(int)
+
+    merged.fillna(0.0, inplace=True)
+    return merged
+
+
+def save_outputs(micro_full: pd.DataFrame):
     RAW_DIR.mkdir(parents=True, exist_ok=True)
 
-    cols = [
+    merged = _merge_with_candles(micro_full)
+
+    delta_only = merged[["open_time_ms", "micro_delta"]].rename(columns={"micro_delta": "delta"})
+    micro_cols = [
         "open_time_ms",
-        "delta",
-        "trade_count",
-        "buy_count",
-        "sell_count",
+        "wick_body_ratio",
+        "micro_volatility",
+        "micro_return",
         "entropy",
+        "order_imbalance",
+        "micro_delta",
         "delta_persistence",
         "micro_clustering",
         "alternation_index",
+        "no_trend_stat",
     ]
-    df = df[cols]
+    micro_only = merged[micro_cols]
 
-    logging.info("Saving delta + microstructure → %s", OUTPUT_PATH)
-    df.to_csv(OUTPUT_PATH, index=False)
-    logging.info("DONE — saved %s rows", f"{len(df):,}")
+    delta_only.to_parquet(DELTA_OUT, index=False)
+    micro_only.to_parquet(MICRO_OUT, index=False)
+
+    logging.info("Saved delta → %s (rows=%s)", DELTA_OUT, len(delta_only))
+    logging.info("Saved micro features → %s (rows=%s)", MICRO_OUT, len(micro_only))
 
 
 # ============================================================
@@ -535,8 +574,11 @@ def main():
     initial_end_dt = wall_start                      # end EXCLUSIVE
     initial_start_dt = initial_end_dt - timedelta(days=LOOKBACK_DAYS)
 
-    initial_start_ms = int(initial_start_dt.timestamp() * 1000)
+    # Ensure exactly LOOKBACK_DAYS worth of minutes: start inclusive, end exclusive
+    # Example: LOOKBACK_DAYS = 30/1440 -> 30 minutes yields 30 rows.
+    window_minutes = int(LOOKBACK_DAYS * 24 * 60)
     initial_end_ms = int(initial_end_dt.timestamp() * 1000)
+    initial_start_ms = initial_end_ms - (window_minutes * 60_000)
 
     logging.info(
         "Initial target window: %s -> %s (~%.3f days, end exclusive)",
@@ -548,46 +590,7 @@ def main():
     try:
         # ---- 2) Fetch & compute microstructure for main window ----
         agg_main = compute_micro_for_range(initial_start_ms, initial_end_ms)
-
-        # ---- 3) Compute gap between script start and now, and top-up ----
-        wall_finish = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-        final_end_ms = int(wall_finish.timestamp() * 1000)   # end EXCLUSIVE
-
-        logging.info("Initial computation finished at %s", wall_finish)
-
-        if final_end_ms > initial_end_ms:
-            # There is a gap between the initial end and "now"
-            gap_minutes = int((final_end_ms - initial_end_ms) // 60_000)
-            logging.info(
-                "Top-up gap detected: %d minutes between %s and %s",
-                gap_minutes,
-                datetime.fromtimestamp(initial_end_ms / 1000, tz=timezone.utc),
-                wall_finish,
-            )
-
-            gap_start_ms = initial_end_ms           # start from old end (no overlap)
-            gap_end_ms = final_end_ms               # end EXCLUSIVE
-
-            agg_gap = compute_micro_for_range(gap_start_ms, gap_end_ms)
-
-            # Merge main + gap, favouring gap data on overlaps
-            main_idxed = agg_main.set_index("open_time_ms")
-            gap_idxed = agg_gap.set_index("open_time_ms")
-            combined = pd.concat([main_idxed, gap_idxed])
-            combined = combined[~combined.index.duplicated(keep="last")]
-            combined = combined.sort_index()
-
-            # Enforce EXACT LOOKBACK_DAYS ending at wall_finish (end EXCLUSIVE)
-            window_ms = int(LOOKBACK_DAYS * 24 * 60 * 60 * 1000)
-            target_start_ms = final_end_ms - window_ms
-
-            combined = combined[combined.index >= target_start_ms]
-            combined = combined[combined.index < final_end_ms]
-
-            agg_final = combined.reset_index()
-        else:
-            logging.info("No significant gap; using initial computation only.")
-            agg_final = agg_main
+        agg_final = agg_main
 
         logging.info(
             "Final window: %s rows from %s to %s (end exclusive)",
@@ -595,7 +598,7 @@ def main():
             datetime.fromtimestamp(
                 int(agg_final["open_time_ms"].iloc[0]) / 1000, tz=timezone.utc
             ),
-            datetime.fromtimestamp(final_end_ms / 1000, tz=timezone.utc),
+            datetime.fromtimestamp(initial_end_ms / 1000, tz=timezone.utc),
         )
 
         # ---- 4) Save all raw trades used in this run as a single CSV ----
@@ -611,7 +614,7 @@ def main():
             logging.warning("No trades collected; skipping trades CSV save.")
 
         # ---- 5) Save final, exact-length minute window ----
-        save_delta_csv(agg_final)
+        save_outputs(agg_final)
         logging.info("=== DELTA + MICROSTRUCTURE GENERATOR FINISHED ===")
 
     except Exception as exc:

@@ -26,7 +26,8 @@ PRE_BASE = BASE_DIR / "PRE_PILLARFOUR"
 RAW_DIR = Path(__file__).resolve().parent / "raw"
 
 CANDLES_PATH = RAW_DIR / "candles" / "BTC_CANDLES.csv"
-DELTA_PATH = RAW_DIR / "delta.csv"
+DELTA_PATH = RAW_DIR / "delta.parquet"
+MICRO_PATH = RAW_DIR / "microstructure.parquet"
 TRADES_DIR = RAW_DIR / "trades"
 HTF_DIR = RAW_DIR / "htf_candles"
 
@@ -71,13 +72,11 @@ def setup_logging() -> None:
     )
 
 
-def load_delta_csv(path: Path) -> pd.DataFrame:
+def load_delta(path: Path) -> pd.DataFrame:
     logging.info("Loading delta from %s", path)
-    df = pd.read_csv(path)
-
+    df = pd.read_parquet(path)
     if "open_time_ms" not in df.columns:
-        raise ValueError("delta.csv must contain open_time_ms.")
-
+        raise ValueError("delta.parquet must contain open_time_ms.")
     df["open_time_ms"] = pd.to_numeric(df["open_time_ms"], errors="coerce").astype("int64")
     float_cols = [c for c in df.columns if c != "open_time_ms"]
     df = _to_float32(df, float_cols)
@@ -85,13 +84,19 @@ def load_delta_csv(path: Path) -> pd.DataFrame:
     return df
 
 
-def load_microstructure_placeholder() -> pd.DataFrame:
-    """
-    No dedicated microstructure parquet exists in RUN_LAYER/src/raw,
-    so we merge nothing here. The delta.csv already contains the
-    micro-style metrics (entropy, persistence, etc.).
-    """
-    return pd.DataFrame(columns=["open_time_ms"])
+def load_micro(path: Path) -> pd.DataFrame:
+    logging.info("Loading microstructure from %s", path)
+    if not path.exists():
+        logging.warning("Microstructure parquet missing at %s; filling zeros.", path)
+        return pd.DataFrame(columns=["open_time_ms"])
+    df = pd.read_parquet(path)
+    if "open_time_ms" not in df.columns:
+        raise ValueError("microstructure.parquet must contain open_time_ms.")
+    df["open_time_ms"] = pd.to_numeric(df["open_time_ms"], errors="coerce").astype("int64")
+    float_cols = [c for c in df.columns if c != "open_time_ms"]
+    df = _to_float32(df, float_cols)
+    df = df.dropna(subset=["open_time_ms"]).drop_duplicates("open_time_ms").sort_values("open_time_ms")
+    return df
 
 
 def _standardise_side(series: pd.Series) -> pd.Series:
@@ -173,8 +178,8 @@ def build_htf_map(htf_dir: Path) -> Dict[str, Path]:
 
 def build_canonical() -> pd.DataFrame:
     candles = load_candles(CANDLES_PATH)
-    delta = load_delta_csv(DELTA_PATH)
-    micro = load_microstructure_placeholder()
+    delta = load_delta(DELTA_PATH)
+    micro = load_micro(MICRO_PATH)
     bulk = load_bulk_trades_from_csv(TRADES_DIR)
     htf_map = load_htf(build_htf_map(HTF_DIR))
 

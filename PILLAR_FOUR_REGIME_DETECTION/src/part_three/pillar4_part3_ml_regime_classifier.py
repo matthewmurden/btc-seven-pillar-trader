@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import joblib
 import pandas as pd
 
 try:
@@ -31,6 +32,7 @@ PART_THREE_DIR = DATA_DIR / "part_three"
 RAW_FEATURES_PATH = PART_ONE_DIR / "raw_regime_features.parquet"
 DETERMINISTIC_PATH = PART_TWO_DIR / "deterministic_regime_engines.parquet"
 OUTPUT_PATH = PART_THREE_DIR / "regime_ml_predictions.parquet"
+MODEL_PATH = PART_THREE_DIR / "regime_ml_model.pkl"
 
 
 # =========================
@@ -259,6 +261,11 @@ def main() -> None:
     logging.info("Saving outputs")
     PART_THREE_DIR.mkdir(parents=True, exist_ok=True)
     preds.to_parquet(OUTPUT_PATH, index=False)
+    try:
+        joblib.dump(model, MODEL_PATH)
+        logging.info("Saved trained model -> %s", MODEL_PATH)
+    except Exception as exc:
+        logging.warning("Could not save model to %s: %s", MODEL_PATH, exc)
     logging.info("Saved regime ML predictions -> %s", OUTPUT_PATH)
 
     # quick summary
