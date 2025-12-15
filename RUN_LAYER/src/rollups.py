@@ -6,8 +6,8 @@ from pathlib import Path
 # ============ CONFIG ============
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-DATA_DIR = PROJECT_ROOT / "raw"
-CANDLES_1M_PATH = DATA_DIR / "candles" / "BTC_CANDLES.csv"
+DATA_DIR = PROJECT_ROOT.parent / "data" / "raw"
+CANDLES_1M_PATH = DATA_DIR / "BTC_CANDLES.csv"
 OUTPUT_DIR = DATA_DIR / "htf_candles"
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)

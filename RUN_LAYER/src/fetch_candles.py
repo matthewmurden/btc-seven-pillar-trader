@@ -11,8 +11,9 @@ SYMBOL = "BTCUSDT"
 INTERVAL = "1m"
 BASE_URL = "https://fapi.binance.com"
 ENDPOINT = "/fapi/v1/klines"
-DATA_DIR = Path(__file__).resolve().parent
-OUTPUT_DIR = DATA_DIR / "raw" / "candles"
+BASE_DIR = Path(__file__).resolve().parent.parent
+RAW_DIR = BASE_DIR / "data" / "raw"
+OUTPUT_DIR = RAW_DIR 
 
 LIMIT = 1500  # Binance max rows per request
 

@@ -13,12 +13,12 @@ from requests.exceptions import HTTPError
 # ============================================================
 # CONFIG / PATHS
 # ============================================================
-BASE_DIR = Path(__file__).resolve().parent
-RAW_DIR = BASE_DIR / "raw"
+BASE_DIR = Path(__file__).resolve().parent.parent
+RAW_DIR = BASE_DIR / "data" / "raw"
 DELTA_OUT = RAW_DIR / "delta.parquet"
 MICRO_OUT = RAW_DIR / "microstructure.parquet"
 TRADES_DIR = RAW_DIR / "trades"   # where we store per-run trades
-CANDLES_PATH = RAW_DIR / "candles" / "BTC_CANDLES.csv"
+CANDLES_PATH = RAW_DIR / "BTC_CANDLES.csv"
 
 SYMBOL = "BTCUSDT"
 BASE_URL = "https://fapi.binance.com"
@@ -26,11 +26,11 @@ ENDPOINT = "/fapi/v1/aggTrades"
 
 # How much history you want in the final window.
 # For testing 1 hour:
-LOOKBACK_DAYS = 1 / 24  # 1 hour
+LOOKBACK_DAYS = 1 / 48  # 1 hour
 
 # Binance / rate control
 LIMIT = 1000           # max trades per aggTrades request
-REQUEST_SLEEP = 0     # pause after each successful request (seconds)
+REQUEST_SLEEP = 0.1   # pause after each successful request (seconds)
 WINDOW_HOURS = 1        # size of each time window (1h chunks)
 WINDOW_SLEEP = 1.0      # pause after finishing each window (seconds)
 
@@ -574,11 +574,8 @@ def main():
     initial_end_dt = wall_start                      # end EXCLUSIVE
     initial_start_dt = initial_end_dt - timedelta(days=LOOKBACK_DAYS)
 
-    # Ensure exactly LOOKBACK_DAYS worth of minutes: start inclusive, end exclusive
-    # Example: LOOKBACK_DAYS = 30/1440 -> 30 minutes yields 30 rows.
-    window_minutes = int(LOOKBACK_DAYS * 24 * 60)
+    initial_start_ms = int(initial_start_dt.timestamp() * 1000)
     initial_end_ms = int(initial_end_dt.timestamp() * 1000)
-    initial_start_ms = initial_end_ms - (window_minutes * 60_000)
 
     logging.info(
         "Initial target window: %s -> %s (~%.3f days, end exclusive)",
@@ -590,7 +587,46 @@ def main():
     try:
         # ---- 2) Fetch & compute microstructure for main window ----
         agg_main = compute_micro_for_range(initial_start_ms, initial_end_ms)
-        agg_final = agg_main
+
+        # ---- 3) Compute gap between script start and now, and top-up ----
+        wall_finish = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        final_end_ms = int(wall_finish.timestamp() * 1000)   # end EXCLUSIVE
+
+        logging.info("Initial computation finished at %s", wall_finish)
+
+        if final_end_ms > initial_end_ms:
+            # There is a gap between the initial end and "now"
+            gap_minutes = int((final_end_ms - initial_end_ms) // 60_000)
+            logging.info(
+                "Top-up gap detected: %d minutes between %s and %s",
+                gap_minutes,
+                datetime.fromtimestamp(initial_end_ms / 1000, tz=timezone.utc),
+                wall_finish,
+            )
+
+            gap_start_ms = initial_end_ms           # start from old end (no overlap)
+            gap_end_ms = final_end_ms               # end EXCLUSIVE
+
+            agg_gap = compute_micro_for_range(gap_start_ms, gap_end_ms)
+
+            # Merge main + gap, favouring gap data on overlaps
+            main_idxed = agg_main.set_index("open_time_ms")
+            gap_idxed = agg_gap.set_index("open_time_ms")
+            combined = pd.concat([main_idxed, gap_idxed])
+            combined = combined[~combined.index.duplicated(keep="last")]
+            combined = combined.sort_index()
+
+            # Enforce EXACT LOOKBACK_DAYS ending at wall_finish (end EXCLUSIVE)
+            window_ms = int(LOOKBACK_DAYS * 24 * 60 * 60 * 1000)
+            target_start_ms = final_end_ms - window_ms
+
+            combined = combined[combined.index >= target_start_ms]
+            combined = combined[combined.index < final_end_ms]
+
+            agg_final = combined.reset_index()
+        else:
+            logging.info("No significant gap; using initial computation only.")
+            agg_final = agg_main
 
         logging.info(
             "Final window: %s rows from %s to %s (end exclusive)",
@@ -598,7 +634,7 @@ def main():
             datetime.fromtimestamp(
                 int(agg_final["open_time_ms"].iloc[0]) / 1000, tz=timezone.utc
             ),
-            datetime.fromtimestamp(initial_end_ms / 1000, tz=timezone.utc),
+            datetime.fromtimestamp(final_end_ms / 1000, tz=timezone.utc),
         )
 
         # ---- 4) Save all raw trades used in this run as a single CSV ----
