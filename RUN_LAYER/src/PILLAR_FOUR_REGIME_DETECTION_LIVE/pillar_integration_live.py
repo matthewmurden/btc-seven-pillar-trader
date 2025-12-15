@@ -38,6 +38,7 @@ if str(P4_SRC) not in sys.path:
     sys.path.append(str(P4_SRC))
 
 from part_seven.regime_master_api import RegimeMasterAPI  # type: ignore
+from part_seven.regime_master_api import export_final_regime_timeline  # type: ignore
 
 
 def main() -> None:
@@ -47,19 +48,14 @@ def main() -> None:
         if not p.exists():
             raise FileNotFoundError(f"Required input missing: {p}")
 
-    stable = pd.read_parquet(STABLE_PATH)
-    fused = pd.read_parquet(FUSED_PATH)
-    ml = pd.read_parquet(ML_PATH)
-    det = pd.read_parquet(DET_PATH)
-
     api = RegimeMasterAPI(
-        stable_labels=stable,
-        fused_labels=fused,
-        ml_preds=ml,
-        deterministic=det,
+        stable_path=STABLE_PATH,
+        fused_path=FUSED_PATH,
+        ml_path=ML_PATH,
+        det_path=DET_PATH,
     )
-
-    timeline = api.build_timeline()
+    api.preload_all_regimes()
+    timeline = export_final_regime_timeline(api)
 
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     timeline.to_parquet(OUTPUT_PATH, index=False)

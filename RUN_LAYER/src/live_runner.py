@@ -33,7 +33,7 @@ import pandas as pd
 # ---------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------
-LOOKBACK_MINUTES = 1440  # easy to change (1 day default)
+LOOKBACK_MINUTES = 5  # easy to change (1 day default)
 MAX_RETRIES = 3
 SLEEP_SECONDS_BETWEEN_LOOPS = 5
 
@@ -103,7 +103,6 @@ from PILLAR_TWO_EXIT_MODEL_LIVE import (
 )
 from PILLAR_THREE_RISK_MODEL_LIVE import build_position_sizing_live
 from PILLAR_FIVE_EXECUTION_ENGINE_LIVE import build_execution_plans_live
-from PILLAR_SIX_SAFETY_LAYER_LIVE import apply_safety_live
 
 
 # ---------------------------------------------------------------------
@@ -240,10 +239,9 @@ def run_p2_live() -> None:
     _run_with_retries(build_exit_final_targets_live.main, "build_exit_final_targets_live")
 
 
-def run_p3_p5_p6_live() -> None:
+def run_p3_p5_live() -> None:
     _run_with_retries(build_position_sizing_live.main, "build_position_sizing_live")
     _run_with_retries(build_execution_plans_live.main, "build_execution_plans_live")
-    _run_with_retries(apply_safety_live.main, "apply_safety_live")
 
 
 def main() -> None:
@@ -259,19 +257,17 @@ def main() -> None:
         run_p4_live()
         run_p1_live()
         run_p2_live()
-        run_p3_p5_p6_live()
+        run_p3_p5_live()
 
         # Trim key parquets to rolling window
         _trim_parquet(RUN_PROCESSED / "PILLAR_ONE_ENTRY_MODEL" / "features_pillar1_final.parquet", "open_time_ms", LOOKBACK_MINUTES)
         _trim_parquet(RUN_PROCESSED / "PILLAR_TWO_EXIT_MODEL" / "exit_final_targets.parquet", "open_time_ms", LOOKBACK_MINUTES)
         _trim_parquet(RUN_PROCESSED / "PILLAR_TWO_EXIT_MODEL" / "exit_with_sizing.parquet", "open_time_ms", LOOKBACK_MINUTES)
         _trim_parquet(RUN_PROCESSED / "PILLAR_FIVE_EXECUTION_ENGINE" / "execution_plans.parquet", "open_time_ms", LOOKBACK_MINUTES)
-        _trim_parquet(RUN_PROCESSED / "PILLAR_SIX_SAFETY_LAYER" / "exit_with_safety.parquet", "open_time_ms", LOOKBACK_MINUTES)
-
-        # Log latest rows
+        # Log latest rows (P5 only for now)
         _log_latest(
             RUN_PROCESSED / "PILLAR_FIVE_EXECUTION_ENGINE" / "execution_plans.parquet",
-            RUN_PROCESSED / "PILLAR_SIX_SAFETY_LAYER" / "exit_with_safety.parquet",
+            RUN_PROCESSED / "PILLAR_FIVE_EXECUTION_ENGINE" / "execution_plans.parquet",
         )
 
         # Update last_ts_ms

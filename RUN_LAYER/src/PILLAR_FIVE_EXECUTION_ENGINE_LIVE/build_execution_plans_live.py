@@ -47,6 +47,7 @@ from execution.execution_engine import (  # type: ignore
     EntrySignal,
     ExitPlan,
     RiskParams,
+    RiskMode,
     RegimeInfo,
     SafetyStatus,
     MarketSnapshot,

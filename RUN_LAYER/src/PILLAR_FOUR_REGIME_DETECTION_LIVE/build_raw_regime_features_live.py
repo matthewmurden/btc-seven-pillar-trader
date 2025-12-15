@@ -39,6 +39,30 @@ def main() -> None:
     if not NORM_INPUT.exists():
         raise FileNotFoundError(f"Normalised features missing: {NORM_INPUT}")
 
+    # Ensure required microstructure columns exist (some live runs may produce sparse inputs)
+    df = pd.read_parquet(NORM_INPUT)
+    missing_cols = [
+        "delta_persistence",
+        "micro_clustering",
+        "alternation_index",
+        "micro_delta",
+        "entropy",
+        "delta",
+        "wick_body_ratio",
+        "micro_volatility",
+        "micro_return",
+        "order_imbalance",
+        "no_trend_stat",
+    ]
+    added = []
+    for col in missing_cols:
+        if col not in df.columns:
+            df[col] = 0.0
+            added.append(col)
+    if added:
+        df.to_parquet(NORM_INPUT, index=False)
+        logging.warning("Injected missing columns into normalised_features: %s", added)
+
     # Temporarily patch the paths used inside build_raw_regime_features
     import build_raw_regime_features as brf  # type: ignore
 

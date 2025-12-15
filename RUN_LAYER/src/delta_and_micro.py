@@ -3,7 +3,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Iterable, List
 
 import numpy as np
 import pandas as pd
@@ -17,7 +17,11 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 RAW_DIR = BASE_DIR / "data" / "raw"
 DELTA_OUT = RAW_DIR / "delta.parquet"
 MICRO_OUT = RAW_DIR / "microstructure.parquet"
+
 TRADES_DIR = RAW_DIR / "trades"   # where we store per-run trades
+TRADES_DIR.mkdir(parents=True, exist_ok=True)
+TRADES_OUT = TRADES_DIR / "trades_BTCUSDT.csv"
+
 CANDLES_PATH = RAW_DIR / "BTC_CANDLES.csv"
 
 SYMBOL = "BTCUSDT"
@@ -25,23 +29,20 @@ BASE_URL = "https://fapi.binance.com"
 ENDPOINT = "/fapi/v1/aggTrades"
 
 # How much history you want in the final window.
-# For testing 1 hour:
-LOOKBACK_DAYS = 1 / 48  # 1 hour
+# Example: LOOKBACK_DAYS = 30 for 30 days; right now ~30 minutes for testing
+LOOKBACK_DAYS = 1 / 48  # 1/48 day ≈ 30 minutes
 
 # Binance / rate control
 LIMIT = 1000           # max trades per aggTrades request
-REQUEST_SLEEP = 0.1   # pause after each successful request (seconds)
-WINDOW_HOURS = 1        # size of each time window (1h chunks)
-WINDOW_SLEEP = 1.0      # pause after finishing each window (seconds)
+REQUEST_SLEEP = 0.1    # pause after each successful request (seconds)
+WINDOW_HOURS = 1       # size of each time window (1h chunks)
+WINDOW_SLEEP = 1.0     # pause after finishing each window (seconds)
 
 # Retry safety so we don't get stuck forever on 429s / glitches
 MAX_429_RETRIES_PER_WINDOW = 6
 MAX_GENERIC_RETRIES_PER_WINDOW = 6
 
 EPS = 1e-12  # safety epsilon
-
-# Global accumulator for per-trade data across the whole run
-TRADES_CHUNKS: List[pd.DataFrame] = []
 
 
 # ============================================================
@@ -92,7 +93,7 @@ def get_agg_trades(symbol: str, start_ms: int, end_ms: int, limit: int = LIMIT) 
 
 
 # ============================================================
-# STREAM TRADES OVER ARBITRARY RANGE
+# STREAM TRADES OVER RANGE (USED PER HOUR)
 # ============================================================
 def stream_trades_range(start_ms: int, end_ms: int) -> Iterable[pd.DataFrame]:
     """
@@ -334,6 +335,7 @@ def compute_minute_microstructure(df: pd.DataFrame) -> pd.DataFrame:
                 "delta_persistence",
                 "micro_clustering",
                 "alternation_index",
+                "micro_delta",
             ]
         )
 
@@ -401,31 +403,17 @@ def build_empty_micro_frame(start_ms: int, end_ms: int) -> pd.DataFrame:
 
 
 # ============================================================
-# SAVE TRADES
+# SAVE TRADES (APPEND TO ONE CSV)
 # ============================================================
-def save_trades_csv(df_all: pd.DataFrame, start_ms: int, end_ms: int):
+def append_trades_csv(df_all: pd.DataFrame, header: bool):
     """
-    Save the raw trades used for this run as a single CSV under raw/trades.
-    File name includes symbol + UTC start/end for readability.
+    Append the raw trades to a single CSV under raw/trades.
     """
-    TRADES_DIR.mkdir(parents=True, exist_ok=True)
-
-    start_dt = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc)
-    end_dt = datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc)
-
-    start_str = start_dt.strftime("%Y%m%d_%H%M")
-    end_str = end_dt.strftime("%Y%m%d_%H%M")
-
-    fname = f"trades_{SYMBOL}_{start_str}_{end_str}.csv"
-    out_path = TRADES_DIR / fname
-
     df_to_save = df_all.copy()
-    # Handy readable timestamp column
     df_to_save["timestamp_utc"] = pd.to_datetime(
         df_to_save["timestamp"], unit="ms", utc=True
     )
 
-    # Put the useful columns first
     cols_order = [
         "timestamp",
         "timestamp_utc",
@@ -439,47 +427,50 @@ def save_trades_csv(df_all: pd.DataFrame, start_ms: int, end_ms: int):
     other_cols = [c for c in df_to_save.columns if c not in existing_cols]
     df_to_save = df_to_save[existing_cols + other_cols]
 
-    df_to_save.to_csv(out_path, index=False)
+    df_to_save.to_csv(TRADES_OUT, mode="a", index=False, header=header)
     logging.info(
-        "Saved raw trades used for this run → %s (%s rows)",
-        out_path,
+        "Appended trades → %s (%s rows, header=%s)",
+        TRADES_OUT,
         len(df_to_save),
+        header,
     )
 
 
 # ============================================================
-# MICROSTRUCTURE FOR RANGE
+# MICROSTRUCTURE FOR A SINGLE [start_ms, end_ms) BUCKET
 # ============================================================
-def compute_micro_for_range(start_ms: int, end_ms: int) -> pd.DataFrame:
+def compute_micro_for_range(start_ms: int, end_ms: int) -> (pd.DataFrame, pd.DataFrame):
     """
     Fetch trades in [start_ms, end_ms), compute per-trade delta and
-    per-minute microstructure, and return a continuous 1-minute frame.
+    per-minute microstructure, and return:
 
-    Columns:
-      - open_time_ms
-      - delta
-      - trade_count
-      - buy_count
-      - sell_count
-      - entropy
-      - delta_persistence
-      - micro_clustering
-      - alternation_index
+      micro_hour: DataFrame with columns
+        - open_time_ms
+        - delta, micro_delta, trade_count, buy_count, sell_count,
+          entropy, delta_persistence, micro_clustering, alternation_index
 
-    Also appends the per-trade data used into the global TRADES_CHUNKS
-    list, so we can save a single CSV at the end of the run.
+      trades_hour: DataFrame of raw trades used
+
+    This is called per hour, so memory stays bounded.
     """
-    chunks = list(stream_trades_range(start_ms, end_ms))
+    trades_chunks: List[pd.DataFrame] = []
 
-    if not chunks:
+    for chunk in stream_trades_range(start_ms, end_ms):
+        trades_chunks.append(chunk)
+
+    if not trades_chunks:
         logging.warning(
-            "No trades found for range %s → %s. Returning zero micro frame.",
+            "No trades found for range %s → %s. Using zero micro frame.",
             start_ms,
             end_ms,
         )
-        return build_empty_micro_frame(start_ms, end_ms)
+        micro = build_empty_micro_frame(start_ms, end_ms)
+        empty_trades = pd.DataFrame(
+            columns=["timestamp", "price", "qty", "is_buyer_maker", "delta", "minute"]
+        )
+        return micro, empty_trades
 
-    df_all = pd.concat(chunks, ignore_index=True)
+    df_all = pd.concat(trades_chunks, ignore_index=True)
 
     # Binance semantics:
     # is_buyer_maker == True  → buyer is maker → SELL TAKER → delta = -qty
@@ -489,9 +480,6 @@ def compute_micro_for_range(start_ms: int, end_ms: int) -> pd.DataFrame:
     # Minute bucket
     df_all["minute"] = (df_all["timestamp"] // 60_000) * 60_000
 
-    # Accumulate trades for this run (we'll save them once in main())
-    TRADES_CHUNKS.append(df_all)
-
     micro = compute_minute_microstructure(df_all)
 
     # Make continuous timeline [start_ms, end_ms) at 1m
@@ -499,24 +487,37 @@ def compute_micro_for_range(start_ms: int, end_ms: int) -> pd.DataFrame:
     micro = micro.reindex(full_idx, fill_value=0.0)
     micro.index.name = "open_time_ms"
 
-    logging.info("Microstructure minute count: %s", f"{len(micro):,}")
+    logging.info("Microstructure minute count (bucket): %s", f"{len(micro):,}")
 
-    return micro.reset_index()
+    return micro.reset_index(), df_all
 
 
-def _merge_with_candles(micro: pd.DataFrame) -> pd.DataFrame:
-    """
-    Merge per-minute micro stats with candle features to derive:
-      wick_body_ratio, micro_volatility, micro_return, order_imbalance, no_trend_stat
-    """
+# ============================================================
+# MERGE WITH CANDLES
+# ============================================================
+def load_candles() -> pd.DataFrame:
     if not CANDLES_PATH.exists():
         raise FileNotFoundError(f"Candles file missing: {CANDLES_PATH}")
 
     candles = pd.read_csv(CANDLES_PATH)
-    candles["open_time_ms"] = pd.to_datetime(candles["open_time"], utc=True).astype("int64") // 1_000_000
+    candles["open_time_ms"] = (
+        pd.to_datetime(candles["open_time"], utc=True)
+        .astype("int64") // 1_000_000
+    )
     candles = candles.drop_duplicates("open_time_ms").sort_values("open_time_ms")
+    return candles
 
-    merged = candles.merge(micro, left_on="open_time_ms", right_on="open_time_ms", how="left").fillna(0)
+
+def _merge_with_candles(candles: pd.DataFrame, micro: pd.DataFrame) -> pd.DataFrame:
+    """
+    Merge per-minute micro stats with candle features to derive:
+      wick_body_ratio, micro_volatility, micro_return, order_imbalance, no_trend_stat
+    """
+    merged = candles.merge(
+        micro,
+        on="open_time_ms",
+        how="left"
+    ).fillna(0)
 
     body = (merged.close - merged.open).abs()
     wick = (merged.high - merged.low) - body
@@ -534,10 +535,10 @@ def _merge_with_candles(micro: pd.DataFrame) -> pd.DataFrame:
     return merged
 
 
-def save_outputs(micro_full: pd.DataFrame):
+def save_outputs(micro_full: pd.DataFrame, candles: pd.DataFrame):
     RAW_DIR.mkdir(parents=True, exist_ok=True)
 
-    merged = _merge_with_candles(micro_full)
+    merged = _merge_with_candles(candles, micro_full)
 
     delta_only = merged[["open_time_ms", "micro_delta"]].rename(columns={"micro_delta": "delta"})
     micro_cols = [
@@ -567,91 +568,80 @@ def save_outputs(micro_full: pd.DataFrame):
 # ============================================================
 def main():
     setup_logging()
-    logging.info("=== DELTA + MICROSTRUCTURE GENERATOR START ===")
+    logging.info("=== DELTA + MICROSTRUCTURE GENERATOR (BUCKETED) START ===")
 
-    # ---- 1) Initial window based on LOOKBACK_DAYS at script START ----
-    wall_start = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-    initial_end_dt = wall_start                      # end EXCLUSIVE
-    initial_start_dt = initial_end_dt - timedelta(days=LOOKBACK_DAYS)
+    # ---- 1) Fixed target window based on LOOKBACK_DAYS ----
+    wall_finish = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    window_ms = int(LOOKBACK_DAYS * 24 * 60 * 60 * 1000)
 
-    initial_start_ms = int(initial_start_dt.timestamp() * 1000)
-    initial_end_ms = int(initial_end_dt.timestamp() * 1000)
+    start_ms = int((wall_finish - timedelta(days=LOOKBACK_DAYS)).timestamp() * 1000)
+    end_ms = int(wall_finish.timestamp() * 1000)  # end EXCLUSIVE
+
+    start_dt = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc)
+    end_dt = datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc)
 
     logging.info(
-        "Initial target window: %s -> %s (~%.3f days, end exclusive)",
-        initial_start_dt,
-        initial_end_dt,
+        "Target window: %s -> %s (~%.3f days, end exclusive)",
+        start_dt,
+        end_dt,
         LOOKBACK_DAYS,
     )
 
+    # If trades CSV already exists, start fresh for this run
+    if TRADES_OUT.exists():
+        TRADES_OUT.unlink()
+        logging.info("Removed existing trades CSV: %s", TRADES_OUT)
+
     try:
-        # ---- 2) Fetch & compute microstructure for main window ----
-        agg_main = compute_micro_for_range(initial_start_ms, initial_end_ms)
+        # ---- 2) Load candles once (fits in memory, unlike trades) ----
+        candles = load_candles()
 
-        # ---- 3) Compute gap between script start and now, and top-up ----
-        wall_finish = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-        final_end_ms = int(wall_finish.timestamp() * 1000)   # end EXCLUSIVE
+        # Restrict candles just to the window we care about for speed
+        candles = candles[
+            (candles["open_time_ms"] >= start_ms)
+            & (candles["open_time_ms"] < end_ms)
+        ].copy()
 
-        logging.info("Initial computation finished at %s", wall_finish)
+        # ---- 3) Process in 1-hour buckets, streaming trades ----
+        bucket_ms = 60 * 60 * 1000
+        current_start = start_ms
 
-        if final_end_ms > initial_end_ms:
-            # There is a gap between the initial end and "now"
-            gap_minutes = int((final_end_ms - initial_end_ms) // 60_000)
+        micro_parts: List[pd.DataFrame] = []
+        first_trades = True
+
+        while current_start < end_ms:
+            current_end = min(current_start + bucket_ms, end_ms)
+
             logging.info(
-                "Top-up gap detected: %d minutes between %s and %s",
-                gap_minutes,
-                datetime.fromtimestamp(initial_end_ms / 1000, tz=timezone.utc),
-                wall_finish,
+                "--- Bucket %s -> %s ---",
+                datetime.fromtimestamp(current_start / 1000, tz=timezone.utc),
+                datetime.fromtimestamp(current_end / 1000, tz=timezone.utc),
             )
 
-            gap_start_ms = initial_end_ms           # start from old end (no overlap)
-            gap_end_ms = final_end_ms               # end EXCLUSIVE
+            micro_hour, trades_hour = compute_micro_for_range(current_start, current_end)
 
-            agg_gap = compute_micro_for_range(gap_start_ms, gap_end_ms)
+            # Append per-minute micro for this bucket to list (tiny)
+            micro_parts.append(micro_hour)
 
-            # Merge main + gap, favouring gap data on overlaps
-            main_idxed = agg_main.set_index("open_time_ms")
-            gap_idxed = agg_gap.set_index("open_time_ms")
-            combined = pd.concat([main_idxed, gap_idxed])
-            combined = combined[~combined.index.duplicated(keep="last")]
-            combined = combined.sort_index()
+            # Append trades for this bucket to one CSV (streaming)
+            if not trades_hour.empty:
+                append_trades_csv(trades_hour, header=first_trades)
+                first_trades = False
 
-            # Enforce EXACT LOOKBACK_DAYS ending at wall_finish (end EXCLUSIVE)
-            window_ms = int(LOOKBACK_DAYS * 24 * 60 * 60 * 1000)
-            target_start_ms = final_end_ms - window_ms
+            current_start = current_end
 
-            combined = combined[combined.index >= target_start_ms]
-            combined = combined[combined.index < final_end_ms]
-
-            agg_final = combined.reset_index()
+        # ---- 4) Concatenate all per-minute microstructure (small) ----
+        if micro_parts:
+            micro_full = pd.concat(micro_parts, ignore_index=True)
         else:
-            logging.info("No significant gap; using initial computation only.")
-            agg_final = agg_main
+            micro_full = build_empty_micro_frame(start_ms, end_ms)
 
-        logging.info(
-            "Final window: %s rows from %s to %s (end exclusive)",
-            len(agg_final),
-            datetime.fromtimestamp(
-                int(agg_final["open_time_ms"].iloc[0]) / 1000, tz=timezone.utc
-            ),
-            datetime.fromtimestamp(final_end_ms / 1000, tz=timezone.utc),
-        )
+        logging.info("Full microstructure frame has %s rows", len(micro_full))
 
-        # ---- 4) Save all raw trades used in this run as a single CSV ----
-        if TRADES_CHUNKS:
-            trades_all = pd.concat(TRADES_CHUNKS, ignore_index=True)
-            trades_all.sort_values("timestamp", inplace=True)
+        # ---- 5) Save final outputs (delta.parquet & microstructure.parquet) ----
+        save_outputs(micro_full, candles)
 
-            start_ms_final = int(agg_final["open_time_ms"].min())
-            end_ms_final = int(agg_final["open_time_ms"].max()) + 60_000  # end exclusive
-
-            save_trades_csv(trades_all, start_ms_final, end_ms_final)
-        else:
-            logging.warning("No trades collected; skipping trades CSV save.")
-
-        # ---- 5) Save final, exact-length minute window ----
-        save_outputs(agg_final)
-        logging.info("=== DELTA + MICROSTRUCTURE GENERATOR FINISHED ===")
+        logging.info("=== DELTA + MICROSTRUCTURE GENERATOR (BUCKETED) FINISHED ===")
 
     except Exception as exc:
         logging.exception("Delta + microstructure pipeline failure: %s", exc)

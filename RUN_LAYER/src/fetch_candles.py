@@ -138,6 +138,11 @@ def download_last_14_days():
     print("==============================\n")
 
 
+# Entry point for orchestrator
+def main() -> None:
+    download_last_14_days()
+
+
 # =========================
 # RUN
 # =========================
