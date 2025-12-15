@@ -39,9 +39,10 @@ SLEEP_SECONDS_BETWEEN_LOOPS = 5
 
 # Paths
 THIS_DIR = Path(__file__).resolve().parent
-BASE_DIR = THIS_DIR.parents[2]
+BASE_DIR = THIS_DIR.parents[1]  # TRADINGBOTPROJECT root
 RUN_PROCESSED = BASE_DIR / "RUN_LAYER" / "data" / "processed"
 RUN_RAW = BASE_DIR / "RUN_LAYER" / "data" / "raw"
+P4_OUT = RUN_PROCESSED / "PILLAR_FOUR_REGIME_DETECTION"
 
 LOG_PATH = RUN_PROCESSED / "live_combined_log.parquet"
 
@@ -181,18 +182,31 @@ def _sleep_until_next_minute(last_ts_ms: int | None) -> None:
         time.sleep(SLEEP_SECONDS_BETWEEN_LOOPS)
         return
     last_dt = datetime.fromtimestamp(last_ts_ms / 1000, tz=timezone.utc)
-    next_minute = (last_dt.replace(second=0, microsecond=0) + pd.Timedelta(minutes=1)).to_pydatetime()
+    next_minute = last_dt.replace(second=0, microsecond=0) + pd.Timedelta(minutes=1)
     wait = max(1.0, (next_minute - datetime.now(timezone.utc)).total_seconds())
     time.sleep(wait)
+
+
+def _current_closed_minute_ms() -> int:
+    """
+    Return the start timestamp (ms) of the latest *closed* minute.
+    I.e., now rounded down to the minute minus one minute.
+    """
+    now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    closed = now - pd.Timedelta(minutes=1)
+    return int(closed.timestamp() * 1000)
 
 
 # ---------------------------------------------------------------------
 # Pipeline runners
 # ---------------------------------------------------------------------
 def run_preload() -> None:
-    # Adjust lookback settings for fetchers
+    # Adjust lookback settings for fetchers (full lookback, ending on latest CLOSED bar)
+    end_ms = _current_closed_minute_ms() + 60_000  # end is next minute boundary (exclusive)
     delta_and_micro.LOOKBACK_DAYS = LOOKBACK_MINUTES / 1440.0
     fetch_candles.LOOKBACK_DAYS = LOOKBACK_MINUTES / 1440.0
+    delta_and_micro.FORCE_END_MS = end_ms
+    fetch_candles.FORCE_END_MS = end_ms
 
     _run_with_retries(delta_and_micro.main, "delta_and_micro")
     _run_with_retries(trade_aggregator.main, "trade_aggregator")
@@ -212,36 +226,102 @@ def run_pre_p4() -> None:
 
 def run_p4_live() -> None:
     _run_with_retries(build_raw_regime_features_live.main, "build_raw_regime_features_live")
+    _keep_latest_only(P4_OUT / "raw_regime_features.parquet", "open_time_ms")
     _run_with_retries(deterministic_regime_engines_live.main, "deterministic_regime_engines_live")
+    _keep_latest_only(P4_OUT / "deterministic_regime_engines.parquet", "open_time_ms")
     _run_with_retries(pillar4_part3_ml_regime_classifier_live.main, "pillar4_part3_ml_regime_classifier_live")
+    _keep_latest_only(P4_OUT / "regime_ml_predictions.parquet", "open_time_ms")
     _run_with_retries(pillar4_part4_fusion_layer_live.main, "pillar4_part4_fusion_layer_live")
+    _keep_latest_only(P4_OUT / "regime_labels_fused.parquet", "open_time_ms")
     _run_with_retries(pillar4_part5_stability_layer_live.main, "pillar4_part5_stability_layer_live")
+    _keep_latest_only(P4_OUT / "regime_labels_stable.parquet", "open_time_ms")
     _run_with_retries(pillar_integration_live.main, "pillar_integration_live")
+    _keep_latest_only(P4_OUT / "regime_timeline.parquet", "open_time_ms")
 
 
 def run_p1_live() -> None:
     _run_with_retries(build_pillar1_feature_matrix_live.main, "build_pillar1_feature_matrix_live")
+    _keep_latest_only(RUN_PROCESSED / "PILLAR_ONE_ENTRY_MODEL" / "features_pillar1_primitives.parquet", "open_time_ms")
     _run_with_retries(build_pillar1_mini_engines_live.main, "build_pillar1_mini_engines_live")
+    _keep_latest_only(RUN_PROCESSED / "PILLAR_ONE_ENTRY_MODEL" / "features_pillar1_with_engines.parquet", "open_time_ms")
     _run_with_retries(build_pillar1_labels_live.main, "build_pillar1_labels_live")
+    _keep_latest_only(RUN_PROCESSED / "PILLAR_ONE_ENTRY_MODEL" / "labels_pillar1.parquet", "open_time_ms")
     _run_with_retries(build_pillar1_multi_horizon_ml_live.main, "build_pillar1_multi_horizon_ml_live")
+    _keep_latest_only(RUN_PROCESSED / "PILLAR_ONE_ENTRY_MODEL" / "features_pillar1_with_ml.parquet", "open_time_ms")
     _run_with_retries(build_pillar1_meta_features_live.main, "build_pillar1_meta_features_live")
+    _keep_latest_only(RUN_PROCESSED / "PILLAR_ONE_ENTRY_MODEL" / "features_pillar1_with_meta.parquet", "open_time_ms")
     _run_with_retries(build_pillar1_master_aggregator_live.main, "build_pillar1_master_aggregator_live")
+    _keep_latest_only(RUN_PROCESSED / "PILLAR_ONE_ENTRY_MODEL" / "features_pillar1_with_agg.parquet", "open_time_ms")
     _run_with_retries(build_pillar1_calibration_live.main, "build_pillar1_calibration_live")
+    _keep_latest_only(RUN_PROCESSED / "PILLAR_ONE_ENTRY_MODEL" / "features_pillar1_with_calib.parquet", "open_time_ms")
     _run_with_retries(build_pillar1_decision_layer_live.main, "build_pillar1_decision_layer_live")
+    _keep_latest_only(RUN_PROCESSED / "PILLAR_ONE_ENTRY_MODEL" / "features_pillar1_final.parquet", "open_time_ms")
 
 
 def run_p2_live() -> None:
     _run_with_retries(build_exit_raw_features_live.main, "build_exit_raw_features_live")
+    _keep_latest_only(RUN_PROCESSED / "PILLAR_TWO_EXIT_MODEL" / "exit_raw.parquet", "open_time_ms")
     _run_with_retries(build_exit_labels_live.main, "build_exit_labels_live")
+    _keep_latest_only(RUN_PROCESSED / "PILLAR_TWO_EXIT_MODEL" / "exit_labels.parquet", "open_time_ms")
     _run_with_retries(build_exit_mini_engines_live.main, "build_exit_mini_engines_live")
+    _keep_latest_only(RUN_PROCESSED / "PILLAR_TWO_EXIT_MODEL" / "exit_with_mini_engines.parquet", "open_time_ms")
     _run_with_retries(build_exit_ml_models_live.main, "build_exit_ml_models_live")
+    _keep_latest_only(RUN_PROCESSED / "PILLAR_TWO_EXIT_MODEL" / "exit_with_ml.parquet", "open_time_ms")
     _run_with_retries(build_exit_fusion_live.main, "build_exit_fusion_live")
+    _keep_latest_only(RUN_PROCESSED / "PILLAR_TWO_EXIT_MODEL" / "exit_with_fusion.parquet", "open_time_ms")
     _run_with_retries(build_exit_final_targets_live.main, "build_exit_final_targets_live")
+    _keep_latest_only(RUN_PROCESSED / "PILLAR_TWO_EXIT_MODEL" / "exit_final_targets.parquet", "open_time_ms")
 
 
 def run_p3_p5_live() -> None:
     _run_with_retries(build_position_sizing_live.main, "build_position_sizing_live")
+    _keep_latest_only(RUN_PROCESSED / "PILLAR_TWO_EXIT_MODEL" / "exit_with_sizing.parquet", "open_time_ms")
     _run_with_retries(build_execution_plans_live.main, "build_execution_plans_live")
+    _keep_latest_only(RUN_PROCESSED / "PILLAR_FIVE_EXECUTION_ENGINE" / "execution_plans.parquet", "open_time_ms")
+
+
+def ensure_pre_p4_current() -> None:
+    """
+    Keep rerunning preload + pre-P4 until the latest *closed* minute is present
+    in normalised_features.parquet. Always loads the full lookback window ending
+    at the latest closed minute (never the current open minute).
+    """
+    target_ms = _current_closed_minute_ms()  # capture once for this cycle
+    logging.info("Pre-P4 catch-up target (latest closed minute): %s", target_ms)
+    while True:
+        logging.info("Pre-P4 loop start with target_ms=%s", target_ms)
+        run_preload()
+        logging.info("Preload completed")
+        run_pre_p4()
+        logging.info("Pre-Pillar4 completed")
+
+        norm_path = RUN_PROCESSED / "PRE_PILLARFOUR" / "normalised_features.parquet"
+        if not norm_path.exists():
+            logging.warning("normalised_features.parquet missing at %s", norm_path)
+            time.sleep(2)
+            continue
+
+        df_norm = pd.read_parquet(norm_path)
+        if df_norm.empty or "open_time_ms" not in df_norm.columns:
+            logging.warning(
+                "normalised_features.parquet empty or missing open_time_ms; cols=%s len=%d",
+                list(df_norm.columns),
+                len(df_norm),
+            )
+            time.sleep(2)
+            continue
+
+        latest_ms = int(df_norm["open_time_ms"].max())
+        logging.info("Normalised latest_ms=%s (rows=%d)", latest_ms, len(df_norm))
+        if latest_ms >= target_ms:
+            logging.info("Pre-P4 catch-up satisfied: latest_ms=%s >= target_ms=%s", latest_ms, target_ms)
+            return
+
+        logging.info(
+            "Pre-P4 still missing: latest_ms=%s target_ms=%s; retrying full preload/pre-P4",
+            latest_ms,
+            target_ms,
+        )
 
 
 def main() -> None:
@@ -252,8 +332,7 @@ def main() -> None:
         loop_start = time.time()
         logging.info("=== Live pipeline loop start ===")
 
-        run_preload()
-        run_pre_p4()
+        ensure_pre_p4_current()
         run_p4_live()
         run_p1_live()
         run_p2_live()

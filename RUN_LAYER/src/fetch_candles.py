@@ -18,6 +18,7 @@ OUTPUT_DIR = RAW_DIR
 LIMIT = 1500  # Binance max rows per request
 
 LOOKBACK_DAYS = 1  # can be fractional (e.g., 30 minutes = 30/1440)
+FORCE_END_MS = None  # optional exclusive end timestamp override (ms)
 
 
 def ensure_output_dir(path: Path):
@@ -58,7 +59,10 @@ def download_last_14_days():
     ensure_output_dir(OUTPUT_DIR)
 
     # Now (UTC) and start based on lookback; end is exclusive
-    end_dt = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    if FORCE_END_MS is not None:
+        end_dt = datetime.fromtimestamp(FORCE_END_MS / 1000, tz=timezone.utc).replace(second=0, microsecond=0)
+    else:
+        end_dt = datetime.now(timezone.utc).replace(second=0, microsecond=0)
     window_minutes = int(LOOKBACK_DAYS * 24 * 60)
     start_dt = end_dt - timedelta(minutes=window_minutes)
 

@@ -32,6 +32,10 @@ ENDPOINT = "/fapi/v1/aggTrades"
 # Example: LOOKBACK_DAYS = 30 for 30 days; right now ~30 minutes for testing
 LOOKBACK_DAYS = 1 / 48  # 1/48 day ≈ 30 minutes
 
+# Optional override for the exclusive end timestamp (ms). When provided,
+# the pipeline will end exactly at that ms instead of "now".
+FORCE_END_MS: int | None = None
+
 # Binance / rate control
 LIMIT = 1000           # max trades per aggTrades request
 REQUEST_SLEEP = 0.1    # pause after each successful request (seconds)
@@ -571,7 +575,11 @@ def main():
     logging.info("=== DELTA + MICROSTRUCTURE GENERATOR (BUCKETED) START ===")
 
     # ---- 1) Fixed target window based on LOOKBACK_DAYS ----
-    wall_finish = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    if FORCE_END_MS is not None:
+        wall_finish = datetime.fromtimestamp(FORCE_END_MS / 1000, tz=timezone.utc).replace(second=0, microsecond=0)
+    else:
+        wall_finish = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+
     window_ms = int(LOOKBACK_DAYS * 24 * 60 * 60 * 1000)
 
     start_ms = int((wall_finish - timedelta(days=LOOKBACK_DAYS)).timestamp() * 1000)

@@ -141,7 +141,7 @@ def _build_market_snapshot(row: pd.Series) -> MarketSnapshot:
     )
 
 
-def _plan_to_row(plan, open_time_ms: Any) -> Dict[str, Any]:
+def _plan_to_row(plan, open_time_ms: Any, execute: int) -> Dict[str, Any]:
     return {
         "open_time_ms": open_time_ms,
         "order_type": plan.order_type.value,
@@ -156,6 +156,7 @@ def _plan_to_row(plan, open_time_ms: Any) -> Dict[str, Any]:
         "slippage_estimate_bps": plan.slippage_estimate_bps,
         "fill_probability": plan.fill_probability,
         "fee_estimate_bps": plan.fee_estimate_bps,
+        "execute": int(execute),
     }
 
 
@@ -173,6 +174,26 @@ def main() -> None:
 
     plans: List[Dict[str, Any]] = []
     for _, row in trades.iterrows():
+        # Execute gate: require all boolean flags True (if present) and any system_filter_v1 truthy
+        gate = True
+        # base P3 gating: decision != 'none' and direction != 0
+        gate &= str(row.get("entry_decision", "none")).lower() != "none"
+        gate &= float(row.get("entry_direction", row.get("direction", 0))) != 0
+        # system_filter_v1 if present
+        if "system_filter_v1" in row:
+            gate &= bool(row.get("system_filter_v1", True))
+        # positive size
+        gate &= float(row.get("position_size", row.get("final_position_size", 0.0))) > 0.0
+        # require TP/SL distances if present
+        if "optimal_tp_distance" in row and "optimal_sl_distance" in row:
+            gate &= (
+                float(row.get("optimal_tp_distance", 0.0)) > 0.0
+                and float(row.get("optimal_sl_distance", 0.0)) > 0.0
+            )
+        # if any explicit safety flag exists, require True
+        if "safety_allowed" in row:
+            gate &= bool(row.get("safety_allowed", True))
+
         entry = _build_entry_signal(row)
         exit_plan = _build_exit_plan(row)
         risk = _build_risk_params(row)
@@ -189,7 +210,7 @@ def main() -> None:
             market=market,
             now_ms=int(row.get("open_time_ms", 0)),
         )
-        plans.append(_plan_to_row(plan, row.get("open_time_ms")))
+        plans.append(_plan_to_row(plan, row.get("open_time_ms"), int(gate)))
 
     plans_df = pd.DataFrame(plans)
     _log_mem(plans_df, "[Exec] Execution plans")
