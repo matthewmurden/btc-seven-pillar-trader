@@ -58,10 +58,14 @@ def main() -> None:
 
     exclude = ["open_time_ms", "open_time", DEFAULT_REGIME_COL, "trades"]
     feature_list = collect_feature_list(df, exclude)
-    logging.info("Features to normalise: %d", len(feature_list))
+    logging.info("Normalising features (count=%d)", len(feature_list))
+    # Temporarily silence per-column INFO noise inside GlobalScalingEngine
+    root_level = logging.getLogger().level
+    logging.getLogger().setLevel(logging.WARNING)
 
     engine = GlobalScalingEngine(regime_col=DEFAULT_REGIME_COL)
     norm_df, params = engine.fit(df, feature_list)
+    logging.getLogger().setLevel(root_level)
 
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     norm_df.write_parquet(OUTPUT_PATH)

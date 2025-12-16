@@ -1,4 +1,4 @@
-# src/risk/risk_surface.py
+from __future__ import annotations
 
 """
 Pillar 3 — Risk Model (Position Sizing)
@@ -31,7 +31,6 @@ import pandas as pd
 # ---------------------------------------------------------------------
 # Config + helpers
 # ---------------------------------------------------------------------
-
 
 @dataclass
 class RiskSurfaceConfig:
@@ -109,7 +108,7 @@ class RiskSurfaceConfig:
 
     # Pillar 2 system filter
     # By default, Pillar 3 *gates* by system_filter_v1 to mirror the
-    # system_backtest pipeline (1.33M → ~202k → ~18k trades).
+    # system_backtest pipeline.
     col_system_filter: str = "system_filter_v1"
     use_system_filter_as_gate: bool = True
     # If gate is off, we can still downweight non-system trades:
@@ -152,20 +151,12 @@ def _nanmedian_safe(x: pd.Series, fallback: float) -> float:
 # 5.4 Volatility-weighted sizing
 # ---------------------------------------------------------------------
 
-
 def _compute_volatility_size_multiplier(
     df_active: pd.DataFrame,
     cfg: RiskSurfaceConfig,
 ) -> pd.Series:
     """
     5.4 Volatility-Weighted Position Sizing
-
-    Uses:
-      - volatility_score          → empirically, higher is better for this system
-                                    so we scale *up* with positive scores.
-      - expected_exit_time        → longer hold → shrink size
-      - mfe_dir^2 (variance proxy)→ fatter tails → shrink size
-      - sl_risk_factor            → direct Pillar 2 risk hint
     """
     idx = df_active.index
     n = len(df_active)
@@ -177,10 +168,6 @@ def _compute_volatility_size_multiplier(
             df_active[cfg.col_volatility_score], errors="coerce"
         ).fillna(0.0)
         vol_score_clip = vol_score.clip(-3.0, 3.0)
-        # Positive vol_score => empirically higher edge → increase size a bit.
-        #  score ≈ 0   → ~1.0
-        #  score ≈ 0.5 → ~1.10
-        #  score ≈ 1.0 → ~1.20 (capped later)
         vol_component = 1.0 + cfg.vol_score_weight * vol_score_clip
     else:
         vol_component = np.ones(n, dtype=float)
@@ -189,7 +176,6 @@ def _compute_volatility_size_multiplier(
     if cfg.col_exit_time in df_active.columns:
         t = pd.to_numeric(df_active[cfg.col_exit_time], errors="coerce")
         t_clip = t.clip(cfg.exit_time_floor, cfg.exit_time_cap)
-        # Longer expected hold → smaller
         time_component = 1.0 / np.sqrt(t_clip / cfg.exit_time_floor)
     else:
         time_component = np.ones(n, dtype=float)
@@ -199,7 +185,6 @@ def _compute_volatility_size_multiplier(
         mfe = pd.to_numeric(df_active[cfg.col_mfe_dir], errors="coerce").fillna(0.0)
         mfe_var_proxy = mfe ** 2
         mfe_ratio = (mfe_var_proxy / (cfg.mfe_var_ref + eps)).clip(0.25, 4.0)
-        # Higher variance => smaller
         mfe_component = 1.0 / np.sqrt(mfe_ratio)
     else:
         mfe_component = np.ones(n, dtype=float)
@@ -223,19 +208,12 @@ def _compute_volatility_size_multiplier(
 # 5.5 Signal-aligned scaling
 # ---------------------------------------------------------------------
 
-
 def _compute_signal_alignment_multiplier(
     df_active: pd.DataFrame,
     cfg: RiskSurfaceConfig,
 ) -> pd.Series:
     """
     5.5 Signal-Aligned Scaling
-
-    Uses:
-      - entry probability in trade direction
-      - meta_agreement_score / meta_conflict_score
-      - trend alignment (trend_score, meta_regime_trend_confirmation)
-      - breakout vs mean-reversion probability weighting
     """
     idx = df_active.index
     n = len(df_active)
@@ -257,10 +235,6 @@ def _compute_signal_alignment_multiplier(
         p_dir = np.where(sign_dir >= 0, p_up, p_dn)
         p_dir = np.clip(p_dir, 0.0, 1.0)
 
-    # Map:
-    #   0.5 → 1.0 (neutral)
-    #   0.25 → 0.5 (low conviction)
-    #   0.75 → 1.5 (high conviction)
     prob_component = 2.0 * (p_dir - 0.5) + 1.0
     prob_component = np.clip(prob_component, 0.2, 2.0)
 
@@ -270,7 +244,6 @@ def _compute_signal_alignment_multiplier(
             df_active[cfg.col_meta_agreement], errors="coerce"
         ).fillna(0.0)
         agree = agree.clip(-1.0, 1.0)
-        # -1 → 0.5, 0 → 1.0, +1 → 1.5
         agree_component = 1.0 + 0.5 * agree.to_numpy(dtype=float)
     else:
         agree_component = np.ones(n, dtype=float)
@@ -280,7 +253,6 @@ def _compute_signal_alignment_multiplier(
             df_active[cfg.col_meta_conflict], errors="coerce"
         ).fillna(0.0)
         conflict = conflict.clip(0.0, 5.0)
-        # 0 → 1.0, 1 → 0.5, 3+ → ~0.25 (clamped later)
         conf_component = 1.0 / (1.0 + conflict.to_numpy(dtype=float))
         conf_component = np.clip(conf_component, 0.4, 1.0)
     else:
@@ -302,7 +274,6 @@ def _compute_signal_alignment_multiplier(
             meta_sign = np.sign(meta_align.to_numpy(dtype=float))
             align_raw = align_raw * np.where(meta_sign == 0.0, 1.0, meta_sign)
 
-        # +1 → 1.2 (trend-aligned), -1 → 0.8 (fighting trend), 0 → 1.0
         trend_component = np.where(
             align_raw > 0,
             1.2,
@@ -326,13 +297,10 @@ def _compute_signal_alignment_multiplier(
         brk_arr = brk.to_numpy(dtype=float)
         rev_arr = rev.to_numpy(dtype=float)
 
-        # Project onto trade direction
         brk_dir = np.where(sign_dir >= 0, brk_arr, 1.0 - brk_arr)
         rev_dir = np.where(sign_dir >= 0, rev_arr, 1.0 - rev_arr)
 
         adv = np.clip(brk_dir - rev_dir, -1.0, 1.0)
-        # adv = +1 → 1.3 (breakout dominates)
-        # adv = -1 → 0.7 (reversion dominates)
         brk_component = 1.0 + 0.3 * adv
         brk_component = np.clip(brk_component, 0.7, 1.3)
     else:
@@ -354,20 +322,12 @@ def _compute_signal_alignment_multiplier(
 # 5.6 Regime-aware risk adjustments
 # ---------------------------------------------------------------------
 
-
 def _compute_regime_multiplier(
     df_active: pd.DataFrame,
     cfg: RiskSurfaceConfig,
 ) -> pd.Series:
     """
     5.6 Regime-Aware Risk Adjustments
-
-    Trend regime        → allow expansion
-    Chop regime         → reduce sharply
-    Vol expansion       → reduce moderately
-    Vol compression     → reduce sharply
-    Liquidity drought   → minimum size
-    Mean-reversion zone → conservative sizing
     """
     idx = df_active.index
     n = len(df_active)
@@ -391,7 +351,6 @@ def _compute_regime_multiplier(
         df_active.get(cfg.col_regime_liq_drought_flag, 0.0), errors="coerce"
     ).fillna(0.0)
 
-    # Approximate vol compression via very low volatility_score
     if cfg.col_volatility_score in df_active.columns:
         vol_score = pd.to_numeric(
             df_active[cfg.col_volatility_score], errors="coerce"
@@ -400,26 +359,15 @@ def _compute_regime_multiplier(
     else:
         vol_compress_flag = np.zeros(n, dtype=float)
 
-    # Chop regime: hard cut
     mult = np.where(chop > 0.5, mult * 0.4, mult)
-
-    # Trend regime: expand modestly (if not chopped)
     mult = np.where(
         (trend > 0.5) & (chop <= 0.5),
         mult * 1.2,
         mult,
     )
-
-    # Mean-reversion zone: slightly conservative
     mult = np.where(mean_rev > 0.5, mult * 0.8, mult)
-
-    # Vol expansion: reduce size moderately (kept conservative)
     mult = np.where(vol_exp > 0.5, mult * 0.8, mult)
-
-    # Vol compression: reduce size sharply (no aggressive sizing)
     mult = np.where(vol_compress_flag > 0.5, mult * 0.6, mult)
-
-    # Liquidity drought: force minimum size
     mult = np.where(liq_drought > 0.5, mult * 0.3, mult)
 
     mult = np.clip(mult, cfg.regime_mult_min, cfg.regime_mult_max)
@@ -430,18 +378,12 @@ def _compute_regime_multiplier(
 # 5.7 Drawdown governor
 # ---------------------------------------------------------------------
 
-
 def _compute_label_return_for_dd(
     df_active: pd.DataFrame,
     cfg: RiskSurfaceConfig,
 ) -> Optional[pd.Series]:
     """
     Build a simple realised-return proxy from labels for drawdown governor.
-
-    Uses:
-      - exit_outcome ∈ {'tp_first', 'sl_first', 'timeout'}
-      - optimal_tp_distance, optimal_sl_distance
-      - direction sign (entry_direction)
     """
     required = [
         cfg.col_exit_outcome,
@@ -472,7 +414,6 @@ def _compute_label_return_for_dd(
     tp = tp_dist.to_numpy(dtype=float)
     sl = sl_dist.to_numpy(dtype=float)
 
-    # Simple proxy: take signed TP/SL distance depending on outcome.
     ret = np.zeros(len(df_active), dtype=float)
     ret[outcome_arr == "tp_first"] = tp[outcome_arr == "tp_first"] * sign_dir[
         outcome_arr == "tp_first"
@@ -480,7 +421,7 @@ def _compute_label_return_for_dd(
     ret[outcome_arr == "sl_first"] = -sl[outcome_arr == "sl_first"] * sign_dir[
         outcome_arr == "sl_first"
     ]
-    # timeout → approx small realised outcome: 0
+    # timeout → approx 0
 
     return pd.Series(ret, index=df_active.index, dtype="float32")
 
@@ -492,23 +433,11 @@ def _compute_drawdown_multiplier(
 ) -> Tuple[pd.Series, pd.Series]:
     """
     5.7 Drawdown Governor
-
-    Builds an equity curve from past label-based returns and computes drawdown.
-    Uses a simple piecewise mapping from drawdown to multiplier:
-
-        drawdown ≥ -5%      → 1.0  (state='ok')
-        -10% ≤ dd < -5%     → 0.9  (state='mild')
-        -20% ≤ dd < -10%    → 0.7  (state='moderate')
-        dd < -20%           → 0.5  (state='severe')
-
-    Returns:
-        drawdown_multiplier, drawdown_state
     """
     idx = df_active.index
     n = len(df_active)
 
     if label_return is None or label_return.empty:
-        # Neutral drawdown state
         mult = np.ones(n, dtype=float)
         state = np.full(n, "none", dtype=object)
         return (
@@ -516,7 +445,6 @@ def _compute_drawdown_multiplier(
             pd.Series(state, index=idx, dtype="object"),
         )
 
-    # Sort trades by time to avoid leakage
     if cfg.col_time not in df_active.columns:
         logging.warning(
             "[RiskSurface] Drawdown governor: %s missing; using neutral.",
@@ -533,37 +461,29 @@ def _compute_drawdown_multiplier(
     df_dd["label_return"] = label_return
     df_dd = df_dd.sort_values(cfg.col_time)
 
-    # Use lagged returns so trade t only sees history up to t-1
     ret = df_dd["label_return"].to_numpy(dtype=float)
     ret_shifted = np.concatenate([[0.0], ret[:-1]])
     equity = 1.0 + np.cumsum(ret_shifted)
     max_equity = np.maximum.accumulate(equity)
     dd = equity / np.maximum(max_equity, cfg.eps) - 1.0  # in [-1, 0]
 
-    # Map drawdown to multiplier & state
     mult = np.ones_like(dd)
     state = np.full(dd.shape, "ok", dtype=object)
 
-    # severe drawdown (< -20%)
     mask_severe = dd < -0.20
     mult[mask_severe] = 0.5
     state[mask_severe] = "severe"
 
-    # moderate [-20%, -10%)
     mask_moderate = (dd >= -0.20) & (dd < -0.10)
     mult[mask_moderate] = 0.7
     state[mask_moderate] = "moderate"
 
-    # mild [-10%, -5%)
     mask_mild = (dd >= -0.10) & (dd < -0.05)
     mult[mask_mild] = 0.9
     state[mask_mild] = "mild"
 
-    # ok (≥ -5%) → 1.0
-
     mult = np.clip(mult, cfg.drawdown_mult_min, cfg.drawdown_mult_max)
 
-    # Map back to original index (unsorted order)
     dd_mult_series = pd.Series(mult.astype("float32"), index=df_dd.index)
     dd_state_series = pd.Series(state, index=df_dd.index, dtype="object")
 
@@ -577,19 +497,12 @@ def _compute_drawdown_multiplier(
 # 5.8 Exposure caps & leverage governor
 # ---------------------------------------------------------------------
 
-
 def _compute_leverage_multiplier(
     df_active: pd.DataFrame,
     cfg: RiskSurfaceConfig,
 ) -> pd.Series:
     """
     Leverage governor (per-trade).
-
-    Updated to be consistent with backtest diagnostics:
-
-      - Low volatility_score  → mild leverage *cut*
-      - Clearly positive score→ mild leverage *boost*
-      - Vol expansion extremes still kept conservative overall.
     """
     idx = df_active.index
     n = len(df_active)
@@ -607,15 +520,12 @@ def _compute_leverage_multiplier(
 
     mult = np.ones(n, dtype=float)
 
-    # Low-vol regimes: cut leverage a bit
     low_vol_mask = vol_score < -0.5
     mult[low_vol_mask] *= 0.8
 
-    # Clearly positive vol_score: allow mild leverage expansion
     high_vol_mask = vol_score > 0.3
     mult[high_vol_mask] *= 1.1
 
-    # In strong expansion + high vol, temper a little to avoid going nuts
     exp_extreme_mask = (vol_exp > 0.5) & (vol_score > 0.8)
     mult[exp_extreme_mask] *= 0.9
 
@@ -631,21 +541,29 @@ def _compute_exposure_cap_multiplier(
     Exposure cap multiplier (per trade).
 
     NOTE:
-      True portfolio-level exposure caps (max open leverage, concurrent positions,
-      directional exposure, cooldowns) require stateful scheduling in Pillar 5.
-
-      Here we provide a mild *per-trade* exposure_cap_multiplier based on
-      recent directional concentration as a hint to Pillar 5.
-
-    Logic (approximate):
-      - Look at recent N trades' direction sign.
-      - If heavily skewed to one side, reduce new size a bit.
+      - In backtest mode, this uses recent trade directions to gently
+        cut size when you're heavily one-sided.
+      - In live mode, if we only see a handful of trades (or just one),
+        we return a neutral multiplier = 1.0 to avoid false "one-sided"
+        cuts from degenerate history.
     """
     idx = df_active.index
     n = len(df_active)
 
-    if cfg.col_time not in df_active.columns or cfg.col_direction not in df_active.columns:
-        # Neutral exposure cap (Pillar 5 will enforce portfolio caps)
+    if (
+        n == 0
+        or cfg.col_time not in df_active.columns
+        or cfg.col_direction not in df_active.columns
+    ):
+        return pd.Series(
+            np.ones(n, dtype="float32"),
+            index=idx,
+        )
+
+    # If there isn't enough history, don't second-guess exposure here.
+    # Pillar 5 can still enforce true portfolio-level caps.
+    min_history = 50
+    if n < min_history:
         return pd.Series(
             np.ones(n, dtype="float32"),
             index=idx,
@@ -657,19 +575,17 @@ def _compute_exposure_cap_multiplier(
     direction = pd.to_numeric(df_exp[cfg.col_direction], errors="coerce").fillna(0.0)
     sign_dir = np.sign(direction.to_numpy(dtype=float))
 
-    # Rolling window over trades, not time; small to avoid heavy compute
     window = 200
-    rolling_mean = pd.Series(sign_dir).rolling(window=window, min_periods=1).mean()
+    window = min(window, n)
+    rolling_mean = pd.Series(sign_dir).rolling(window=window, min_periods=window).mean()
     skew = rolling_mean.to_numpy(dtype=float)  # in [-1, 1]
 
-    # If |skew| > 0.5 we are heavily biased to one side → cut size moderately
     mult = np.ones_like(skew)
-    mult[np.abs(skew) > 0.7] = 0.6   # strong one-sided exposure
-    mult[(np.abs(skew) > 0.5) & (np.abs(skew) <= 0.7)] = 0.8  # moderate
+    mult[np.abs(skew) > 0.7] = 0.6
+    mult[(np.abs(skew) > 0.5) & (np.abs(skew) <= 0.7)] = 0.8
 
     mult = np.clip(mult, cfg.exposure_mult_min, cfg.exposure_mult_max)
 
-    # Map back to active index order
     mult_series = pd.Series(mult.astype("float32"), index=df_exp.index)
     mult_series = mult_series.reindex(idx)
 
@@ -680,45 +596,12 @@ def _compute_exposure_cap_multiplier(
 # Public API: full risk surface + sizing
 # ---------------------------------------------------------------------
 
-
 def compute_risk_surface_and_sizing(
     trades_df: pd.DataFrame,
     cfg: Optional[RiskSurfaceConfig] = None,
 ) -> pd.DataFrame:
     """
     Build Pillar 3 risk surface + position sizing.
-
-    *Now aligned with backtester logic:*
-
-      - If col_system_filter exists and use_system_filter_as_gate=True,
-        only trades with system_filter_v1 == True are treated as "active"
-        and get non-zero size. This mirrors the system_backtest where
-        you first filter by system_filter_v1 and then simulate trades.
-
-    Adds (among others):
-
-        sl_distance
-        vol_factor
-        liq_factor
-
-        size_volatility_multiplier
-        signal_alignment_multiplier
-        regime_multiplier
-        drawdown_multiplier
-        leverage_multiplier
-        exposure_cap_multiplier
-        position_size_multiplier
-
-        risk_per_trade_frac
-        position_notional
-        position_size
-        position_leverage
-
-        volatility_adjustment_flag
-        risk_mode
-        drawdown_state
-        scaling_metadata
-        position_risk_score
     """
     if cfg is None:
         cfg = RiskSurfaceConfig()
@@ -726,7 +609,6 @@ def compute_risk_surface_and_sizing(
     df = trades_df.copy()
     _log_mem(df, "[RiskSurface] Input trades_df")
 
-    # Basic requirements
     _require_cols(
         df,
         [
@@ -738,7 +620,6 @@ def compute_risk_surface_and_sizing(
         context="base P3 sizing",
     )
 
-    # Active trade mask: decision != 'none', direction != 0, and valid if flag exists
     active_mask = (df[cfg.col_decision] != "none") & (
         pd.to_numeric(df[cfg.col_direction], errors="coerce") != 0
     )
@@ -747,18 +628,14 @@ def compute_risk_surface_and_sizing(
         valid_flag = pd.to_numeric(df[cfg.col_valid_flag], errors="coerce").fillna(1.0)
         active_mask &= valid_flag != 0
 
-    # Pillar 2 system_filter_v1 alignment
     system_filter = None
     if cfg.col_system_filter in df.columns:
         system_filter = df[cfg.col_system_filter].astype(bool)
         if cfg.use_system_filter_as_gate:
-            # Mirror system_backtest: only trades that pass system_filter_v1
-            # are considered "tradable" for P3 sizing.
             active_mask &= system_filter
 
     if not active_mask.any():
         logging.warning("[RiskSurface] No active trades found in trades_df after gating.")
-        # Add empty output columns for consistency
         for col in [
             "sl_distance",
             "vol_factor",
@@ -793,9 +670,7 @@ def compute_risk_surface_and_sizing(
 
     df_active = df.loc[active_mask].copy()
 
-    # --------------------------------------------------------------
-    # 5.3 Risk Surface Estimator: SL distance, vol_factor, liq_factor
-    # --------------------------------------------------------------
+    # 5.3 Risk surface: SL distance, vol_factor, liq_factor
     entry_price = pd.to_numeric(
         df_active[cfg.col_entry_price], errors="coerce"
     ).astype(float)
@@ -809,7 +684,6 @@ def compute_risk_surface_and_sizing(
     df["sl_distance"] = np.nan
     df.loc[active_mask, "sl_distance"] = sl_distance.astype("float32")
 
-    # ATR-based volatility factor
     if cfg.col_atr in df_active.columns:
         atr = pd.to_numeric(df_active[cfg.col_atr], errors="coerce").abs()
         atr_pct = atr / np.clip(entry_price.abs(), cfg.eps, np.inf)
@@ -824,7 +698,6 @@ def compute_risk_surface_and_sizing(
         )
         vol_factor = np.ones(len(df_active), dtype=float)
 
-    # Liquidity factor
     if cfg.col_volume in df_active.columns:
         vol = pd.to_numeric(df_active[cfg.col_volume], errors="coerce").abs()
         med_vol = _nanmedian_safe(vol, fallback=1.0)
@@ -846,48 +719,27 @@ def compute_risk_surface_and_sizing(
             drought_arr > 0, cfg.liq_drought_multiplier, 1.0
         )
 
-    # Baseline risk per trade (before advanced scaling)
     baseline_risk = cfg.max_risk_pct * vol_factor * liq_factor
     baseline_risk = np.clip(
         baseline_risk, cfg.min_risk_pct, cfg.max_risk_pct * 1.5
     )
 
-    # If we are NOT using system_filter_v1 as a hard gate, we can still
-    # downweight non-system trades (so they exist but with tiny risk).
     if (system_filter is not None) and (not cfg.use_system_filter_as_gate):
         sf_arr = system_filter.loc[df_active.index].to_numpy(dtype=bool)
         baseline_risk = baseline_risk * np.where(sf_arr, 1.0, cfg.non_system_risk_downscale)
 
-    # --------------------------------------------------------------
-    # 5.4 Volatility-weighted position sizing multiplier
-    # --------------------------------------------------------------
     size_vol_mult = _compute_volatility_size_multiplier(df_active, cfg)
-
-    # --------------------------------------------------------------
-    # 5.5 Signal-aligned scaling multiplier
-    # --------------------------------------------------------------
     signal_mult = _compute_signal_alignment_multiplier(df_active, cfg)
-
-    # --------------------------------------------------------------
-    # 5.6 Regime-aware multiplier
-    # --------------------------------------------------------------
     regime_mult = _compute_regime_multiplier(df_active, cfg)
 
-    # --------------------------------------------------------------
-    # 5.7 Drawdown governor
-    # --------------------------------------------------------------
     label_return = _compute_label_return_for_dd(df_active, cfg)
     drawdown_mult, drawdown_state = _compute_drawdown_multiplier(
         df_active, label_return, cfg
     )
 
-    # --------------------------------------------------------------
-    # 5.8 Leverage governor + exposure cap
-    # --------------------------------------------------------------
     leverage_mult = _compute_leverage_multiplier(df_active, cfg)
     exposure_mult = _compute_exposure_cap_multiplier(df_active, cfg)
 
-    # Combined multiplier (regime + signal + vol + drawdown + leverage + exposure)
     combined_mult = (
         size_vol_mult.to_numpy(dtype=float)
         * signal_mult.to_numpy(dtype=float)
@@ -897,7 +749,6 @@ def compute_risk_surface_and_sizing(
         * exposure_mult.to_numpy(dtype=float)
     )
 
-    # Clamp combined multiplier to sane global bounds
     combined_mult = np.clip(
         combined_mult,
         cfg.vol_size_mult_min
@@ -914,30 +765,20 @@ def compute_risk_surface_and_sizing(
         * cfg.exposure_mult_max,
     )
 
-    # --------------------------------------------------------------
-    # Initial risk_per_trade_frac (P&L risk, not notional)
-    # --------------------------------------------------------------
     raw_risk_frac = baseline_risk * combined_mult
     risk_per_trade_frac = np.clip(
         raw_risk_frac, cfg.min_risk_pct, cfg.max_risk_pct
     )
 
-    # --------------------------------------------------------------
-    # Initial position notional & leverage (before risk_mode gating)
-    # --------------------------------------------------------------
     sl_dist_arr = sl_distance.to_numpy(dtype=float)
     position_notional = risk_per_trade_frac / np.clip(
         sl_dist_arr, cfg.min_sl_distance, np.inf
     )
     position_leverage = np.clip(position_notional, 0.0, cfg.max_leverage)
 
-    # If leverage was clipped, adjust notional to match the capped leverage
     position_notional = position_leverage
-    position_size = position_notional  # alias
+    position_size = position_notional
 
-    # --------------------------------------------------------------
-    # Write base results back to full DataFrame
-    # --------------------------------------------------------------
     df["vol_factor"] = np.nan
     df["liq_factor"] = np.nan
     df["size_volatility_multiplier"] = 1.0
@@ -972,23 +813,17 @@ def compute_risk_surface_and_sizing(
     df.loc[active_mask, "position_leverage"] = position_leverage.astype("float32")
     df.loc[active_mask, "drawdown_state"] = drawdown_state.astype("object")
 
-    # Volatility adjustment flag (cut / neutral / expanded)
     size_vol = df.loc[active_mask, "size_volatility_multiplier"].to_numpy(dtype=float)
     vol_flag = np.full(size_vol.shape, "neutral", dtype=object)
     vol_flag[size_vol < 0.8] = "cut"
     vol_flag[size_vol > 1.1] = "expanded"
     df.loc[active_mask, "volatility_adjustment_flag"] = vol_flag
 
-    # --------------------------------------------------------------
-    # Risk mode classification
-    # --------------------------------------------------------------
     risk_mode = np.full(size_vol.shape, "normal", dtype=object)
     dd_state_arr = df.loc[active_mask, "drawdown_state"].to_numpy(dtype=object)
 
-    # crisis → severe drawdown
     risk_mode[dd_state_arr == "severe"] = "crisis"
 
-    # defensive → moderate dd, chop, or vol expansion
     chop_flag = pd.to_numeric(
         df_active.get(cfg.col_regime_chop_flag, 0.0), errors="coerce"
     ).fillna(0.0)
@@ -1002,7 +837,6 @@ def compute_risk_surface_and_sizing(
     )
     risk_mode[defensive_mask & (risk_mode != "crisis")] = "defensive"
 
-    # aggressive → strong signal + low drawdown
     sig_mult_arr = signal_mult.to_numpy(dtype=float)
     aggressive_mask = (
         (sig_mult_arr > 1.3) & (dd_state_arr == "ok") & (size_vol >= 0.9)
@@ -1011,9 +845,6 @@ def compute_risk_surface_and_sizing(
 
     df.loc[active_mask, "risk_mode"] = risk_mode
 
-    # --------------------------------------------------------------
-    # Risk-mode-based adjustment of risk_per_trade_frac
-    # --------------------------------------------------------------
     mode_arr = df.loc[active_mask, "risk_mode"].to_numpy(dtype=object)
     rpt = df.loc[active_mask, "risk_per_trade_frac"].to_numpy(dtype=float)
 
@@ -1021,13 +852,12 @@ def compute_risk_surface_and_sizing(
     mode_mult[mode_arr == "crisis"] = 0.4
     mode_mult[mode_arr == "defensive"] = 0.7
     mode_mult[mode_arr == "normal"] = 1.0
-    mode_mult[mode_arr == "aggressive"] = 1.0  # currently no extra boost
+    mode_mult[mode_arr == "aggressive"] = 1.0
 
     rpt = rpt * mode_mult
     rpt = np.clip(rpt, cfg.min_risk_pct, cfg.max_risk_pct)
     df.loc[active_mask, "risk_per_trade_frac"] = rpt.astype("float32")
 
-    # Recompute position_notional / size / leverage after mode gating
     sl_dist_arr_final = df.loc[active_mask, "sl_distance"].to_numpy(dtype=float)
     position_notional_final = rpt / np.clip(
         sl_dist_arr_final, cfg.min_sl_distance, np.inf
@@ -1040,7 +870,6 @@ def compute_risk_surface_and_sizing(
     df.loc[active_mask, "position_size"] = position_size_final.astype("float32")
     df.loc[active_mask, "position_leverage"] = position_leverage_final.astype("float32")
 
-    # Position risk score (0–1, where 1 ~ at max_risk_pct) AFTER risk_mode gating
     pos_risk_score = np.clip(
         rpt / (cfg.max_risk_pct + cfg.eps),
         0.0,
@@ -1048,7 +877,6 @@ def compute_risk_surface_and_sizing(
     )
     df.loc[active_mask, "position_risk_score"] = pos_risk_score.astype("float32")
 
-    # Scaling metadata string (per-component multipliers only)
     reg_mult_arr = regime_mult.to_numpy(dtype=float)
     dd_mult_arr = drawdown_mult.to_numpy(dtype=float)
     lev_mult_arr = leverage_mult.to_numpy(dtype=float)
@@ -1063,7 +891,6 @@ def compute_risk_surface_and_sizing(
 
     _log_mem(df, "[RiskSurface] Output trades_df + full P3 sizing")
 
-    # Some summary stats (after all adjustments)
     active_leverage = df.loc[active_mask, "position_leverage"]
     logging.info(
         "[RiskSurface] Active trades: %d, mean leverage=%.3f, max leverage=%.3f",

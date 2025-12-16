@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import requests
 from requests.exceptions import HTTPError
+import warnings
 
 # ============================================================
 # CONFIG / PATHS
@@ -38,15 +39,17 @@ FORCE_END_MS: int | None = None
 
 # Binance / rate control
 LIMIT = 1000           # max trades per aggTrades request
-REQUEST_SLEEP = 0.1    # pause after each successful request (seconds)
+REQUEST_SLEEP = 0.25    # pause after each successful request (seconds)
 WINDOW_HOURS = 1       # size of each time window (1h chunks)
-WINDOW_SLEEP = 1.0     # pause after finishing each window (seconds)
+WINDOW_SLEEP = 0     # pause after finishing each window (seconds)
 
 # Retry safety so we don't get stuck forever on 429s / glitches
 MAX_429_RETRIES_PER_WINDOW = 6
 MAX_GENERIC_RETRIES_PER_WINDOW = 6
 
 EPS = 1e-12  # safety epsilon
+# Silence noisy FutureWarnings from groupby.apply deprecation
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 # Microstructure columns that we persist to MICRO_OUT
 MICRO_FEATURE_COLS = [
@@ -102,12 +105,37 @@ def get_agg_trades(symbol: str, start_ms: int, end_ms: int, limit: int = LIMIT) 
         "limit": limit,
     }
 
+    # NEW: log every request
+    logging.info(
+        "Requesting aggTrades: %s | params=%s",
+        url,
+        params,
+    )
+
     resp = requests.get(url, params=params, timeout=10)
+
+    # Log basic response info before raising on error
+    logging.info(
+        "aggTrades response: status=%s, bytes=%s",
+        resp.status_code,
+        len(resp.content),
+    )
+
     resp.raise_for_status()
     data = resp.json()
 
     if not isinstance(data, list):
+        logging.error("Unexpected aggTrades response payload: %s", data)
         raise RuntimeError(f"Unexpected aggTrades response: {data}")
+
+    # Also log how many trades we actually got in this raw payload
+    logging.info(
+        "aggTrades payload decoded: trades=%s (start_ms=%s, end_ms=%s)",
+        len(data),
+        start_ms,
+        end_ms,
+    )
+
     return data
 
 

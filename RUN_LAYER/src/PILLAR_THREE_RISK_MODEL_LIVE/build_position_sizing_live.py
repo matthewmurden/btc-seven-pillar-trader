@@ -21,15 +21,17 @@ from pathlib import Path
 import pandas as pd
 
 THIS_DIR = Path(__file__).resolve().parent
+# Repo root: TRADINGBOTPROJECT
 BASE_DIR = THIS_DIR.parents[2]
-RUN_PROCESSED = BASE_DIR / "RUN_LAYER" / "data" / "processed"
 
-# Input/Output within the live processed tree
+# Live processed tree
+RUN_PROCESSED = BASE_DIR / "RUN_LAYER" / "data" / "processed"
 P2_PROCESSED = RUN_PROCESSED / "PILLAR_TWO_EXIT_MODEL"
+
 TRADES_PATH = P2_PROCESSED / "exit_final_targets.parquet"
 OUTPUT_PATH = P2_PROCESSED / "exit_with_sizing.parquet"
 
-# Pillar 3 source
+# Pillar 3 source (offline risk model implementation)
 P3_BASE = BASE_DIR / "PILLAR_THREE_RISK_MODEL"
 P3_SRC = P3_BASE / "src"
 for p in (P3_BASE, P3_SRC):
@@ -46,7 +48,8 @@ def _log_mem(df: pd.DataFrame, msg: str) -> None:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+    # Logging is usually configured by live_runner; if not, uncomment:
+    # logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
     if not TRADES_PATH.exists():
         raise FileNotFoundError(f"Final TP/SL targets parquet not found: {TRADES_PATH}")
@@ -54,6 +57,12 @@ def main() -> None:
     logging.info("Loading Pillar 2 final targets (live): %s", TRADES_PATH)
     trades_df = pd.read_parquet(TRADES_PATH)
     _log_mem(trades_df, "[P3] Loaded exit_final_targets (live)")
+
+    if trades_df.empty:
+        logging.warning("[P3] exit_final_targets is empty; writing empty sizing output.")
+        OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        trades_df.to_parquet(OUTPUT_PATH, index=False, compression="zstd")
+        return
 
     cfg = RiskSurfaceConfig()
     logging.info("[P3] Computing risk surface + sizing (live) with config: %s", cfg)

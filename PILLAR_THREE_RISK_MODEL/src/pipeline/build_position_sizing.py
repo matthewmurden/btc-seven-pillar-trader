@@ -1,4 +1,4 @@
-# src/pipeline/build_position_sizing.py
+from __future__ import annotations
 
 """
 Pipeline entrypoint for Pillar 3 — Risk Model (Position Sizing).
@@ -34,10 +34,11 @@ def _log_mem(df: pd.DataFrame, msg: str) -> None:
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(message)s",
-    )
+    # Assume logging is configured by the top-level runner; if not, uncomment:
+    # logging.basicConfig(
+    #     level=logging.INFO,
+    #     format="%(asctime)s | %(levelname)s | %(message)s",
+    # )
 
     if not TRADES_PATH.exists():
         raise FileNotFoundError(f"Final TP/SL targets parquet not found: {TRADES_PATH}")
@@ -45,6 +46,12 @@ def main() -> None:
     logging.info("Loading final TP/SL targets (Pillar 2): %s", TRADES_PATH)
     trades_df = pd.read_parquet(TRADES_PATH)
     _log_mem(trades_df, "[P3] Loaded exit_final_targets")
+
+    if trades_df.empty:
+        logging.warning("[P3] exit_final_targets is empty; writing empty sizing output.")
+        OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        trades_df.to_parquet(OUTPUT_PATH, index=False, compression="zstd")
+        return
 
     cfg = RiskSurfaceConfig()
     logging.info(

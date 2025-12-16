@@ -48,7 +48,7 @@ import pandas as pd
 # Config
 # ---------------------------------------------------------------------
 # Change to 1440 for 1-day lookback in production
-LOOKBACK_MINUTES = 5
+LOOKBACK_MINUTES = 120
 
 MAX_RETRIES = 3
 MAX_PRE_P4_TOPUPS = 5  # safety cap when trying to catch up to latest closed minute
@@ -123,6 +123,7 @@ from PILLAR_TWO_EXIT_MODEL_LIVE import (
     build_exit_raw_features_live,
     build_exit_labels_live,
     build_exit_mini_engines_live,
+    build_exit_deterministic_live,
     build_exit_ml_models_live,
     build_exit_fusion_live,
     build_exit_final_targets_live,
@@ -248,26 +249,32 @@ def _load_norm_features() -> pd.DataFrame | None:
 # ---------------------------------------------------------------------
 def run_preload_full_window(end_ms: int, lookback_minutes: int) -> None:
     """
-    Run delta_and_micro + trade_aggregator + fetch_candles + rollups for a full
-    `lookback_minutes` window ending at `end_ms` (exclusive).
+    Run fetch_candles + rollups + delta_and_micro + trade_aggregator
+    for a full `lookback_minutes` window ending at `end_ms` (exclusive).
 
     This is the "bootstrap" behaviour and also the fallback when no incremental
     top-up functions are available.
     """
     lookback_days = lookback_minutes / 1440.0
 
-    # If your scripts honour FORCE_END_MS, this will force the right end boundary;
-    # otherwise they will just use LOOKBACK_DAYS relative to "now".
-    delta_and_micro.LOOKBACK_DAYS = lookback_days
+    # Make sure both modules agree on the same fixed window
     fetch_candles.LOOKBACK_DAYS = lookback_days
-    delta_and_micro.FORCE_END_MS = end_ms
     fetch_candles.FORCE_END_MS = end_ms
 
-    _run_with_retries(delta_and_micro.main, "delta_and_micro")
-    _run_with_retries(trade_aggregator.main, "trade_aggregator")
+    delta_and_micro.LOOKBACK_DAYS = lookback_days
+    delta_and_micro.FORCE_END_MS = end_ms
+
+    # 1) Download 1m candles for the window (fresh BTC_CANDLES.csv)
     _run_with_retries(fetch_candles.main, "fetch_candles")
+
+    # 2) Build HTF rollups purely from the local 1m candles
     _run_with_retries(rollups.main, "rollups")
 
+    # 3) Build trades + microstructure using the *fresh* candles file
+    _run_with_retries(delta_and_micro.main, "delta_and_micro")
+
+    # 4) Aggregate trades as needed
+    _run_with_retries(trade_aggregator.main, "trade_aggregator")
 
 def run_preload_incremental(end_ms: int, lookback_minutes: int) -> None:
     """
@@ -493,10 +500,10 @@ def run_p2_live() -> None:
     _run_with_retries(build_exit_raw_features_live.main, "build_exit_raw_features_live")
     _run_with_retries(build_exit_labels_live.main, "build_exit_labels_live")
     _run_with_retries(build_exit_mini_engines_live.main, "build_exit_mini_engines_live")
+    _run_with_retries(build_exit_deterministic_live.main, "build_exit_deterministic_live")  # 🔴 new
     _run_with_retries(build_exit_ml_models_live.main, "build_exit_ml_models_live")
     _run_with_retries(build_exit_fusion_live.main, "build_exit_fusion_live")
     _run_with_retries(build_exit_final_targets_live.main, "build_exit_final_targets_live")
-
 
 def run_p3_p5_live() -> None:
     """
@@ -530,7 +537,7 @@ def main() -> None:
 
     while True:
         loop_start = time.time()
-        logging.info("=== Live pipeline loop start ===")
+        print("=== Live pipeline loop start ===")
 
         # 1) Ensure Pre-Pillar4 has the latest closed minute (full normalised window)
         ensure_pre_p4_current(initial=first_run)
@@ -576,7 +583,7 @@ def main() -> None:
         )
 
         loop_dur = time.time() - loop_start
-        logging.info("=== Live pipeline loop complete in %.1fs ===", loop_dur)
+        print(f"=== Live pipeline loop complete in {loop_dur:.1f}s ===")
 
         # 8) Wait for next whole-minute boundary
         _sleep_until_next_minute()

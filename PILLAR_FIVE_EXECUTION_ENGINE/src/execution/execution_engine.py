@@ -240,9 +240,12 @@ class ExecutionEngine:
             now_ms = int(time.time() * 1000)
 
         # 1) Safety veto
-        if not safety.allowed or safety.liquidity_guard_triggered \
-                or safety.volatility_shock_guard_triggered \
-                or safety.cooldown_guard_triggered:
+        if (
+            not safety.allowed
+            or safety.liquidity_guard_triggered
+            or safety.volatility_shock_guard_triggered
+            or safety.cooldown_guard_triggered
+        ):
             return self._build_vetoed_plan(
                 entry_signal=entry_signal,
                 exit_plan=exit_plan,
@@ -860,7 +863,10 @@ class ExecutionEngine:
         Turn signal validity + expected exit time into an order expiration timestamp.
         """
         # Heuristic: base validity = min(expected_exit_time, 1/4 of it)
-        base_valid_sec = min(exit_plan.expected_exit_time_sec, max(30.0, exit_plan.expected_exit_time_sec / 4.0))
+        base_valid_sec = min(
+            exit_plan.expected_exit_time_sec,
+            max(30.0, exit_plan.expected_exit_time_sec / 4.0),
+        )
 
         # Scale by time_sensitivity (more sensitive -> shorter validity)
         scale = 1.0 - 0.5 * entry_signal.time_sensitivity
