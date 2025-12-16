@@ -202,7 +202,7 @@ def smooth(fused: pd.DataFrame, ml: pd.DataFrame, det: pd.DataFrame) -> pd.DataF
         hold_len_arr[i] = hold
         mode_arr[i] = mode
 
-    return pd.DataFrame(
+    out = pd.DataFrame(
         {
             "regime_label_stable": stable,
             "regime_label_prev": prev_label_arr,
@@ -210,6 +210,11 @@ def smooth(fused: pd.DataFrame, ml: pd.DataFrame, det: pd.DataFrame) -> pd.DataF
             "smoothing_mode": mode_arr,
         }
     )
+
+    if "open_time_ms" in fused.columns:
+        out.insert(0, "open_time_ms", fused["open_time_ms"].to_numpy())
+
+    return out
 
 
 # =========================

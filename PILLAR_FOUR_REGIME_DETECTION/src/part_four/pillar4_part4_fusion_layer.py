@@ -194,6 +194,10 @@ def fuse(det: pd.DataFrame, ml: pd.DataFrame) -> pd.DataFrame:
         },
         index=det.index,
     )
+
+    # Preserve time alignment if available
+    if "open_time_ms" in det.columns:
+        result.insert(0, "open_time_ms", det["open_time_ms"].to_numpy())
     return result
 
 

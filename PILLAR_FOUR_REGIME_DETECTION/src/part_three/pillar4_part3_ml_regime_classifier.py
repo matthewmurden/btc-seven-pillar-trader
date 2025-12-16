@@ -240,6 +240,11 @@ def main() -> None:
     df = prepare_features(raw_feats, det)
     labels = generate_labels(det)
 
+    # Preserve time column for output alignment
+    time_col = None
+    if "open_time_ms" in df.columns:
+        time_col = df["open_time_ms"].reset_index(drop=True)
+
     # drop timestamp columns from features
     feature_df = df.drop(
         columns=[c for c in df.columns if c in ["open_time_ms", "open_time"]],
@@ -260,6 +265,8 @@ def main() -> None:
 
     logging.info("Saving outputs")
     PART_THREE_DIR.mkdir(parents=True, exist_ok=True)
+    if time_col is not None:
+        preds.insert(0, "open_time_ms", time_col)
     preds.to_parquet(OUTPUT_PATH, index=False)
     try:
         joblib.dump(model, MODEL_PATH)

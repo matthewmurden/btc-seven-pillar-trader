@@ -43,7 +43,20 @@ def main() -> None:
     df = pl.read_parquet(INPUT_PATH)
     df = ensure_open_time_ms(df)
 
-    exclude = ["open_time_ms", "open_time", DEFAULT_REGIME_COL]
+    # Ensure count-style fields are floats so they get normalised (e.g. agg_trades)
+    promote_to_float = [
+        "agg_trades",
+        "agg_qty",
+        "agg_buy_qty",
+        "agg_sell_qty",
+        "agg_delta",
+        "trades",
+    ]
+    for col in promote_to_float:
+        if col in df.columns:
+            df = df.with_columns(pl.col(col).cast(pl.Float32))
+
+    exclude = ["open_time_ms", "open_time", DEFAULT_REGIME_COL, "trades"]
     feature_list = collect_feature_list(df, exclude)
     logging.info("Features to normalise: %d", len(feature_list))
 
