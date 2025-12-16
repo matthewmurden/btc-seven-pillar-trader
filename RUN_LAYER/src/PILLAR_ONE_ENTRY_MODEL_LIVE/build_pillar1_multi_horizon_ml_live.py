@@ -32,11 +32,10 @@ P1_PROCESSED = RUN_PROCESSED / "PILLAR_ONE_ENTRY_MODEL"
 FEATURES_PATH = P1_PROCESSED / "features_pillar1_with_engines.parquet"
 OUTPUT_PATH = P1_PROCESSED / "features_pillar1_with_ml.parquet"
 
-# Use the offline training template to preserve column ordering/coverage
+# Offline model dir (no need to touch training features in live)
 P1_BASE = BASE_DIR / "PILLAR_ONE_ENTRY_MODEL"
 P1_SRC = P1_BASE / "src"
 MODEL_DIR = P1_BASE / "models" / "pillar1_multi_horizon"
-TEMPLATE_PATH = P1_BASE / "data" / "processed" / "features_pillar1_with_engines.parquet"
 
 if str(P1_SRC) not in sys.path:
     sys.path.append(str(P1_SRC))
@@ -61,13 +60,6 @@ _LABELS_CACHE: Optional[pd.DataFrame] = None
 def _log_mem(df: pd.DataFrame, msg: str) -> None:
     mb = df.memory_usage(deep=True).sum() / (1024**2)
     logging.info("%s | shape=%s | approx_mem=%.1f MB", msg, df.shape, mb)
-
-
-def _load_feature_cols(template_path: Path, exclude: List[str]) -> List[str]:
-    if not template_path.exists():
-        raise FileNotFoundError(f"Template features parquet missing: {template_path}")
-    cols = pd.read_parquet(template_path, columns=None).columns.tolist()
-    return [c for c in cols if c not in exclude]
 
 
 def _align_features(
@@ -248,7 +240,6 @@ def main() -> None:
 
     specs = default_model_specs()
     label_cols = [s.label_col for s in specs]
-    feature_cols = _load_feature_cols(TEMPLATE_PATH, exclude=label_cols + ["open_time_ms"])
 
     cfg = MultiHorizonTrainingConfig(model_dir=MODEL_DIR)
     models = _load_models_cached(cfg, specs)
@@ -260,10 +251,18 @@ def main() -> None:
         base_df = base_df.sort_values("open_time_ms").reset_index(drop=True)
     _log_mem(base_df, "[MH] Loaded live features_with_engines")
 
-    # Current live window of timestamps
     if "open_time_ms" not in base_df.columns:
         raise RuntimeError("features_pillar1_with_engines.parquet missing 'open_time_ms' column")
+
     current_times = base_df["open_time_ms"].to_numpy()
+
+    # Fallback feature set if a model doesn't expose feature_names_in_
+    numeric_feature_cols = [
+        c
+        for c in base_df.columns
+        if c not in (["open_time_ms"] + label_cols)
+        and pd.api.types.is_numeric_dtype(base_df[c])
+    ]
 
     # Load existing slim ML output (if any)
     existing_slim = _load_existing_ml()
@@ -286,14 +285,11 @@ def main() -> None:
         _log_mem(aligned_existing, "[MH] Reused existing ML output (no new rows)")
         OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
         aligned_existing.to_parquet(OUTPUT_PATH, index=False, compression="zstd")
-        logging.info(
-            "Saved live Pillar 1 ML predictions (reused only) -> %s",
-            OUTPUT_PATH,
-        )
+        logging.info("Saved live Pillar 1 ML predictions (reused only) -> %s", OUTPUT_PATH)
         return
 
     if new_df.empty:
-        # No existing slim, but somehow nothing to score (should only happen if file just created); fall back to scoring all
+        # No existing slim, but nothing marked as "new" (e.g. first run edgecase) -> score all
         logging.info("[MH] No existing ML output; scoring entire current feature window.")
         new_df = base_df.copy()
 
@@ -308,7 +304,7 @@ def main() -> None:
         first = specs[0].name
         shared_feature_names = list(models[first].feature_names_in_)
         shared_expected_count = getattr(models[first], "n_features_in_", None)
-        # sanity: ensure all identical
+        # Sanity: ensure all identical
         for spec in specs[1:]:
             if list(models[spec.name].feature_names_in_) != shared_feature_names:
                 shared_feature_names = None
@@ -336,8 +332,12 @@ def main() -> None:
                 model_feature_cols = list(model_feature_cols)
                 expected_count = getattr(model, "n_features_in_", None)
             else:
-                # Fall back to template-based feature list
-                model_feature_cols = feature_cols
+                # Final fallback: use all numeric live columns
+                logging.warning(
+                    "[MH] Model %s has no feature_names_in_; falling back to all numeric live features.",
+                    spec.name,
+                )
+                model_feature_cols = numeric_feature_cols
                 expected_count = getattr(model, "n_features_in_", None)
 
         if aligned_cache is not None and shared_feature_names is not None:
