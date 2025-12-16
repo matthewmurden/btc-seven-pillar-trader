@@ -219,9 +219,8 @@ def run_pre_p4() -> None:
     _run_with_retries(build_canonical_with_engines_live.main, "build_canonical_with_engines_live")
     _run_with_retries(global_scaling_engine_live.main, "global_scaling_engine_live")
     norm_path = RUN_PROCESSED / "PRE_PILLARFOUR" / "normalised_features.parquet"
-    # Keep full history for correctness during computation, then keep only the freshest bar for downstream pillars.
+    # Keep history bounded to the lookback window, but retain all rows (no collapse to latest).
     _trim_parquet(norm_path, "open_time_ms", LOOKBACK_MINUTES)
-    _keep_latest_only(norm_path, "open_time_ms")
 
 
 def run_p4_live() -> None:
