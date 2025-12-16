@@ -104,3 +104,65 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+def topup_to(end_ms: int, lookback_minutes: int) -> None:
+    """
+    Incrementally aggregate trades up to end_ms (exclusive) keeping a rolling window.
+    Relies on trades CSVs already written by delta_and_micro.
+    """
+    _setup_logging()
+    window_ms = lookback_minutes * 60_000
+    target_start_ms = end_ms - window_ms
+
+    # Load existing aggregated if present
+    agg_df = pd.DataFrame()
+    if OUT_PATH.exists():
+        agg_df = pd.read_parquet(OUT_PATH)
+
+    if not agg_df.empty and "open_time_ms" in agg_df.columns:
+        existing_latest = int(agg_df["open_time_ms"].max())
+    else:
+        existing_latest = target_start_ms - 60_000
+
+    desired_latest = end_ms - 60_000
+    if existing_latest >= desired_latest:
+        # Already current; just trim to window
+        if not agg_df.empty:
+            agg_df = agg_df[
+                (agg_df["open_time_ms"] >= target_start_ms) & (agg_df["open_time_ms"] < end_ms)
+            ]
+            agg_df.to_parquet(OUT_PATH, index=False)
+        return
+
+    missing_start_ms = max(existing_latest + 60_000, target_start_ms)
+    if missing_start_ms >= end_ms:
+        return
+
+    frames: List[pl.DataFrame] = []
+    for csv_file in sorted(RAW_TRADES_DIR.glob("*.csv")):
+        frames.append(_process_csv(csv_file))
+
+    if not frames:
+        logging.warning("No trade CSVs found in %s", RAW_TRADES_DIR)
+        return
+
+    combined = (
+        pl.concat(frames)
+        .group_by("open_time_ms")
+        .agg(
+            agg_qty=pl.col("agg_qty").sum(),
+            agg_buy_qty=pl.col("agg_buy_qty").sum(),
+            agg_sell_qty=pl.col("agg_sell_qty").sum(),
+            agg_delta=pl.col("agg_delta").sum(),
+            agg_trades=pl.col("agg_trades").sum(),
+        )
+        .sort("open_time_ms")
+    )
+
+    pdf = combined.to_pandas()
+    pdf = pdf[(pdf["open_time_ms"] >= target_start_ms) & (pdf["open_time_ms"] < end_ms)]
+
+    OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    pdf.to_parquet(OUT_PATH, index=False)
+    logging.info("Top-up aggregated trades -> %s (rows=%d)", OUT_PATH, len(pdf))

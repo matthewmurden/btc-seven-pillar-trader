@@ -57,6 +57,7 @@ warnings.filterwarnings("ignore", category=InconsistentVersionWarning)
 _MODEL_CACHE: Optional[Dict[str, object]] = None
 _LABELS_CACHE: Optional[pd.DataFrame] = None
 
+
 def _log_mem(df: pd.DataFrame, msg: str) -> None:
     mb = df.memory_usage(deep=True).sum() / (1024**2)
     logging.info("%s | shape=%s | approx_mem=%.1f MB", msg, df.shape, mb)
@@ -70,7 +71,10 @@ def _load_feature_cols(template_path: Path, exclude: List[str]) -> List[str]:
 
 
 def _align_features(
-    df: pd.DataFrame, feature_cols: List[str], dtype: np.dtype, expected_count: int | None = None
+    df: pd.DataFrame,
+    feature_cols: List[str],
+    dtype: np.dtype,
+    expected_count: int | None = None,
 ) -> np.ndarray:
     """
     Align to exactly the columns expected by the model (order matters).
@@ -101,12 +105,14 @@ def _align_features(
     aligned = aligned.astype(dtype, copy=False)
     return aligned.to_numpy(copy=False)
 
+
 def _load_models_cached(cfg: MultiHorizonTrainingConfig, specs):
     global _MODEL_CACHE
     if _MODEL_CACHE is not None:
         return _MODEL_CACHE
     _MODEL_CACHE = load_models(cfg, specs)
     return _MODEL_CACHE
+
 
 def _load_labels_cached(label_cols: List[str]) -> Optional[pd.DataFrame]:
     global _LABELS_CACHE
@@ -222,6 +228,18 @@ def _slim_output(df: pd.DataFrame, specs) -> pd.DataFrame:
     return slim
 
 
+def _load_existing_ml() -> Optional[pd.DataFrame]:
+    """
+    Load existing slim ML output if present.
+    """
+    if not OUTPUT_PATH.exists():
+        return None
+    df = pd.read_parquet(OUTPUT_PATH)
+    if df.empty or "open_time_ms" not in df.columns:
+        return None
+    return df.sort_values("open_time_ms").reset_index(drop=True)
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
@@ -237,12 +255,52 @@ def main() -> None:
     labels_df = _load_labels_cached(label_cols)
 
     logging.info("Loading live features_with_engines from %s", FEATURES_PATH)
-    df = pd.read_parquet(FEATURES_PATH)
-    if "open_time_ms" in df.columns:
-        df = df.sort_values("open_time_ms").reset_index(drop=True)
-    _log_mem(df, "[MH] Loaded live features_with_engines")
+    base_df = pd.read_parquet(FEATURES_PATH)
+    if "open_time_ms" in base_df.columns:
+        base_df = base_df.sort_values("open_time_ms").reset_index(drop=True)
+    _log_mem(base_df, "[MH] Loaded live features_with_engines")
+
+    # Current live window of timestamps
+    if "open_time_ms" not in base_df.columns:
+        raise RuntimeError("features_pillar1_with_engines.parquet missing 'open_time_ms' column")
+    current_times = base_df["open_time_ms"].to_numpy()
+
+    # Load existing slim ML output (if any)
+    existing_slim = _load_existing_ml()
+    if existing_slim is not None and not existing_slim.empty:
+        last_scored_ms = int(existing_slim["open_time_ms"].max())
+    else:
+        last_scored_ms = -1
+
+    # Determine which rows need (re)scoring: strictly newer than last_scored_ms
+    new_mask = base_df["open_time_ms"] > last_scored_ms
+    new_df = base_df.loc[new_mask].copy()
+
+    if new_df.empty and existing_slim is not None:
+        # No new rows to score; just align existing ML to the current feature window and rewrite
+        logging.info(
+            "[MH] No new rows to score; aligning existing ML output to current feature window."
+        )
+        aligned_existing = existing_slim[existing_slim["open_time_ms"].isin(current_times)].copy()
+        aligned_existing = aligned_existing.sort_values("open_time_ms").reset_index(drop=True)
+        _log_mem(aligned_existing, "[MH] Reused existing ML output (no new rows)")
+        OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        aligned_existing.to_parquet(OUTPUT_PATH, index=False, compression="zstd")
+        logging.info(
+            "Saved live Pillar 1 ML predictions (reused only) -> %s",
+            OUTPUT_PATH,
+        )
+        return
+
+    if new_df.empty:
+        # No existing slim, but somehow nothing to score (should only happen if file just created); fall back to scoring all
+        logging.info("[MH] No existing ML output; scoring entire current feature window.")
+        new_df = base_df.copy()
+
+    _log_mem(new_df, "[MH] Rows to score (new window subset)")
 
     logging.info("Scoring multi-horizon models (pre-trained)")
+
     # If all models share the same feature_names_in_, align once and reuse
     shared_feature_names = None
     shared_expected_count = None
@@ -260,45 +318,73 @@ def main() -> None:
     aligned_cache = None
     if shared_feature_names is not None:
         aligned_cache = _align_features(
-            df, shared_feature_names, cfg.feature_dtype, expected_count=shared_expected_count
+            new_df,
+            shared_feature_names,
+            cfg.feature_dtype,
+            expected_count=shared_expected_count,
         )
 
+    # Run each spec on the new_df subset
     for spec in specs:
         model = models[spec.name]
         model_feature_cols = shared_feature_names
         expected_count = shared_expected_count
+
         if model_feature_cols is None:
             model_feature_cols = getattr(model, "feature_names_in_", None)
             if model_feature_cols is not None:
                 model_feature_cols = list(model_feature_cols)
                 expected_count = getattr(model, "n_features_in_", None)
             else:
+                # Fall back to template-based feature list
                 model_feature_cols = feature_cols
                 expected_count = getattr(model, "n_features_in_", None)
 
         if aligned_cache is not None and shared_feature_names is not None:
             X = aligned_cache
         else:
-            X = _align_features(df, model_feature_cols, cfg.feature_dtype, expected_count=expected_count)
+            X = _align_features(
+                new_df,
+                model_feature_cols,
+                cfg.feature_dtype,
+                expected_count=expected_count,
+            )
 
         prob_dict = _extract_probs(model, X, spec)
         for k, v in prob_dict.items():
-            df[k] = v
+            new_df[k] = v
 
-    # Merge labels (if available) for downstream compatibility
-    if labels_df is not None and "open_time_ms" in df.columns:
-        df = df.merge(
+    # Merge labels (if available) for downstream compatibility (only for new rows)
+    if labels_df is not None and "open_time_ms" in new_df.columns:
+        new_df = new_df.merge(
             labels_df[["open_time_ms"] + label_cols],
             on="open_time_ms",
             how="left",
             suffixes=("", "_lbl"),
         )
-        logging.info("[MH] Merged labels into live ML output")
+        logging.info("[MH] Merged labels into live ML output (new rows only)")
 
-    df_slim = _slim_output(df, specs)
+    # Slim just the new rows to the downstream schema
+    new_slim = _slim_output(new_df, specs)
+
+    # Combine with existing slim ML, drop duplicates on open_time_ms, and align to current window
+    if existing_slim is not None:
+        combined = pd.concat([existing_slim, new_slim], ignore_index=True)
+    else:
+        combined = new_slim
+
+    combined = combined.sort_values("open_time_ms").drop_duplicates(
+        subset="open_time_ms", keep="last"
+    )
+
+    # Keep only rows that are in the current feature window (so shapes line up downstream)
+    combined = combined[combined["open_time_ms"].isin(current_times)].copy()
+    combined = combined.sort_values("open_time_ms").reset_index(drop=True)
+
+    _log_mem(combined, "[MH] Final df with ML predictions (live)")
 
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    df_slim.to_parquet(OUTPUT_PATH, index=False, compression="zstd")
+    combined.to_parquet(OUTPUT_PATH, index=False, compression="zstd")
     logging.info("Saved live Pillar 1 ML predictions -> %s", OUTPUT_PATH)
 
 

@@ -3,7 +3,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -48,13 +48,28 @@ MAX_GENERIC_RETRIES_PER_WINDOW = 6
 
 EPS = 1e-12  # safety epsilon
 
+# Microstructure columns that we persist to MICRO_OUT
+MICRO_FEATURE_COLS = [
+    "open_time_ms",
+    "wick_body_ratio",
+    "micro_volatility",
+    "micro_return",
+    "entropy",
+    "order_imbalance",
+    "micro_delta",
+    "delta_persistence",
+    "micro_clustering",
+    "alternation_index",
+    "no_trend_stat",
+]
+
 
 # ============================================================
 # LOGGING
 # ============================================================
-def setup_logging():
+def setup_logging() -> None:
     logging.basicConfig(
-        level=logging.INFO,   # no debug spam
+        level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
@@ -252,7 +267,7 @@ def stream_trades_range(start_ms: int, end_ms: int) -> Iterable[pd.DataFrame]:
                         cursor = window_end
                     continue
 
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 n_generic_err += 1
                 logging.warning(
                     "Error fetching/processing aggTrades in window %d (attempt %d): %s. "
@@ -409,7 +424,7 @@ def build_empty_micro_frame(start_ms: int, end_ms: int) -> pd.DataFrame:
 # ============================================================
 # SAVE TRADES (APPEND TO ONE CSV)
 # ============================================================
-def append_trades_csv(df_all: pd.DataFrame, header: bool):
+def append_trades_csv(df_all: pd.DataFrame, header: bool) -> None:
     """
     Append the raw trades to a single CSV under raw/trades.
     """
@@ -443,7 +458,7 @@ def append_trades_csv(df_all: pd.DataFrame, header: bool):
 # ============================================================
 # MICROSTRUCTURE FOR A SINGLE [start_ms, end_ms) BUCKET
 # ============================================================
-def compute_micro_for_range(start_ms: int, end_ms: int) -> (pd.DataFrame, pd.DataFrame):
+def compute_micro_for_range(start_ms: int, end_ms: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Fetch trades in [start_ms, end_ms), compute per-trade delta and
     per-minute microstructure, and return:
@@ -504,10 +519,10 @@ def load_candles() -> pd.DataFrame:
         raise FileNotFoundError(f"Candles file missing: {CANDLES_PATH}")
 
     candles = pd.read_csv(CANDLES_PATH)
+    candles["open_time"] = pd.to_datetime(candles["open_time"], utc=True)
     candles["open_time_ms"] = (
-        pd.to_datetime(candles["open_time"], utc=True)
-        .astype("int64") // 1_000_000
-    )
+        candles["open_time"].astype("int64") // 1_000_000
+    ).astype("int64")
     candles = candles.drop_duplicates("open_time_ms").sort_values("open_time_ms")
     return candles
 
@@ -520,7 +535,7 @@ def _merge_with_candles(candles: pd.DataFrame, micro: pd.DataFrame) -> pd.DataFr
     merged = candles.merge(
         micro,
         on="open_time_ms",
-        how="left"
+        how="left",
     ).fillna(0)
 
     body = (merged.close - merged.open).abs()
@@ -532,33 +547,40 @@ def _merge_with_candles(candles: pd.DataFrame, micro: pd.DataFrame) -> pd.DataFr
     merged["order_imbalance"] = (
         merged.taker_buy_base - (merged.volume - merged.taker_buy_base)
     ) / merged.volume.replace(0, np.nan).fillna(1)
-    merged["no_trend_stat"] = ((merged.high - merged.low) /
-                               merged.close.replace(0, np.nan).fillna(1) < 0.0003).astype(int)
+    merged["no_trend_stat"] = (
+        (merged.high - merged.low) /
+        merged.close.replace(0, np.nan).fillna(1) < 0.0003
+    ).astype(int)
 
     merged.fillna(0.0, inplace=True)
     return merged
 
 
-def save_outputs(micro_full: pd.DataFrame, candles: pd.DataFrame):
+def save_outputs(micro_full: pd.DataFrame, candles: pd.DataFrame) -> None:
+    """
+    Merge the raw microstructure stats with candles, derive higher-level
+    micro features, and persist delta.parquet and microstructure.parquet.
+
+    This is the **canonical** writer: MICRO_OUT will always contain only
+    MICRO_FEATURE_COLS, no datetime/string columns, so that
+    build_canonical_raw.load_microstructure can safely float32-cast
+    its numeric columns.
+    """
     RAW_DIR.mkdir(parents=True, exist_ok=True)
 
     merged = _merge_with_candles(candles, micro_full)
 
-    delta_only = merged[["open_time_ms", "micro_delta"]].rename(columns={"micro_delta": "delta"})
-    micro_cols = [
-        "open_time_ms",
-        "wick_body_ratio",
-        "micro_volatility",
-        "micro_return",
-        "entropy",
-        "order_imbalance",
-        "micro_delta",
-        "delta_persistence",
-        "micro_clustering",
-        "alternation_index",
-        "no_trend_stat",
-    ]
-    micro_only = merged[micro_cols]
+    # Normalise any datetime columns to int ms to avoid downstream float32 cast errors
+    for col in ["open_time", "close_time"]:
+        if col in merged.columns:
+            merged[col] = pd.to_datetime(merged[col], utc=True, errors="coerce")
+            merged[col] = (merged[col].astype("int64") // 1_000_000).astype("int64")
+
+    delta_only = merged[["open_time_ms", "micro_delta"]].rename(
+        columns={"micro_delta": "delta"}
+    )
+
+    micro_only = merged[MICRO_FEATURE_COLS].copy()
 
     delta_only.to_parquet(DELTA_OUT, index=False)
     micro_only.to_parquet(MICRO_OUT, index=False)
@@ -568,15 +590,17 @@ def save_outputs(micro_full: pd.DataFrame, candles: pd.DataFrame):
 
 
 # ============================================================
-# MAIN
+# MAIN (FULL WINDOW)
 # ============================================================
-def main():
+def main() -> None:
     setup_logging()
     logging.info("=== DELTA + MICROSTRUCTURE GENERATOR (BUCKETED) START ===")
 
     # ---- 1) Fixed target window based on LOOKBACK_DAYS ----
     if FORCE_END_MS is not None:
-        wall_finish = datetime.fromtimestamp(FORCE_END_MS / 1000, tz=timezone.utc).replace(second=0, microsecond=0)
+        wall_finish = datetime.fromtimestamp(
+            FORCE_END_MS / 1000, tz=timezone.utc
+        ).replace(second=0, microsecond=0)
     else:
         wall_finish = datetime.now(timezone.utc).replace(second=0, microsecond=0)
 
@@ -651,10 +675,159 @@ def main():
 
         logging.info("=== DELTA + MICROSTRUCTURE GENERATOR (BUCKETED) FINISHED ===")
 
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logging.exception("Delta + microstructure pipeline failure: %s", exc)
         sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
+
+
+# ============================================================
+# INCREMENTAL TOP-UP
+# ============================================================
+def topup_to(end_ms: int, lookback_minutes: int) -> None:
+    """
+    Incrementally fetch only missing trades/microstructure up to end_ms (exclusive)
+    and keep a rolling window of size lookback_minutes on disk.
+
+    Key invariants:
+      - MICRO_OUT always contains only MICRO_FEATURE_COLS (no datetime strings).
+      - DELTA_OUT always contains [open_time_ms, delta].
+      - We never refetch historical minutes we already have; we start from the
+        last known open_time_ms + 60_000.
+    """
+    global LOOKBACK_DAYS, FORCE_END_MS  # single global declaration, at top of function
+
+    setup_logging()
+
+    window_ms = lookback_minutes * 60_000
+    target_start_ms = end_ms - window_ms
+
+    # ---- Load candles over the target window ----
+    try:
+        candles = load_candles()
+    except FileNotFoundError:
+        # Bootstrap full window via main()
+        LOOKBACK_DAYS = lookback_minutes / 1440.0
+        FORCE_END_MS = end_ms
+        logging.info("Candles missing; bootstrapping full window via main()")
+        main()
+        return
+
+    candles = candles[
+        (candles["open_time_ms"] >= target_start_ms)
+        & (candles["open_time_ms"] < end_ms)
+    ].copy()
+
+    # ---- Load existing micro + delta (if any) ----
+    if MICRO_OUT.exists():
+        existing_micro = pd.read_parquet(MICRO_OUT)
+    else:
+        existing_micro = pd.DataFrame(columns=MICRO_FEATURE_COLS)
+
+    # ensure correct column order/types
+    if not existing_micro.empty:
+        # keep only expected columns if file ever drifted
+        existing_micro = existing_micro[
+            [c for c in MICRO_FEATURE_COLS if c in existing_micro.columns]
+        ]
+    else:
+        existing_micro = pd.DataFrame(columns=MICRO_FEATURE_COLS)
+
+    if existing_micro.empty or "open_time_ms" not in existing_micro.columns:
+        existing_latest = target_start_ms - 60_000
+    else:
+        existing_latest = int(existing_micro["open_time_ms"].max())
+
+    desired_latest = end_ms - 60_000
+
+    logging.info(
+        "Incremental delta+micro topup: existing_latest=%s, desired_latest=%s",
+        existing_latest,
+        desired_latest,
+    )
+
+    # Already current: just trim to rolling window and rebuild delta
+    if existing_latest >= desired_latest:
+        logging.info("Microstructure already up to date; trimming to rolling window.")
+        trimmed = existing_micro[
+            (existing_micro["open_time_ms"] >= target_start_ms)
+            & (existing_micro["open_time_ms"] < end_ms)
+        ].copy()
+        trimmed = trimmed.sort_values("open_time_ms")
+        trimmed.to_parquet(MICRO_OUT, index=False)
+
+        delta_only = trimmed[["open_time_ms", "micro_delta"]].rename(
+            columns={"micro_delta": "delta"}
+        )
+        delta_only.to_parquet(DELTA_OUT, index=False)
+        return
+
+    # Need new minutes
+    missing_start_ms = max(existing_latest + 60_000, target_start_ms)
+    if missing_start_ms >= end_ms:
+        logging.info("No positive missing range after adjustment; nothing to do.")
+        return
+
+    logging.info(
+        "Fetching missing microstructure for [%s, %s)",
+        datetime.fromtimestamp(missing_start_ms / 1000, tz=timezone.utc),
+        datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc),
+    )
+
+    try:
+        micro_new_full, _ = compute_micro_for_range(missing_start_ms, end_ms)
+    except Exception as exc:  # noqa: BLE001
+        # On failure, bootstrap full window
+        logging.exception(
+            "Incremental micro fetch failed, falling back to full bootstrap: %s",
+            exc,
+        )
+        LOOKBACK_DAYS = lookback_minutes / 1440.0
+        FORCE_END_MS = end_ms
+        main()
+        return
+
+    # Merge new micro with candles slice to derive feature block for new minutes
+    candles_slice = candles[
+        (candles["open_time_ms"] >= missing_start_ms)
+        & (candles["open_time_ms"] < end_ms)
+    ].copy()
+
+    merged_new = _merge_with_candles(candles_slice, micro_new_full)
+    micro_new_only = merged_new[MICRO_FEATURE_COLS].copy()
+
+    # Combine existing + new microfeature rows
+    combined = pd.concat([existing_micro, micro_new_only], ignore_index=True)
+
+    combined = (
+        combined
+        .drop_duplicates(subset=["open_time_ms"], keep="last")
+        .sort_values("open_time_ms")
+    )
+
+    # Trim to rolling window
+    combined = combined[
+        (combined["open_time_ms"] >= target_start_ms)
+        & (combined["open_time_ms"] < end_ms)
+    ].copy()
+
+    combined.to_parquet(MICRO_OUT, index=False)
+    logging.info(
+        "Incremental microstructure written → %s (rows=%s)",
+        MICRO_OUT,
+        len(combined),
+    )
+
+    # Rebuild delta.parquet from combined micro features
+    delta_only = combined[["open_time_ms", "micro_delta"]].rename(
+        columns={"micro_delta": "delta"}
+    )
+    delta_only.to_parquet(DELTA_OUT, index=False)
+    logging.info(
+        "Incremental delta written → %s (rows=%s)",
+        DELTA_OUT,
+        len(delta_only),
+    )

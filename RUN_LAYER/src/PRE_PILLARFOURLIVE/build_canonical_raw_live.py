@@ -3,12 +3,14 @@ from __future__ import annotations
 """
 Live helper to rebuild the Pre-PillarFour Phase 0 canonical raw parquet
 using the existing build_canonical_raw script from PRE_PILLARFOUR, but
-with inputs under RUN_LAYER/data/raw and output to RUN_LAYER/data/processed/PRE_PILLARFOUR.
+with inputs under RUN_LAYER/data/raw and output to
+RUN_LAYER/data/processed/PRE_PILLARFOUR.
 """
 
 import logging
 import sys
 from pathlib import Path
+
 import pandas as pd
 
 # Paths
@@ -35,6 +37,9 @@ from build_canonical_raw import (  # type: ignore
 def _load_bulk_trades_live(path_or_dir: Path) -> pd.DataFrame:
     """
     Prefer a pre-aggregated trades parquet if present; else fall back to raw loader.
+
+    This keeps the live path fast by using RUN_LAYER/data/raw/trades/aggregated_trades.parquet
+    if available, but preserves compatibility with the original PRE_PILLARFOUR loader.
     """
     if path_or_dir.is_file() and path_or_dir.suffix == ".parquet":
         df = pd.read_parquet(path_or_dir)
@@ -42,7 +47,11 @@ def _load_bulk_trades_live(path_or_dir: Path) -> pd.DataFrame:
         missing = [c for c in needed if c not in df.columns]
         if not missing:
             return df[needed].copy()
-        logging.warning("Aggregated trades file %s missing cols %s; falling back to raw loader.", path_or_dir, missing)
+        logging.warning(
+            "Aggregated trades file %s missing cols %s; falling back to raw loader.",
+            path_or_dir,
+            missing,
+        )
 
     if path_or_dir.is_dir():
         agg_file = path_or_dir / "aggregated_trades.parquet"
@@ -53,7 +62,10 @@ def _load_bulk_trades_live(path_or_dir: Path) -> pd.DataFrame:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+    )
 
     # Override the RAW/HTF paths to point to RUN_LAYER/data/raw
     candles_file = RUN_RAW / "BTC_CANDLES.csv"
@@ -69,19 +81,33 @@ def main() -> None:
     }
 
     # Load inputs using the existing loaders
+    logging.info("Loading live candles from %s", candles_file)
     candles = load_candles(candles_file)
+
+    logging.info("Loading live delta from %s", delta_file)
     delta = load_delta(delta_file)
+
+    logging.info("Loading live microstructure from %s", micro_file)
     micro = load_microstructure(micro_file)
+
+    logging.info("Loading live bulk trades from %s", bulk_dir)
     bulk = _load_bulk_trades_live(bulk_dir)
+
+    logging.info("Loading live HTF candles from %s", htf_files)
     htf_map = load_htf(htf_files)
 
+    # Merge all into canonical raw
     canonical = merge_all(candles, delta, micro, bulk, htf_map)
 
     # Save to RUN_LAYER/data/processed/PRE_PILLARFOUR
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     out_path = OUT_DIR / "canonical_raw_with_utilities.parquet"
     canonical.to_parquet(out_path, index=False)
-    logging.info("Saved Phase 0 canonical (live) -> %s (shape=%s)", out_path, canonical.shape)
+    logging.info(
+        "Saved Phase 0 canonical (live) -> %s (shape=%s)",
+        out_path,
+        canonical.shape,
+    )
 
 
 if __name__ == "__main__":

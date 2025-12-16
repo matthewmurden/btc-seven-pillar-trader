@@ -4,27 +4,41 @@ from __future__ import annotations
 Live orchestrator to run the full multi-pillar pipeline on a rolling window.
 
 Key settings:
-  LOOKBACK_MINUTES: number of latest 1m bars to keep (default: 1 day = 1440)
+  LOOKBACK_MINUTES: number of latest 1m bars to keep (e.g. 1440 for 1 day)
   MAX_RETRIES: how many times to retry a failing stage before aborting
 
-Workflow per loop:
-  1) Preload data (delta/micro, trades, candles, rollups)
-  2) Pre-Pillar4 live: canonical_raw_live -> with_engines_live -> global_scaling_live
-  3) Trim normalised features to LOOKBACK_MINUTES
-  4) Pillar 1 live stack (feature matrix -> mini engines -> labels -> ML -> meta -> agg -> calibration -> decision)
-  5) Pillar 2 live stack (raw -> labels -> mini engines -> ML -> fusion -> final targets)
-  6) Pillar 3 live sizing
-  7) Pillar 5 execution plans
-  8) Pillar 6 safety filter
-  9) Log latest rows from Pillar 5 + Pillar 6 into a combined parquet
+High-level behaviour:
 
-The loop runs indefinitely, waiting for the next minute before repeating.
+- First loop ("bootstrap"):
+    • Fetch a full LOOKBACK_MINUTES window of raw data (trades, candles, rollups).
+    • Run Pre-Pillar4 live (canonical_raw -> engines -> global scaling) on the full
+      window, producing normalised_features.parquet with LOOKBACK_MINUTES rows.
+
+- Subsequent loops:
+    • Determine the latest *closed* minute (now - 1m).
+    • Try to "top up" the raw layer to that time:
+        - If your fetcher modules expose `topup_to(end_ms, lookback_minutes)`,
+          use those to fetch only missing minutes and maintain a rolling window.
+        - Otherwise, fall back to the original full-window fetch mode.
+    • Rebuild canonical_raw + engines + global scaling on the full local window.
+      (This is cheap compared to network IO and avoids 1-row normalisation issues.)
+    • Trim normalised_features.parquet to LOOKBACK_MINUTES rows.
+
+- For each loop, after Pre-Pillar4 is up to date:
+    • Run Pillar 4 live (regime detection).
+    • Run Pillar 1 live (entry model).
+    • Run Pillar 2 live (exit model).
+    • Run Pillar 3 + Pillar 5 live on the latest row only (sizing + execution).
+    • Trim key downstream parquet files to LOOKBACK_MINUTES rows.
+    • Append the latest Pillar 5 row to a rolling log parquet.
+
+The loop runs indefinitely, aligned to minute boundaries.
 """
 
 import logging
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Callable, Any, List
 
@@ -33,16 +47,21 @@ import pandas as pd
 # ---------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------
-LOOKBACK_MINUTES = 5  # easy to change (1 day default)
+# Change to 1440 for 1-day lookback in production
+LOOKBACK_MINUTES = 5
+
 MAX_RETRIES = 3
-SLEEP_SECONDS_BETWEEN_LOOPS = 5
+MAX_PRE_P4_TOPUPS = 5  # safety cap when trying to catch up to latest closed minute
 
 # Paths
 THIS_DIR = Path(__file__).resolve().parent
 BASE_DIR = THIS_DIR.parents[1]  # TRADINGBOTPROJECT root
+
 RUN_PROCESSED = BASE_DIR / "RUN_LAYER" / "data" / "processed"
 RUN_RAW = BASE_DIR / "RUN_LAYER" / "data" / "raw"
-P4_OUT = RUN_PROCESSED / "PILLAR_FOUR_REGIME_DETECTION"
+
+PRE_P4_DIR = RUN_PROCESSED / "PRE_PILLARFOUR"
+NORM_PATH = PRE_P4_DIR / "normalised_features.parquet"
 
 LOG_PATH = RUN_PROCESSED / "live_combined_log.parquet"
 
@@ -57,7 +76,6 @@ SRC_DIRS: List[Path] = [
     THIS_DIR / "PILLAR_TWO_EXIT_MODEL_LIVE",
     THIS_DIR / "PILLAR_THREE_RISK_MODEL_LIVE",
     THIS_DIR / "PILLAR_FIVE_EXECUTION_ENGINE_LIVE",
-    THIS_DIR / "PILLAR_SIX_SAFETY_LAYER_LIVE",
 ]
 
 for p in SRC_DIRS:
@@ -65,17 +83,20 @@ for p in SRC_DIRS:
     if ps not in sys.path:
         sys.path.append(ps)
 
-# Pillar wrappers
+# Raw / rollups
 import delta_and_micro
 import fetch_candles
 import rollups
 import trade_aggregator
 
+# Pre-Pillar 4 live
 from PRE_PILLARFOURLIVE import (
     build_canonical_raw_live,
     build_canonical_with_engines_live,
     global_scaling_engine_live,
 )
+
+# Pillar 4 live
 from PILLAR_FOUR_REGIME_DETECTION_LIVE import (
     build_raw_regime_features_live,
     deterministic_regime_engines_live,
@@ -84,6 +105,8 @@ from PILLAR_FOUR_REGIME_DETECTION_LIVE import (
     pillar4_part5_stability_layer_live,
     pillar_integration_live,
 )
+
+# Pillar 1 live
 from PILLAR_ONE_ENTRY_MODEL_LIVE import (
     build_pillar1_feature_matrix_live,
     build_pillar1_mini_engines_live,
@@ -94,6 +117,8 @@ from PILLAR_ONE_ENTRY_MODEL_LIVE import (
     build_pillar1_calibration_live,
     build_pillar1_decision_layer_live,
 )
+
+# Pillar 2 live
 from PILLAR_TWO_EXIT_MODEL_LIVE import (
     build_exit_raw_features_live,
     build_exit_labels_live,
@@ -102,7 +127,11 @@ from PILLAR_TWO_EXIT_MODEL_LIVE import (
     build_exit_fusion_live,
     build_exit_final_targets_live,
 )
+
+# Pillar 3 live
 from PILLAR_THREE_RISK_MODEL_LIVE import build_position_sizing_live
+
+# Pillar 5 live
 from PILLAR_FIVE_EXECUTION_ENGINE_LIVE import build_execution_plans_live
 
 
@@ -115,7 +144,10 @@ def _run_with_retries(func: Callable[[], Any], name: str) -> None:
             func()
             return
         except Exception as exc:  # noqa: BLE001
-            logging.exception("Stage %s failed (attempt %d/%d): %s", name, attempt, MAX_RETRIES, exc)
+            logging.exception(
+                "Stage %s failed (attempt %d/%d): %s",
+                name, attempt, MAX_RETRIES, exc,
+            )
             if attempt == MAX_RETRIES:
                 raise
             time.sleep(2)
@@ -125,20 +157,21 @@ def _trim_parquet(path: Path, time_col: str, max_rows: int) -> None:
     if not path.exists():
         return
     df = pd.read_parquet(path)
-    if len(df) > max_rows:
-        if time_col in df.columns:
-            df = df.sort_values(time_col).iloc[-max_rows:]
-        else:
-            df = df.iloc[-max_rows:]
-        path.parent.mkdir(parents=True, exist_ok=True)
-        df.to_parquet(path, index=False)
-        logging.info("Trimmed %s to last %d rows", path.name, max_rows)
+    if len(df) <= max_rows:
+        return
+    if time_col in df.columns:
+        df = df.sort_values(time_col).iloc[-max_rows:]
+    else:
+        df = df.iloc[-max_rows:]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(path, index=False)
+    logging.info("Trimmed %s to last %d rows", path.name, max_rows)
 
 
 def _keep_latest_only(path: Path, time_col: str) -> None:
     """
     Replace the parquet at `path` with only its latest row (by time_col if present).
-    Intended for post-Pre-P4 so downstream pillars only process the freshest bar.
+    Used where we intentionally want single-row outputs (e.g. P3/P5 inputs).
     """
     if not path.exists():
         return
@@ -153,37 +186,41 @@ def _keep_latest_only(path: Path, time_col: str) -> None:
     logging.info("Reduced %s to latest row only", path.name)
 
 
-def _log_latest(p5_path: Path, p6_path: Path) -> None:
-    if not p5_path.exists() or not p6_path.exists():
-        logging.warning("Cannot log latest outputs; missing pillar5 or pillar6 parquet.")
+def _log_latest_p5(p5_path: Path) -> None:
+    """
+    Log the latest row from Pillar 5 execution_plans into a rolling log parquet.
+    """
+    if not p5_path.exists():
+        logging.warning("Cannot log latest outputs; missing Pillar5 parquet.")
         return
-    p5 = pd.read_parquet(p5_path).sort_values("open_time_ms") if p5_path.exists() else pd.DataFrame()
-    p6 = pd.read_parquet(p6_path).sort_values("open_time_ms") if p6_path.exists() else pd.DataFrame()
-    if p5.empty or p6.empty:
-        logging.warning("Pillar5 or Pillar6 outputs empty; skipping log append.")
+
+    p5 = pd.read_parquet(p5_path)
+    if p5.empty:
+        logging.warning("Pillar5 outputs empty; skipping log append.")
         return
+
+    p5 = p5.sort_values("open_time_ms")
     latest_p5 = p5.iloc[[-1]]
-    latest_p6 = p6.iloc[[-1]]
-    if "open_time_ms" in latest_p5.columns and "open_time_ms" in latest_p6.columns:
-        combined = latest_p5.merge(latest_p6, on="open_time_ms", suffixes=("_p5", "_p6"))
-    else:
-        combined = pd.concat([latest_p5.add_suffix("_p5"), latest_p6.add_suffix("_p6")], axis=1)
+
     if LOG_PATH.exists():
         existing = pd.read_parquet(LOG_PATH)
-        combined = pd.concat([existing, combined], ignore_index=True)
-    combined = combined.iloc[-LOOKBACK_MINUTES:]
+        combined = pd.concat([existing, latest_p5], ignore_index=True)
+    else:
+        combined = latest_p5
+
+    combined = combined.sort_values("open_time_ms").iloc[-LOOKBACK_MINUTES:]
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     combined.to_parquet(LOG_PATH, index=False)
-    logging.info("Appended latest Pillar5/6 row to log (%s)", LOG_PATH)
+    logging.info("Appended latest Pillar5 row to log (%s)", LOG_PATH)
 
 
-def _sleep_until_next_minute(last_ts_ms: int | None) -> None:
-    if last_ts_ms is None:
-        time.sleep(SLEEP_SECONDS_BETWEEN_LOOPS)
-        return
-    last_dt = datetime.fromtimestamp(last_ts_ms / 1000, tz=timezone.utc)
-    next_minute = last_dt.replace(second=0, microsecond=0) + pd.Timedelta(minutes=1)
-    wait = max(1.0, (next_minute - datetime.now(timezone.utc)).total_seconds())
+def _sleep_until_next_minute() -> None:
+    """
+    Sleep until the next whole-minute boundary (UTC).
+    """
+    now = datetime.now(timezone.utc)
+    next_minute = (now.replace(second=0, microsecond=0) + timedelta(minutes=1))
+    wait = max(0.0, (next_minute - now).total_seconds())
     time.sleep(wait)
 
 
@@ -197,14 +234,32 @@ def _current_closed_minute_ms() -> int:
     return int(closed.timestamp() * 1000)
 
 
+def _load_norm_features() -> pd.DataFrame | None:
+    if not NORM_PATH.exists():
+        return None
+    df = pd.read_parquet(NORM_PATH)
+    if df.empty or "open_time_ms" not in df.columns:
+        return None
+    return df.sort_values("open_time_ms")
+
+
 # ---------------------------------------------------------------------
-# Pipeline runners
+# Preload / raw fetchers
 # ---------------------------------------------------------------------
-def run_preload() -> None:
-    # Adjust lookback settings for fetchers (full lookback, ending on latest CLOSED bar)
-    end_ms = _current_closed_minute_ms() + 60_000  # end is next minute boundary (exclusive)
-    delta_and_micro.LOOKBACK_DAYS = LOOKBACK_MINUTES / 1440.0
-    fetch_candles.LOOKBACK_DAYS = LOOKBACK_MINUTES / 1440.0
+def run_preload_full_window(end_ms: int, lookback_minutes: int) -> None:
+    """
+    Run delta_and_micro + trade_aggregator + fetch_candles + rollups for a full
+    `lookback_minutes` window ending at `end_ms` (exclusive).
+
+    This is the "bootstrap" behaviour and also the fallback when no incremental
+    top-up functions are available.
+    """
+    lookback_days = lookback_minutes / 1440.0
+
+    # If your scripts honour FORCE_END_MS, this will force the right end boundary;
+    # otherwise they will just use LOOKBACK_DAYS relative to "now".
+    delta_and_micro.LOOKBACK_DAYS = lookback_days
+    fetch_candles.LOOKBACK_DAYS = lookback_days
     delta_and_micro.FORCE_END_MS = end_ms
     fetch_candles.FORCE_END_MS = end_ms
 
@@ -214,150 +269,317 @@ def run_preload() -> None:
     _run_with_retries(rollups.main, "rollups")
 
 
-def run_pre_p4() -> None:
+def run_preload_incremental(end_ms: int, lookback_minutes: int) -> None:
+    """
+    Incremental preload:
+
+    - If the underlying modules expose `topup_to(end_ms, lookback_minutes)`,
+      use those to fetch ONLY the missing minutes and maintain a rolling window.
+    - Otherwise, fall back to `run_preload_full_window`, which rebuilds the entire
+      raw window.
+
+    This is where you plug in your "smart incremental" behaviour without having
+    to change the rest of live_runner.
+    """
+    used_incremental = False
+
+    # fetch_candles: 1m candles
+    if hasattr(fetch_candles, "topup_to"):
+        logging.info("Using fetch_candles.topup_to for incremental candles.")
+        fetch_candles.topup_to(end_ms=end_ms, lookback_minutes=lookback_minutes)
+        used_incremental = True
+
+    # delta_and_micro: trades + microstructure
+    if hasattr(delta_and_micro, "topup_to"):
+        logging.info("Using delta_and_micro.topup_to for incremental raw trades.")
+        delta_and_micro.topup_to(end_ms=end_ms, lookback_minutes=lookback_minutes)
+        used_incremental = True
+
+    # trade_aggregator: any derived trade-based aggregates
+    if hasattr(trade_aggregator, "topup_to"):
+        logging.info("Using trade_aggregator.topup_to for incremental trade aggregates.")
+        trade_aggregator.topup_to(end_ms=end_ms, lookback_minutes=lookback_minutes)
+        used_incremental = True
+
+    # rollups: HTF candles derived from 1m candles
+    if hasattr(rollups, "topup_to"):
+        logging.info("Using rollups.topup_to for incremental HTF candles.")
+        rollups.topup_to(end_ms=end_ms, lookback_minutes=lookback_minutes)
+        used_incremental = True
+    else:
+        # rollups are cheap and purely local; it's fine to recompute from local 1m candles
+        logging.info("No rollups.topup_to found; recomputing HTF candles from local 1m.")
+        _run_with_retries(rollups.main, "rollups")
+
+    if not used_incremental:
+        logging.info(
+            "No incremental topup_to() implementations found; falling back to full-window preload."
+        )
+        run_preload_full_window(end_ms=end_ms, lookback_minutes=lookback_minutes)
+
+
+# ---------------------------------------------------------------------
+# Pre-Pillar 4
+# ---------------------------------------------------------------------
+def run_pre_p4_full() -> None:
+    """
+    Build canonical raw + engines + global scaling using whatever raw/micro/candles
+    are currently on disk.
+
+    Output: PRE_PILLARFOUR/normalised_features.parquet
+    """
     _run_with_retries(build_canonical_raw_live.main, "build_canonical_raw_live")
-    _run_with_retries(build_canonical_with_engines_live.main, "build_canonical_with_engines_live")
-    _run_with_retries(global_scaling_engine_live.main, "global_scaling_engine_live")
-    norm_path = RUN_PROCESSED / "PRE_PILLARFOUR" / "normalised_features.parquet"
-    # Keep history bounded to the lookback window, but retain all rows (no collapse to latest).
-    _trim_parquet(norm_path, "open_time_ms", LOOKBACK_MINUTES)
+    _run_with_retries(
+        build_canonical_with_engines_live.main,
+        "build_canonical_with_engines_live",
+    )
+    _run_with_retries(
+        global_scaling_engine_live.main,
+        "global_scaling_engine_live",
+    )
+
+    df_norm = _load_norm_features()
+    if df_norm is None:
+        raise RuntimeError(
+            "global_scaling_engine_live completed but normalised_features.parquet "
+            "is missing or invalid."
+        )
+
+    # Keep the normalised window bounded to LOOKBACK_MINUTES
+    if len(df_norm) > LOOKBACK_MINUTES:
+        df_norm = df_norm.iloc[-LOOKBACK_MINUTES:]
+        PRE_P4_DIR.mkdir(parents=True, exist_ok=True)
+        df_norm.to_parquet(NORM_PATH, index=False)
+        logging.info(
+            "Trimmed normalised_features.parquet to last %d rows", LOOKBACK_MINUTES
+        )
 
 
-def run_p4_live() -> None:
-    _run_with_retries(build_raw_regime_features_live.main, "build_raw_regime_features_live")
-    _keep_latest_only(P4_OUT / "raw_regime_features.parquet", "open_time_ms")
-    _run_with_retries(deterministic_regime_engines_live.main, "deterministic_regime_engines_live")
-    _keep_latest_only(P4_OUT / "deterministic_regime_engines.parquet", "open_time_ms")
-    _run_with_retries(pillar4_part3_ml_regime_classifier_live.main, "pillar4_part3_ml_regime_classifier_live")
-    _keep_latest_only(P4_OUT / "regime_ml_predictions.parquet", "open_time_ms")
-    _run_with_retries(pillar4_part4_fusion_layer_live.main, "pillar4_part4_fusion_layer_live")
-    _keep_latest_only(P4_OUT / "regime_labels_fused.parquet", "open_time_ms")
-    _run_with_retries(pillar4_part5_stability_layer_live.main, "pillar4_part5_stability_layer_live")
-    _keep_latest_only(P4_OUT / "regime_labels_stable.parquet", "open_time_ms")
-    _run_with_retries(pillar_integration_live.main, "pillar_integration_live")
-    _keep_latest_only(P4_OUT / "regime_timeline.parquet", "open_time_ms")
-
-
-def run_p1_live() -> None:
-    _run_with_retries(build_pillar1_feature_matrix_live.main, "build_pillar1_feature_matrix_live")
-    _keep_latest_only(RUN_PROCESSED / "PILLAR_ONE_ENTRY_MODEL" / "features_pillar1_primitives.parquet", "open_time_ms")
-    _run_with_retries(build_pillar1_mini_engines_live.main, "build_pillar1_mini_engines_live")
-    _keep_latest_only(RUN_PROCESSED / "PILLAR_ONE_ENTRY_MODEL" / "features_pillar1_with_engines.parquet", "open_time_ms")
-    _run_with_retries(build_pillar1_labels_live.main, "build_pillar1_labels_live")
-    _keep_latest_only(RUN_PROCESSED / "PILLAR_ONE_ENTRY_MODEL" / "labels_pillar1.parquet", "open_time_ms")
-    _run_with_retries(build_pillar1_multi_horizon_ml_live.main, "build_pillar1_multi_horizon_ml_live")
-    _keep_latest_only(RUN_PROCESSED / "PILLAR_ONE_ENTRY_MODEL" / "features_pillar1_with_ml.parquet", "open_time_ms")
-    _run_with_retries(build_pillar1_meta_features_live.main, "build_pillar1_meta_features_live")
-    _keep_latest_only(RUN_PROCESSED / "PILLAR_ONE_ENTRY_MODEL" / "features_pillar1_with_meta.parquet", "open_time_ms")
-    _run_with_retries(build_pillar1_master_aggregator_live.main, "build_pillar1_master_aggregator_live")
-    _keep_latest_only(RUN_PROCESSED / "PILLAR_ONE_ENTRY_MODEL" / "features_pillar1_with_agg.parquet", "open_time_ms")
-    _run_with_retries(build_pillar1_calibration_live.main, "build_pillar1_calibration_live")
-    _keep_latest_only(RUN_PROCESSED / "PILLAR_ONE_ENTRY_MODEL" / "features_pillar1_with_calib.parquet", "open_time_ms")
-    _run_with_retries(build_pillar1_decision_layer_live.main, "build_pillar1_decision_layer_live")
-    _keep_latest_only(RUN_PROCESSED / "PILLAR_ONE_ENTRY_MODEL" / "features_pillar1_final.parquet", "open_time_ms")
-
-
-def run_p2_live() -> None:
-    _run_with_retries(build_exit_raw_features_live.main, "build_exit_raw_features_live")
-    _keep_latest_only(RUN_PROCESSED / "PILLAR_TWO_EXIT_MODEL" / "exit_raw.parquet", "open_time_ms")
-    _run_with_retries(build_exit_labels_live.main, "build_exit_labels_live")
-    _keep_latest_only(RUN_PROCESSED / "PILLAR_TWO_EXIT_MODEL" / "exit_labels.parquet", "open_time_ms")
-    _run_with_retries(build_exit_mini_engines_live.main, "build_exit_mini_engines_live")
-    _keep_latest_only(RUN_PROCESSED / "PILLAR_TWO_EXIT_MODEL" / "exit_with_mini_engines.parquet", "open_time_ms")
-    _run_with_retries(build_exit_ml_models_live.main, "build_exit_ml_models_live")
-    _keep_latest_only(RUN_PROCESSED / "PILLAR_TWO_EXIT_MODEL" / "exit_with_ml.parquet", "open_time_ms")
-    _run_with_retries(build_exit_fusion_live.main, "build_exit_fusion_live")
-    _keep_latest_only(RUN_PROCESSED / "PILLAR_TWO_EXIT_MODEL" / "exit_with_fusion.parquet", "open_time_ms")
-    _run_with_retries(build_exit_final_targets_live.main, "build_exit_final_targets_live")
-    _keep_latest_only(RUN_PROCESSED / "PILLAR_TWO_EXIT_MODEL" / "exit_final_targets.parquet", "open_time_ms")
-
-
-def run_p3_p5_live() -> None:
-    _run_with_retries(build_position_sizing_live.main, "build_position_sizing_live")
-    _keep_latest_only(RUN_PROCESSED / "PILLAR_TWO_EXIT_MODEL" / "exit_with_sizing.parquet", "open_time_ms")
-    _run_with_retries(build_execution_plans_live.main, "build_execution_plans_live")
-    _keep_latest_only(RUN_PROCESSED / "PILLAR_FIVE_EXECUTION_ENGINE" / "execution_plans.parquet", "open_time_ms")
-
-
-def ensure_pre_p4_current() -> None:
+def ensure_pre_p4_current(initial: bool) -> None:
     """
-    Keep rerunning preload + pre-P4 until the latest *closed* minute is present
-    in normalised_features.parquet. Always loads the full lookback window ending
-    at the latest closed minute (never the current open minute).
+    Ensure Pre-Pillar4 is up to date with the latest *closed* minute.
+
+    - initial=True  -> full bootstrap over LOOKBACK_MINUTES.
+    - initial=False -> incremental raw top-up (if available) then full Pre-P4 run.
+
+    We allow a few attempts in case the exchange/API lags slightly and the
+    latest closed minute isn't immediately available downstream.
     """
-    target_ms = _current_closed_minute_ms()  # capture once for this cycle
-    logging.info("Pre-P4 catch-up target (latest closed minute): %s", target_ms)
-    while True:
-        logging.info("Pre-P4 loop start with target_ms=%s", target_ms)
-        run_preload()
-        logging.info("Preload completed")
-        run_pre_p4()
-        logging.info("Pre-Pillar4 completed")
+    target_closed_ms = _current_closed_minute_ms()
+    end_ms = target_closed_ms + 60_000  # end EXCLUSIVE
 
-        norm_path = RUN_PROCESSED / "PRE_PILLARFOUR" / "normalised_features.parquet"
-        if not norm_path.exists():
-            logging.warning("normalised_features.parquet missing at %s", norm_path)
-            time.sleep(2)
-            continue
+    logging.info(
+        "ensure_pre_p4_current: target_closed_ms=%s end_ms=%s lookback=%d minutes",
+        target_closed_ms,
+        end_ms,
+        LOOKBACK_MINUTES,
+    )
 
-        df_norm = pd.read_parquet(norm_path)
-        if df_norm.empty or "open_time_ms" not in df_norm.columns:
+    for attempt in range(1, MAX_PRE_P4_TOPUPS + 1):
+        logging.info(
+            "Pre-P4 ensure loop attempt %d/%d", attempt, MAX_PRE_P4_TOPUPS
+        )
+
+        if initial and attempt == 1:
+            # First loop: do a full bootstrap fetch
+            run_preload_full_window(end_ms=end_ms, lookback_minutes=LOOKBACK_MINUTES)
+        else:
+            # Subsequent loops or retries: incremental top-up if possible
+            run_preload_incremental(end_ms=end_ms, lookback_minutes=LOOKBACK_MINUTES)
+
+        # Build full canonical + engines + normalised window for the current raw state
+        run_pre_p4_full()
+
+        df_norm = _load_norm_features()
+        if df_norm is None:
             logging.warning(
-                "normalised_features.parquet empty or missing open_time_ms; cols=%s len=%d",
-                list(df_norm.columns),
-                len(df_norm),
+                "normalised_features.parquet missing/invalid after Pre-P4; retrying..."
             )
             time.sleep(2)
             continue
 
         latest_ms = int(df_norm["open_time_ms"].max())
-        logging.info("Normalised latest_ms=%s (rows=%d)", latest_ms, len(df_norm))
-        if latest_ms >= target_ms:
-            logging.info("Pre-P4 catch-up satisfied: latest_ms=%s >= target_ms=%s", latest_ms, target_ms)
-            return
-
         logging.info(
-            "Pre-P4 still missing: latest_ms=%s target_ms=%s; retrying full preload/pre-P4",
+            "Pre-P4 latest normalised open_time_ms=%s (rows=%d)",
             latest_ms,
-            target_ms,
+            len(df_norm),
         )
 
+        if latest_ms >= target_closed_ms:
+            logging.info(
+                "Pre-P4 is current: latest_ms=%s >= target_closed_ms=%s",
+                latest_ms,
+                target_closed_ms,
+            )
+            return
 
+        if attempt < MAX_PRE_P4_TOPUPS:
+            logging.info(
+                "Pre-P4 behind target (latest_ms=%s < target_closed_ms=%s); retrying...",
+                latest_ms,
+                target_closed_ms,
+            )
+            time.sleep(2)
+
+    raise RuntimeError(
+        f"Pre-P4 catch-up failed after {MAX_PRE_P4_TOPUPS} attempts; "
+        f"latest_ms < target_closed_ms={target_closed_ms}"
+    )
+
+
+# ---------------------------------------------------------------------
+# Pillar runners
+# ---------------------------------------------------------------------
+def run_p4_live() -> None:
+    _run_with_retries(
+        build_raw_regime_features_live.main,
+        "build_raw_regime_features_live",
+    )
+    _run_with_retries(
+        deterministic_regime_engines_live.main,
+        "deterministic_regime_engines_live",
+    )
+    _run_with_retries(
+        pillar4_part3_ml_regime_classifier_live.main,
+        "pillar4_part3_ml_regime_classifier_live",
+    )
+    _run_with_retries(
+        pillar4_part4_fusion_layer_live.main,
+        "pillar4_part4_fusion_layer_live",
+    )
+    _run_with_retries(
+        pillar4_part5_stability_layer_live.main,
+        "pillar4_part5_stability_layer_live",
+    )
+    _run_with_retries(pillar_integration_live.main, "pillar_integration_live")
+
+
+def run_p1_live() -> None:
+    _run_with_retries(
+        build_pillar1_feature_matrix_live.main,
+        "build_pillar1_feature_matrix_live",
+    )
+    _run_with_retries(
+        build_pillar1_mini_engines_live.main,
+        "build_pillar1_mini_engines_live",
+    )
+    _run_with_retries(
+        build_pillar1_labels_live.main,
+        "build_pillar1_labels_live",
+    )
+    _run_with_retries(
+        build_pillar1_multi_horizon_ml_live.main,
+        "build_pillar1_multi_horizon_ml_live",
+    )
+    _run_with_retries(
+        build_pillar1_meta_features_live.main,
+        "build_pillar1_meta_features_live",
+    )
+    _run_with_retries(
+        build_pillar1_master_aggregator_live.main,
+        "build_pillar1_master_aggregator_live",
+    )
+    _run_with_retries(
+        build_pillar1_calibration_live.main,
+        "build_pillar1_calibration_live",
+    )
+    _run_with_retries(
+        build_pillar1_decision_layer_live.main,
+        "build_pillar1_decision_layer_live",
+    )
+
+
+def run_p2_live() -> None:
+    _run_with_retries(build_exit_raw_features_live.main, "build_exit_raw_features_live")
+    _run_with_retries(build_exit_labels_live.main, "build_exit_labels_live")
+    _run_with_retries(build_exit_mini_engines_live.main, "build_exit_mini_engines_live")
+    _run_with_retries(build_exit_ml_models_live.main, "build_exit_ml_models_live")
+    _run_with_retries(build_exit_fusion_live.main, "build_exit_fusion_live")
+    _run_with_retries(build_exit_final_targets_live.main, "build_exit_final_targets_live")
+
+
+def run_p3_p5_live() -> None:
+    """
+    For sizing & execution we deliberately use only the latest bar from
+    Pillar 2 final targets, and propagate that through to execution_plans.
+    """
+    p2_final = RUN_PROCESSED / "PILLAR_TWO_EXIT_MODEL" / "exit_final_targets.parquet"
+    _keep_latest_only(p2_final, "open_time_ms")
+
+    _run_with_retries(build_position_sizing_live.main, "build_position_sizing_live")
+
+    p2_with_sizing = RUN_PROCESSED / "PILLAR_TWO_EXIT_MODEL" / "exit_with_sizing.parquet"
+    _keep_latest_only(p2_with_sizing, "open_time_ms")
+
+    _run_with_retries(build_execution_plans_live.main, "build_execution_plans_live")
+
+    p5_exec = RUN_PROCESSED / "PILLAR_FIVE_EXECUTION_ENGINE" / "execution_plans.parquet"
+    _keep_latest_only(p5_exec, "open_time_ms")
+
+
+# ---------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-    last_ts_ms: int | None = None
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+    )
+
+    first_run = True
 
     while True:
         loop_start = time.time()
         logging.info("=== Live pipeline loop start ===")
 
-        ensure_pre_p4_current()
+        # 1) Ensure Pre-Pillar4 has the latest closed minute (full normalised window)
+        ensure_pre_p4_current(initial=first_run)
+        first_run = False
+
+        # 2) Pillar 4 (regime detection)
         run_p4_live()
+
+        # 3) Pillar 1 (entry model)
         run_p1_live()
+
+        # 4) Pillar 2 (exit model)
         run_p2_live()
+
+        # 5) Pillar 3 & 5 (sizing + execution, latest row only)
         run_p3_p5_live()
 
-        # Trim key parquets to rolling window
-        _trim_parquet(RUN_PROCESSED / "PILLAR_ONE_ENTRY_MODEL" / "features_pillar1_final.parquet", "open_time_ms", LOOKBACK_MINUTES)
-        _trim_parquet(RUN_PROCESSED / "PILLAR_TWO_EXIT_MODEL" / "exit_final_targets.parquet", "open_time_ms", LOOKBACK_MINUTES)
-        _trim_parquet(RUN_PROCESSED / "PILLAR_TWO_EXIT_MODEL" / "exit_with_sizing.parquet", "open_time_ms", LOOKBACK_MINUTES)
-        _trim_parquet(RUN_PROCESSED / "PILLAR_FIVE_EXECUTION_ENGINE" / "execution_plans.parquet", "open_time_ms", LOOKBACK_MINUTES)
-        # Log latest rows (P5 only for now)
-        _log_latest(
+        # 6) Trim key parquets to rolling window
+        _trim_parquet(
+            RUN_PROCESSED / "PILLAR_ONE_ENTRY_MODEL" / "features_pillar1_final.parquet",
+            "open_time_ms",
+            LOOKBACK_MINUTES,
+        )
+        _trim_parquet(
+            RUN_PROCESSED / "PILLAR_TWO_EXIT_MODEL" / "exit_final_targets.parquet",
+            "open_time_ms",
+            LOOKBACK_MINUTES,
+        )
+        _trim_parquet(
+            RUN_PROCESSED / "PILLAR_TWO_EXIT_MODEL" / "exit_with_sizing.parquet",
+            "open_time_ms",
+            LOOKBACK_MINUTES,
+        )
+        _trim_parquet(
             RUN_PROCESSED / "PILLAR_FIVE_EXECUTION_ENGINE" / "execution_plans.parquet",
-            RUN_PROCESSED / "PILLAR_FIVE_EXECUTION_ENGINE" / "execution_plans.parquet",
+            "open_time_ms",
+            LOOKBACK_MINUTES,
         )
 
-        # Update last_ts_ms
-        norm_path = RUN_PROCESSED / "PRE_PILLARFOUR" / "normalised_features.parquet"
-        if norm_path.exists():
-            df_norm = pd.read_parquet(norm_path)
-            if "open_time_ms" in df_norm.columns and len(df_norm) > 0:
-                last_ts_ms = int(df_norm["open_time_ms"].max())
+        # 7) Log latest P5 row
+        _log_latest_p5(
+            RUN_PROCESSED / "PILLAR_FIVE_EXECUTION_ENGINE" / "execution_plans.parquet"
+        )
 
         loop_dur = time.time() - loop_start
         logging.info("=== Live pipeline loop complete in %.1fs ===", loop_dur)
-        _sleep_until_next_minute(last_ts_ms)
+
+        # 8) Wait for next whole-minute boundary
+        _sleep_until_next_minute()
 
 
 if __name__ == "__main__":
