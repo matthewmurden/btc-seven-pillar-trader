@@ -135,6 +135,8 @@ from PILLAR_THREE_RISK_MODEL_LIVE import build_position_sizing_live
 # Pillar 5 live
 from PILLAR_FIVE_EXECUTION_ENGINE_LIVE import build_execution_plans_live
 
+# NEW: Trade execution wiring (Binance demo futures)
+from the_executor import execute_latest_plan
 
 # ---------------------------------------------------------------------
 # Helpers
@@ -275,6 +277,7 @@ def run_preload_full_window(end_ms: int, lookback_minutes: int) -> None:
 
     # 4) Aggregate trades as needed
     _run_with_retries(trade_aggregator.main, "trade_aggregator")
+
 
 def run_preload_incremental(end_ms: int, lookback_minutes: int) -> None:
     """
@@ -500,10 +503,11 @@ def run_p2_live() -> None:
     _run_with_retries(build_exit_raw_features_live.main, "build_exit_raw_features_live")
     _run_with_retries(build_exit_labels_live.main, "build_exit_labels_live")
     _run_with_retries(build_exit_mini_engines_live.main, "build_exit_mini_engines_live")
-    _run_with_retries(build_exit_deterministic_live.main, "build_exit_deterministic_live")  # 🔴 new
+    _run_with_retries(build_exit_deterministic_live.main, "build_exit_deterministic_live")
     _run_with_retries(build_exit_ml_models_live.main, "build_exit_ml_models_live")
     _run_with_retries(build_exit_fusion_live.main, "build_exit_fusion_live")
     _run_with_retries(build_exit_final_targets_live.main, "build_exit_final_targets_live")
+
 
 def run_p3_p5_live() -> None:
     """
@@ -522,6 +526,12 @@ def run_p3_p5_live() -> None:
 
     p5_exec = RUN_PROCESSED / "PILLAR_FIVE_EXECUTION_ENGINE" / "execution_plans.parquet"
     _keep_latest_only(p5_exec, "open_time_ms")
+
+    # NEW: actually send the trade to Binance demo futures
+    try:
+        execute_latest_plan(p5_exec)
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("Live trade execution failed: %s", exc)
 
 
 # ---------------------------------------------------------------------
