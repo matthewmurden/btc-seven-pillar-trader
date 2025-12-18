@@ -1,632 +1,751 @@
 """
-Pillar 6 — Safety / Guards / Filters
+Pillar 6 — Safety, Guards, Kill Switch (pre + mid trade)
 
-This module owns all safety-related vetoes and structural filters.
-It is allowed to override Pillars 1, 2, 3, and 5.
+Goal:
+- Veto / modify execution even if P1/P2/P3/P5 want to trade.
+- Continuously enforce “never leave it hanging” invariants mid-trade.
+- Provide a one-flip kill switch that cancels orders, flattens, and locks trading.
 
-Key responsibilities:
-  - Prevent trading in structurally dangerous environments
-  - Block trades with bad geometry / risk characteristics
-  - Provide a *single* safety verdict per trade:
-        trade_allowed : bool
-        execution_mode_override : str | None
-        safe_size_multiplier : float
-        safe_sl_multiplier : float
-        safe_tp_modifier : float
-        cooldown_active : bool
-        safety_metadata : dict
+Designed to plug into your existing system:
+- Trades only BTCUSDT
+- Hedge Mode supported (LONG / SHORT positionSide)
+- Works with your Pillar 5 OMS / executor (brackets + synthetic OCO)
+- Uses REST as truth, WS as low-latency signal (optional)
 
-There are two use modes:
-
-  1) Online / per-trade:
-       engine = SafetyEngine(config)
-       decision = engine.evaluate_trade(...)
-
-  2) Offline / vectorised:
-       df_out = apply_safety_to_df(df_from_pillar2, config)
-
-     This adds columns:
-       - system_filter_v1 (backwards-compatible with old Pillar 2)
-       - safety_trade_allowed
-       - safety_structure_filter_v1
-       - safety_liquidity_guard
-       - safety_volatility_guard
-       - safety_news_guard
-       - safety_funding_guard
-       - safety_metadata_json (stringified summary, optional)
+Notes:
+- This script is deliberately deterministic + testable.
+- You can run it in two modes:
+  (A) “pre_trade_check” called right before attempting an entry
+  (B) “in_trade_guard_tick” running on a loop to enforce invariants
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Dict, Optional, List, Any
-
-import numpy as np
-import pandas as pd
-import json
+import os
+import time
+import hmac
+import hashlib
 import logging
+from dataclasses import dataclass, field
+from typing import Optional, Dict, Any, Literal, List, Tuple
+from urllib.parse import urlencode
+from pathlib import Path
+
+import requests
+from requests import Response
+from dotenv import load_dotenv
+
+# --- load .env sitting next to this file ---
+ENV_PATH = Path(__file__).resolve().parent / ".env"
+load_dotenv(ENV_PATH)
+
+logger = logging.getLogger(__name__)
 
 
 # =====================================================================
-# Basic enums reused across pillars
-# =====================================================================
-
-class VolatilityRegime(str, Enum):
-    LOW = "low"
-    NORMAL = "normal"
-    HIGH = "high"
-    EXTREME = "extreme"
-
-
-class LiquidityRegime(str, Enum):
-    GOOD = "good"
-    AVERAGE = "average"
-    POOR = "poor"
-
-
-class TrendChopFlag(str, Enum):
-    TREND = "trend"
-    CHOP = "chop"
-    UNKNOWN = "unknown"
-
-
-class ExecutionModeOverride(str, Enum):
-    NORMAL = "normal"            # no override
-    SAFE_LIMIT_ONLY = "safe_limit_only"
-    BLOCK_MARKET = "block_market"
-    NO_TRADE = "no_trade"
-    MIN_SIZE_ONLY = "min_size_only"
-
-
-# =====================================================================
-# Shared inputs from other pillars / environment
+# Config
 # =====================================================================
 
 @dataclass
-class RegimeInfo:
-    regime_final: str
-    volatility_regime: VolatilityRegime
-    liquidity_regime: LiquidityRegime
-    chop_trend_flag: TrendChopFlag
-    ignition_flag: bool
-    mean_reversion_flag: bool
-    regime_confidence: float      # 0–1
-    liq_drought_flag: bool = False
-    vol_expansion_flag: bool = False
+class Pillar6Config:
+    # --- Binance Futures REST ---
+    api_key: str = os.getenv("BINANCE_FUTURES_API_KEY", "")
+    api_secret: str = os.getenv("BINANCE_FUTURES_API_SECRET", "")
+    base_url: str = os.getenv("BINANCE_FUTURES_BASE_URL", "https://demo-fapi.binance.com")
+    symbol: str = os.getenv("BINANCE_FUTURES_SYMBOL", "BTCUSDT")
+    recv_window: int = int(os.getenv("BINANCE_FUTURES_RECV_WINDOW", "5000"))
 
+    # Brackets
+    stop_working_type: str = os.getenv("BINANCE_FUTURES_STOP_WORKING_TYPE", "MARK_PRICE")
+    price_protect: bool = os.getenv("BINANCE_FUTURES_PRICE_PROTECT", "false").lower() == "true"
 
-@dataclass
-class MarketContext:
-    """
-    Minimal execution-relevant view of the market for safety.
-    """
-    spread_bps: float                     # bid/ask spread in bps
-    volatility_percentile: float          # 0–100 (%)
-    depth_imbalance: float = 0.0         # -1 (ask heavy) → +1 (bid heavy)
-    volume_percentile: float = 50.0      # 0–100 (%), vs history
-    orderbook_depth_score: float = 1.0   # 0 (thin) → 1 (normal) → >1 (very deep)
+    # --- Pre-trade safety thresholds (conservative defaults) ---
+    max_fill_spread_bps_default: float = float(os.getenv("P5_DEFAULT_MAX_FILL_SPREAD_BPS", "8.0"))
+    volatility_shock_mult: float = float(os.getenv("P6_VOL_SHOCK_MULT", "2.0"))  # current_vol > mult * baseline_vol
+    volatility_shock_abs_bps: float = float(os.getenv("P6_VOL_SHOCK_ABS_BPS", "30.0"))  # or absolute trigger
 
+    # System-level pre-trade guards
+    min_r_multiple_for_system: float = float(os.getenv("P6_MIN_R_MULTIPLE", "2.0"))  # tp_dist / sl_dist
+    max_sl_dist_for_system: float = float(os.getenv("P6_MAX_SL_DIST", "0.003"))  # SL <= 0.3%
+    min_tp_dist_for_system: float = float(os.getenv("P6_MIN_TP_DIST", "0.003"))  # TP >= 0.3%
+    min_entry_conf_for_system: float = float(os.getenv("P6_MIN_ENTRY_CONF", "0.40"))
 
-@dataclass
-class EntrySignalContext:
-    """
-    Subset of Pillar 1 data relevant to safety.
-    """
-    entry_confidence: float               # 0–1
-    signal_confidence: float              # alias if you want
-    time_sensitivity: float               # 0–1
-    pattern_type: Optional[str] = None
+    # Data staleness (WS) – if you don't use WS, set very large or disable.
+    ws_stale_ms: int = int(os.getenv("P6_WS_STALE_MS", "2500"))
+    require_ws_fresh: bool = os.getenv("P6_REQUIRE_WS_FRESH", "false").lower() == "true"
 
+    # Account health
+    min_available_balance_usdt: float = float(os.getenv("P6_MIN_AVAILABLE_BALANCE_USDT", "5.0"))
+    max_consecutive_api_errors: int = int(os.getenv("P6_MAX_CONSEC_API_ERRORS", "5"))
 
-@dataclass
-class ExitRiskContext:
-    """
-    Subset of Pillar 2 outputs relevant to safety.
-    """
-    tp_first_probability: float           # probability TP hit before SL
-    expected_exit_time: float             # bars or seconds
-    exit_entropy: float                   # 0 (clean) → high (messy)
-    optimal_tp_distance: float            # fraction of price
-    optimal_sl_distance: float            # fraction of price
-    r_multiple: float                     # TP_dist / SL_dist
+    # --- In-trade guard behaviour ---
+    guard_tick_sec: float = float(os.getenv("P6_GUARD_TICK_SEC", "2.0"))
+    reconcile_sec: float = float(os.getenv("P6_RECONCILE_SEC", "10.0"))
 
+    # Emergency actions
+    emergency_place_brackets: bool = os.getenv("P6_EMERGENCY_PLACE_BRACKETS", "true").lower() == "true"
+    emergency_flatten_on_inconsistent_state: bool = os.getenv("P6_EMERGENCY_FLATTEN", "true").lower() == "true"
+    emergency_flatten_order_type: str = os.getenv("P6_FLATTEN_ORDER_TYPE", "aggressive_limit")  # aggressive_limit or market
+    flatten_chase_bps: float = float(os.getenv("P6_FLATTEN_CHASE_BPS", "6.0"))
 
-@dataclass
-class RiskContext:
-    """
-    Subset of Pillar 3 / account-level risk relevant to safety.
-    """
-    risk_mode: str                        # "normal" / "conservative" / "aggressive"
-    required_size: float                  # planned size
-    max_equity_risk_frac: float           # max equity fraction to risk
-    current_equity_drawdown: float        # 0–1
+    # Kill switch / lock
+    kill_file_path: str = os.getenv("P6_KILL_FILE_PATH", "KILL_SWITCH_ON.txt")  # if exists => kill mode
+    trading_lock_file_path: str = os.getenv("P6_TRADING_LOCK_FILE_PATH", "TRADING_LOCK.txt")  # persistent lock after kill
 
-
-@dataclass
-class BehaviourContext:
-    """
-    Behaviour / PnL-related safety context (consecutive losses etc.).
-    """
-    consecutive_losses: int
-    last_pnl_frac: float                  # last trade PnL / equity
-    rolling_max_drawdown: float           # worst DD in recent window
-    time_since_last_trade_sec: float
-
-
-@dataclass
-class NewsContext:
-    """
-    Scheduled / unscheduled event guard.
-    """
-    has_active_blackout: bool
-    minutes_to_next_major_event: Optional[float] = None
-    event_importance_score: Optional[float] = None  # 0–1
-
-
-@dataclass
-class FundingContext:
-    """
-    Perp futures funding guard.
-    """
-    minutes_to_funding: Optional[float] = None
-    funding_rate_bps: Optional[float] = None
-    funding_skew_extreme: bool = False
-
-
-@dataclass
-class CircuitBreakerState:
-    """
-    Global-level circuit breakers.
-    """
-    latency_spike: bool = False
-    api_failure: bool = False
-    data_corruption: bool = False
-    model_conflict: bool = False
-    kill_switch: bool = False
+    # ClientOrderId prefix for “ours”
+    client_id_prefix: str = os.getenv("BINANCE_FUTURES_CLIENT_ID_PREFIX", "p5_")
 
 
 # =====================================================================
-# Safety layer config
+# Types exchanged with P3 / P5
 # =====================================================================
 
 @dataclass
-class SafetyConfig:
-    """
-    All knobs / thresholds for Pillar 6.
-    """
-
-    # ---------------- News filter ----------------
-    news_blackout_hard_block: bool = True
-    min_minutes_pre_event_block: float = 5.0
-    min_minutes_post_event_block: float = 5.0
-
-    # ---------------- Liquidity guard ----------------
-    liqudity_spread_threshold_bps: float = 8.0
-    min_orderbook_depth_score: float = 0.4
-    min_volume_percentile: float = 10.0
-
-    # ---------------- Volatility shock filter ----------------
-    vol_percentile_shock_threshold: float = 98.0
-    vol_percentile_soft_threshold: float = 95.0
-    vol_shock_hard_block: bool = True
-
-    # ---------------- Behaviour / consecutive loss lock ----------------
-    max_consecutive_losses: int = 5
-    big_loss_drawdown_threshold: float = 0.05  # 5% equity hit
-    cooldown_seconds_after_big_loss: float = 900.0  # 15 minutes
-
-    # ---------------- Funding guard ----------------
-    funding_block_minutes_before: float = 15.0
-    funding_extreme_rate_bps: float = 20.0
-
-    # ---------------- Circuit breakers ----------------
-    circuit_breaker_blocks_trading: bool = True
-
-    # ---------------- Structural trade quality filter ----------------
-    # (ported from old Pillar 2 system_filter_v1)
-    min_r_multiple_for_system: float = 2.0
-    max_sl_dist_for_system: float = 0.003    # SL <= 0.3%
-    min_tp_dist_for_system: float = 0.003    # TP >= 0.3%
-    min_entry_conf_for_system: float = 0.40
-    min_expected_exit_time_for_system: float = 30.0
-    max_expected_exit_time_for_system: float = 60.0
-    exclude_regime_id_for_system: Optional[List[int]] = (5,)
-    exclude_saturday_in_system: bool = True
-    enable_structure_filter_v1: bool = True
-
-    # ---------------- Safe-mode multipliers ----------------
-    safe_size_multiplier_in_danger: float = 0.0   # 0 = no new trades
-    safe_sl_multiplier_vol_shock: float = 1.5     # widen SL in vol shocks
-    safe_tp_modifier_vol_shock: float = 0.9       # TP a bit closer
-    eps: float = 1e-8
+class MarketMicroSnapshot:
+    ts_ms: int
+    best_bid: float
+    best_ask: float
+    mid: float
+    spread_bps: float
+    volatility_bps: float  # realised/estimated over your chosen window
 
 
-# =====================================================================
-# Output: SafetyDecision
-# =====================================================================
+@dataclass
+class RiskIntent:
+    # From P3
+    side: Literal["long", "short"]
+    final_position_size: float
+    leverage_to_apply: float
+    risk_mode: str  # "conservative" etc.
+    max_fill_spread_bps: float
+    max_chase_bps: float
+    time_budget_ms: int
+
+    # From P2
+    tp_price: float
+    sl_price: float
+
+    # Optional diagnostics for P6 checks
+    entry_ref_price: Optional[float] = None
+    sl_distance_abs: Optional[float] = None
+    tp_distance_abs: Optional[float] = None
+    entry_confidence: Optional[float] = None
+
+    # Optional metadata
+    open_time_ms: Optional[int] = None
+
 
 @dataclass
 class SafetyDecision:
-    trade_allowed: bool
-    execution_mode_override: ExecutionModeOverride
-    safe_size_multiplier: float
-    safe_sl_multiplier: float
-    safe_tp_modifier: float
-    cooldown_active: bool
-    # Guard flags
-    liquidity_guard_triggered: bool = False
-    volatility_shock_guard_triggered: bool = False
-    news_guard_triggered: bool = False
-    funding_guard_triggered: bool = False
-    behaviour_guard_triggered: bool = False
-    circuit_breaker_triggered: bool = False
-    structure_filter_passed: bool = True
-    # Metadata
-    safety_metadata: Dict[str, Any] = field(default_factory=dict)
+    allowed: bool
+    reason: str
+    # modifications / forced constraints
+    forced_order_type: Optional[Literal["limit", "post_only", "aggressive_limit", "market"]] = None
+    forced_max_chase_bps: Optional[float] = None
+    forced_time_budget_ms: Optional[int] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 # =====================================================================
-# Core engine (per-trade, live-style)
+# Low-level Binance Futures REST client (minimal set for safety/guards)
 # =====================================================================
 
-class SafetyEngine:
-    """
-    Live / per-trade safety evaluator.
+class BinanceRest:
+    def __init__(self, cfg: Pillar6Config) -> None:
+        if not cfg.api_key or not cfg.api_secret:
+            raise ValueError("Missing BINANCE_FUTURES_API_KEY / BINANCE_FUTURES_API_SECRET")
+        self.cfg = cfg
+        self._s = requests.Session()
+        self._api_errors = 0
 
-    This is what you call *before* letting Pillar 5 execute a trade.
-    """
+    def _headers(self) -> Dict[str, str]:
+        return {"X-MBX-APIKEY": self.cfg.api_key}
 
-    def __init__(self, config: Optional[SafetyConfig] = None):
-        self.cfg = config or SafetyConfig()
+    def _sign(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        params = dict(params)
+        params.setdefault("timestamp", int(time.time() * 1000))
+        params.setdefault("recvWindow", self.cfg.recv_window)
+        qs = urlencode(params, doseq=True)
+        sig = hmac.new(self.cfg.api_secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
+        params["signature"] = sig
+        return params
 
-    def evaluate_trade(
+    def _require_json(self, r: Response, path: str) -> Any:
+        ct = (r.headers.get("Content-Type", "") or "").lower()
+        if "application/json" not in ct:
+            raise RuntimeError(f"Expected JSON from {path}, got {ct!r}: {(r.text or '')[:200]!r}")
+        return r.json()
+
+    def _get_signed(self, path: str, params: Dict[str, Any]) -> Any:
+        url = self.cfg.base_url.rstrip("/") + path
+        signed = self._sign(params)
+        r = self._s.get(url, headers=self._headers(), params=signed, timeout=15)
+        if not r.ok:
+            self._api_errors += 1
+            payload = None
+            try:
+                payload = self._require_json(r, path)
+            except Exception:
+                payload = (r.text or "")[:300]
+            logger.error("GET %s failed (%s): %s", path, r.status_code, payload)
+            r.raise_for_status()
+        return self._require_json(r, path)
+
+    def _post_signed(self, path: str, params: Dict[str, Any]) -> Any:
+        url = self.cfg.base_url.rstrip("/") + path
+        signed = self._sign(params)
+        r = self._s.post(url, headers=self._headers(), data=signed, timeout=15)
+        if not r.ok:
+            self._api_errors += 1
+            payload = None
+            try:
+                payload = self._require_json(r, path)
+            except Exception:
+                payload = (r.text or "")[:300]
+            logger.error("POST %s failed (%s): %s", path, r.status_code, payload)
+            r.raise_for_status()
+        return self._require_json(r, path)
+
+    def _delete_signed(self, path: str, params: Dict[str, Any]) -> Any:
+        url = self.cfg.base_url.rstrip("/") + path
+        signed = self._sign(params)
+        r = self._s.delete(url, headers=self._headers(), params=signed, timeout=15)
+        if not r.ok:
+            self._api_errors += 1
+            payload = None
+            try:
+                payload = self._require_json(r, path)
+            except Exception:
+                payload = (r.text or "")[:300]
+            logger.error("DELETE %s failed (%s): %s", path, r.status_code, payload)
+            r.raise_for_status()
+        return self._require_json(r, path)
+
+    # ---- endpoints ----
+
+    def get_account_balance(self) -> Any:
+        # futures account balance (USER_DATA)
+        return self._get_signed("/fapi/v2/balance", {})
+
+    def get_position_risk(self, symbol: Optional[str] = None) -> Any:
+        p: Dict[str, Any] = {}
+        if symbol:
+            p["symbol"] = symbol
+        return self._get_signed("/fapi/v2/positionRisk", p)
+
+    def get_open_orders(self, symbol: Optional[str] = None) -> Any:
+        p: Dict[str, Any] = {}
+        if symbol:
+            p["symbol"] = symbol
+        return self._get_signed("/fapi/v1/openOrders", p)
+
+    def cancel_order(self, symbol: str, order_id: Optional[int] = None, orig_client_order_id: Optional[str] = None) -> Any:
+        p: Dict[str, Any] = {"symbol": symbol}
+        if order_id is not None:
+            p["orderId"] = int(order_id)
+        if orig_client_order_id is not None:
+            p["origClientOrderId"] = str(orig_client_order_id)
+        if order_id is None and orig_client_order_id is None:
+            raise ValueError("cancel_order requires order_id or orig_client_order_id")
+        return self._delete_signed("/fapi/v1/order", p)
+
+    def cancel_all_orders(self, symbol: str) -> Any:
+        return self._delete_signed("/fapi/v1/allOpenOrders", {"symbol": symbol})
+
+    def create_close_position_stop(self, *, symbol: str, position_side: str, side: str, stop_type: str, stop_price: str, client_id: str) -> Any:
+        # closePosition=true conditional
+        common: Dict[str, Any] = {
+            "symbol": symbol,
+            "side": side,
+            "positionSide": position_side,
+            "type": stop_type,
+            "closePosition": "true",
+            "stopPrice": stop_price,
+            "workingType": self.cfg.stop_working_type,
+            "newClientOrderId": client_id,
+            "newOrderRespType": "RESULT",
+        }
+        if self.cfg.price_protect:
+            common["priceProtect"] = "TRUE"
+        return self._post_signed("/fapi/v1/order", common)
+
+    def create_market_flatten(self, *, symbol: str, side: str, position_side: str, qty: str, client_id: str) -> Any:
+        # market reduce-only to flatten a known position amount
+        params: Dict[str, Any] = {
+            "symbol": symbol,
+            "side": side,
+            "positionSide": position_side,
+            "type": "MARKET",
+            "quantity": qty,
+            "reduceOnly": "true",
+            "newClientOrderId": client_id,
+            "newOrderRespType": "RESULT",
+        }
+        return self._post_signed("/fapi/v1/order", params)
+
+    def api_error_count(self) -> int:
+        return self._api_errors
+
+
+# =====================================================================
+# Pillar 6 Core
+# =====================================================================
+
+class Pillar6Safety:
+    def __init__(self, cfg: Optional[Pillar6Config] = None) -> None:
+        self.cfg = cfg or Pillar6Config()
+        self.rest = BinanceRest(self.cfg)
+
+        # WS freshness (you can wire this up from your WS consumer)
+        self._last_ws_ts_ms: Optional[int] = None
+
+        # Vol baseline (rolling) – you can feed it from your market module
+        self._baseline_vol_bps: Optional[float] = None
+
+        # Reconcile timing
+        self._last_reconcile_ts: float = 0.0
+
+    # -----------------------------------------------------------------
+    # External hooks
+    # -----------------------------------------------------------------
+
+    def update_ws_tick_time(self, ts_ms: int) -> None:
+        self._last_ws_ts_ms = ts_ms
+
+    def update_volatility_baseline(self, baseline_vol_bps: float) -> None:
+        self._baseline_vol_bps = float(max(baseline_vol_bps, 0.0))
+
+    # -----------------------------------------------------------------
+    # Kill switch + lock
+    # -----------------------------------------------------------------
+
+    def kill_switch_is_on(self) -> bool:
+        p = Path(self.cfg.kill_file_path)
+        return p.exists()
+
+    def trading_is_locked(self) -> bool:
+        return Path(self.cfg.trading_lock_file_path).exists()
+
+    def lock_trading(self, reason: str) -> None:
+        Path(self.cfg.trading_lock_file_path).write_text(f"LOCKED: {reason}\n")
+
+    # -----------------------------------------------------------------
+    # Pre-trade guards
+    # -----------------------------------------------------------------
+
+    def pre_trade_check(
         self,
-        regime: RegimeInfo,
-        market: MarketContext,
-        entry_ctx: EntrySignalContext,
-        exit_ctx: ExitRiskContext,
-        risk_ctx: RiskContext,
-        behaviour_ctx: BehaviourContext,
-        news_ctx: NewsContext,
-        funding_ctx: FundingContext,
-        circuit_state: CircuitBreakerState,
-        timestamp_ms: Optional[int] = None,
-        regime_id_stable: Optional[int] = None,
-        open_time_ms: Optional[int] = None,
-        weekday: Optional[int] = None,  # 0=Mon
+        intent: RiskIntent,
+        market: MarketMicroSnapshot,
     ) -> SafetyDecision:
-        cfg = self.cfg
+        def _block(reason: str, metadata: Optional[Dict[str, Any]] = None) -> SafetyDecision:
+            logger.warning("Pre-trade blocked: %s | %s", reason, metadata or {})
+            return SafetyDecision(False, reason, metadata=metadata or {})
 
-        trade_allowed = True
-        execution_override = ExecutionModeOverride.NORMAL
-        size_mult = 1.0
-        sl_mult = 1.0
-        tp_mod = 1.0
-        cooldown_active = False
+        # 0) Hard lock / kill switch
+        if self.kill_switch_is_on():
+            self.lock_trading("kill_switch_on")
+            return _block("kill_switch_on")
 
-        liq_guard = False
-        vol_guard = False
-        news_guard = False
-        funding_guard = False
-        behav_guard = False
-        cb_guard = False
+        if self.trading_is_locked():
+            return _block("trading_locked")
 
-        meta: Dict[str, Any] = {}
+        # 1) API health guard
+        if self.rest.api_error_count() >= self.cfg.max_consecutive_api_errors:
+            self.lock_trading("too_many_api_errors")
+            return _block("too_many_api_errors")
 
-        # ---------------- 1) Circuit breaker ----------------
-        if cfg.circuit_breaker_blocks_trading and (
-            circuit_state.kill_switch
-            or circuit_state.api_failure
-            or circuit_state.data_corruption
-        ):
-            trade_allowed = False
-            cb_guard = True
-            execution_override = ExecutionModeOverride.NO_TRADE
-            meta["circuit_reason"] = "kill_switch/api_failure/data_corruption"
+        # 2) WS staleness guard (optional)
+        if self.cfg.require_ws_fresh:
+            if self._last_ws_ts_ms is None:
+                return _block("ws_missing")
+            if (market.ts_ms - self._last_ws_ts_ms) > self.cfg.ws_stale_ms:
+                return _block("ws_stale", metadata={"ws_age_ms": market.ts_ms - self._last_ws_ts_ms})
 
-        # ---------------- 2) News filter ----------------
-        if trade_allowed and news_ctx.has_active_blackout and cfg.news_blackout_hard_block:
-            trade_allowed = False
-            news_guard = True
-            execution_override = ExecutionModeOverride.NO_TRADE
-            meta["news_blackout"] = True
+        # 3) Spread too wide vs cap
+        cap = float(intent.max_fill_spread_bps or self.cfg.max_fill_spread_bps_default)
+        if market.spread_bps > cap:
+            return _block("spread_too_wide", metadata={"spread_bps": market.spread_bps, "cap": cap})
 
-        # ---------------- 3) Liquidity guard ----------------
-        if trade_allowed:
-            if (
-                regime.liquidity_regime == LiquidityRegime.POOR
-                or regime.liq_drought_flag
-                or market.spread_bps > cfg.liqudity_spread_threshold_bps
-                or market.orderbook_depth_score < cfg.min_orderbook_depth_score
-                or market.volume_percentile < cfg.min_volume_percentile
-            ):
-                liq_guard = True
-                # Hard block new trades; in a softer config you could set MIN_SIZE_ONLY
-                trade_allowed = False
-                execution_override = ExecutionModeOverride.SAFE_LIMIT_ONLY
-                size_mult = cfg.safe_size_multiplier_in_danger
-                meta["liquidity_guard_reason"] = "spread/depth/volume"
+        # 4) Volatility shock guard (baseline required; if missing, use abs only)
+        baseline = self._baseline_vol_bps
+        if baseline is not None and baseline > 0:
+            if market.volatility_bps > self.cfg.volatility_shock_mult * baseline:
+                return SafetyDecision(
+                    False,
+                    "volatility_shock_mult",
+                    metadata={"vol_bps": market.volatility_bps, "baseline_bps": baseline, "mult": self.cfg.volatility_shock_mult},
+                )
 
-        # ---------------- 4) Volatility shock filter ----------------
-        if trade_allowed:
-            if market.volatility_percentile >= cfg.vol_percentile_shock_threshold:
-                vol_guard = True
-                if cfg.vol_shock_hard_block:
-                    trade_allowed = False
-                    execution_override = ExecutionModeOverride.NO_TRADE
-                else:
-                    execution_override = ExecutionModeOverride.BLOCK_MARKET
-                # Widen SL slightly, pull TP slightly closer
-                sl_mult *= cfg.safe_sl_multiplier_vol_shock
-                tp_mod *= cfg.safe_tp_modifier_vol_shock
-                meta["volatility_guard_level"] = "shock"
-            elif market.volatility_percentile >= cfg.vol_percentile_soft_threshold:
-                # softer guard: no market orders, reduce size
-                vol_guard = True
-                execution_override = ExecutionModeOverride.BLOCK_MARKET
-                size_mult *= 0.5
-                meta["volatility_guard_level"] = "soft"
-
-        # ---------------- 5) Behaviour / consecutive loss lock ----------------
-        if trade_allowed:
-            if behaviour_ctx.consecutive_losses >= cfg.max_consecutive_losses:
-                trade_allowed = False
-                behav_guard = True
-                cooldown_active = True
-                execution_override = ExecutionModeOverride.NO_TRADE
-                meta["behaviour_guard_reason"] = "max_consecutive_losses"
-
-            big_loss = behaviour_ctx.last_pnl_frac <= -cfg.big_loss_drawdown_threshold
-            if big_loss and behaviour_ctx.time_since_last_trade_sec < cfg.cooldown_seconds_after_big_loss:
-                trade_allowed = False
-                behav_guard = True
-                cooldown_active = True
-                execution_override = ExecutionModeOverride.NO_TRADE
-                meta["behaviour_guard_reason"] = "post_big_loss_cooldown"
-
-        # ---------------- 6) Funding guard ----------------
-        if trade_allowed and funding_ctx.minutes_to_funding is not None:
-            if funding_ctx.minutes_to_funding < cfg.funding_block_minutes_before:
-                trade_allowed = False
-                funding_guard = True
-                execution_override = ExecutionModeOverride.NO_TRADE
-                meta["funding_guard_reason"] = "near_funding"
-            elif funding_ctx.funding_rate_bps is not None and abs(funding_ctx.funding_rate_bps) > cfg.funding_extreme_rate_bps:
-                # not a hard block, but safe mode
-                funding_guard = True
-                execution_override = ExecutionModeOverride.SAFE_LIMIT_ONLY
-                size_mult *= 0.5
-                meta["funding_guard_reason"] = "extreme_funding_rate"
-
-        # ---------------- 7) Structural trade-quality filter (old system_filter_v1) ----------------
-        structure_pass = True
-        if cfg.enable_structure_filter_v1 and trade_allowed:
-            structure_pass = _structure_filter_v1_scalar(
-                cfg=cfg,
-                expected_exit_time=exit_ctx.expected_exit_time,
-                optimal_tp_distance=exit_ctx.optimal_tp_distance,
-                optimal_sl_distance=exit_ctx.optimal_sl_distance,
-                r_multiple=exit_ctx.r_multiple,
-                entry_confidence=entry_ctx.entry_confidence,
-                regime_id_stable=regime_id_stable,
-                open_time_ms=open_time_ms,
-                weekday=weekday,
+        if market.volatility_bps >= self.cfg.volatility_shock_abs_bps:
+            return SafetyDecision(
+                False,
+                "volatility_shock_abs",
+                metadata={"vol_bps": market.volatility_bps, "abs_bps": self.cfg.volatility_shock_abs_bps},
             )
-            if not structure_pass:
-                trade_allowed = False
-                meta["structure_filter_v1"] = False
 
-        # Build final decision
-        decision = SafetyDecision(
-            trade_allowed=trade_allowed,
-            execution_mode_override=execution_override,
-            safe_size_multiplier=float(size_mult),
-            safe_sl_multiplier=float(sl_mult),
-            safe_tp_modifier=float(tp_mod),
-            cooldown_active=cooldown_active,
-            liquidity_guard_triggered=liq_guard,
-            volatility_shock_guard_triggered=vol_guard,
-            news_guard_triggered=news_guard,
-            funding_guard_triggered=funding_guard,
-            behaviour_guard_triggered=behav_guard,
-            circuit_breaker_triggered=cb_guard,
-            structure_filter_passed=structure_pass,
-            safety_metadata=meta,
-        )
-        return decision
+        # 4.5) System-level quality gates (R-multiple, TP/SL distance bands, entry confidence)
+        entry_ref = intent.entry_ref_price
+        if entry_ref is None or entry_ref <= 0:
+            entry_ref = 0.5 * (float(intent.tp_price) + float(intent.sl_price))
+
+        sl_dist = intent.sl_distance_abs
+        if sl_dist is None or sl_dist <= 0:
+            sl_dist = abs(float(entry_ref) - float(intent.sl_price))
+
+        tp_dist = intent.tp_distance_abs
+        if tp_dist is None or tp_dist <= 0:
+            tp_dist = abs(float(intent.tp_price) - float(entry_ref))
+
+        if sl_dist <= 0 or entry_ref <= 0:
+            return _block("invalid_sl_distance_for_system_check")
+
+        r_multiple = tp_dist / sl_dist if sl_dist > 0 else 0.0
+        sl_dist_pct = sl_dist / entry_ref
+        tp_dist_pct = tp_dist / entry_ref
+
+        if r_multiple < self.cfg.min_r_multiple_for_system:
+            return _block(
+                "r_multiple_below_min",
+                metadata={"r_multiple": r_multiple, "min_required": self.cfg.min_r_multiple_for_system},
+            )
+
+        if sl_dist_pct > self.cfg.max_sl_dist_for_system:
+            return _block(
+                "sl_distance_too_large",
+                metadata={"sl_dist_pct": sl_dist_pct, "max_allowed": self.cfg.max_sl_dist_for_system},
+            )
+
+        if tp_dist_pct < self.cfg.min_tp_dist_for_system:
+            return _block(
+                "tp_distance_too_small",
+                metadata={"tp_dist_pct": tp_dist_pct, "min_required": self.cfg.min_tp_dist_for_system},
+            )
+
+        if intent.entry_confidence is not None and intent.entry_confidence < self.cfg.min_entry_conf_for_system:
+            return _block(
+                "entry_confidence_below_min",
+                metadata={"entry_confidence": intent.entry_confidence, "min_required": self.cfg.min_entry_conf_for_system},
+            )
+
+        # 5) Account health guard (minimum free balance)
+        try:
+            bal = self.rest.get_account_balance()
+            # USDT balance entry looks like {"asset":"USDT","availableBalance":"..."}
+            usdt = None
+            for row in bal or []:
+                if str(row.get("asset", "")).upper() == "USDT":
+                    usdt = row
+                    break
+            if usdt is None:
+                # don't hard fail; demo APIs can be weird
+                logger.warning("Could not locate USDT in /fapi/v2/balance response.")
+            else:
+                avail = float(usdt.get("availableBalance", 0.0))
+                if avail < self.cfg.min_available_balance_usdt:
+                    return SafetyDecision(False, "low_available_balance", metadata={"available_usdt": avail})
+        except Exception as e:
+            # If account check itself fails repeatedly, the API guard will lock you.
+            logger.warning("Account health check failed (non-fatal this tick): %s", e)
+
+        # Allowed
+        return SafetyDecision(True, "ok")
+
+    # -----------------------------------------------------------------
+    # In-trade guards: invariants + emergency actions
+    # -----------------------------------------------------------------
+
+    @staticmethod
+    def _pos_side(side: Literal["long", "short"]) -> str:
+        return "LONG" if side == "long" else "SHORT"
+
+    @staticmethod
+    def _exit_side_for_pos(position_side: str) -> str:
+        # To close a LONG you SELL, to close a SHORT you BUY
+        return "SELL" if position_side.upper() == "LONG" else "BUY"
+
+    def _get_side_state(self, symbol: str, position_side: str) -> Dict[str, Any]:
+        # positions
+        positions = self.rest.get_position_risk(symbol=symbol) or []
+        pos_amt = 0.0
+        for p in positions:
+            if str(p.get("symbol", "")).upper() == symbol.upper() and str(p.get("positionSide", "")).upper() == position_side.upper():
+                try:
+                    pos_amt = float(p.get("positionAmt", 0.0))
+                except Exception:
+                    pos_amt = 0.0
+                break
+
+        # orders
+        open_orders = self.rest.get_open_orders(symbol=symbol) or []
+        side_orders = [o for o in open_orders if str(o.get("positionSide", "")).upper() == position_side.upper()]
+
+        # bracket classification
+        entry_like: List[Dict[str, Any]] = []
+        bracket_like: List[Dict[str, Any]] = []
+        for o in side_orders:
+            otype = str(o.get("type", "")).upper()
+            close_pos = str(o.get("closePosition", "false")).lower() == "true"
+            reduce_only = str(o.get("reduceOnly", "false")).lower() == "true"
+            is_conditional = otype in ("STOP", "STOP_MARKET", "TAKE_PROFIT", "TAKE_PROFIT_MARKET", "TRAILING_STOP_MARKET")
+            is_bracket = close_pos or (reduce_only and is_conditional) or (is_conditional and "stopPrice" in o)
+            (bracket_like if is_bracket else entry_like).append(o)
+
+        # split TP/SL
+        tp = [o for o in bracket_like if str(o.get("type", "")).upper() in ("TAKE_PROFIT", "TAKE_PROFIT_MARKET")]
+        sl = [o for o in bracket_like if str(o.get("type", "")).upper() in ("STOP", "STOP_MARKET")]
+
+        return {
+            "positionAmt": pos_amt,
+            "open_orders": side_orders,
+            "entry_like": entry_like,
+            "bracket_like": bracket_like,
+            "tp_orders": tp,
+            "sl_orders": sl,
+        }
+
+    def in_trade_guard_tick(
+        self,
+        intent_long: Optional[RiskIntent],
+        intent_short: Optional[RiskIntent],
+        market: MarketMicroSnapshot,
+    ) -> Dict[str, Any]:
+        """
+        Run continuously.
+        - intent_long/intent_short are the latest known intents (with tp/sl prices).
+          Pass None if you have no current intent for that side; guards can still flatten if inconsistent.
+        """
+
+        # Kill switch overrides everything
+        if self.kill_switch_is_on():
+            logger.critical("KILL SWITCH ON: cancelling orders + flattening + locking.")
+            res = self.execute_kill_switch(market=market)
+            return {"kill_switch": True, "result": res}
+
+        # If already locked, do not trade, but DO keep enforcing safety if you want.
+        if self.trading_is_locked():
+            return {"locked": True}
+
+        out: Dict[str, Any] = {"ts_ms": market.ts_ms, "actions": []}
+
+        # Periodic reconcile via REST already happens here (this function is REST-truth by design)
+        now = time.time()
+        do_reconcile = (now - self._last_reconcile_ts) >= self.cfg.reconcile_sec
+        if do_reconcile:
+            self._last_reconcile_ts = now
+
+        for side_name, intent in (("LONG", intent_long), ("SHORT", intent_short)):
+            position_side = side_name
+            state = self._get_side_state(self.cfg.symbol, position_side)
+
+            pos_amt = float(state["positionAmt"])
+            tp_count = len(state["tp_orders"])
+            sl_count = len(state["sl_orders"])
+
+            # If no position exists: nothing to protect
+            if abs(pos_amt) == 0.0:
+                continue
+
+            # If position exists but no brackets exist => emergency bracket placement
+            if tp_count == 0 and sl_count == 0:
+                msg = f"{position_side}: position exists but NO brackets"
+                logger.error(msg)
+
+                if self.cfg.emergency_place_brackets and intent is not None:
+                    placed = self._emergency_place_brackets(intent=intent, position_side=position_side)
+                    out["actions"].append({"action": "emergency_place_brackets", "side": position_side, "result": placed})
+                else:
+                    # No intent = we don't know TP/SL; safest is flatten if enabled
+                    if self.cfg.emergency_flatten_on_inconsistent_state:
+                        flat = self._flatten_position(position_side=position_side, market=market, reason="no_brackets_no_intent")
+                        out["actions"].append({"action": "flatten", "side": position_side, "result": flat})
+                continue
+
+            # Exactly one bracket exists => restore missing or flatten
+            if (tp_count == 0 and sl_count >= 1) or (sl_count == 0 and tp_count >= 1):
+                msg = f"{position_side}: ONLY ONE bracket exists (tp={tp_count}, sl={sl_count})"
+                logger.error(msg)
+
+                if self.cfg.emergency_place_brackets and intent is not None:
+                    # place missing only (do not duplicate existing)
+                    restored = self._restore_missing_bracket(intent=intent, position_side=position_side, state=state)
+                    out["actions"].append({"action": "restore_missing_bracket", "side": position_side, "result": restored})
+                else:
+                    if self.cfg.emergency_flatten_on_inconsistent_state:
+                        flat = self._flatten_position(position_side=position_side, market=market, reason="one_bracket_missing_intent")
+                        out["actions"].append({"action": "flatten", "side": position_side, "result": flat})
+                continue
+
+            # If brackets exist but spread is insane or vol shock: optional “panic flatten”
+            cap = float((intent.max_fill_spread_bps if intent else 0.0) or self.cfg.max_fill_spread_bps_default)
+            if market.spread_bps > cap * 3.0:
+                logger.warning("%s: spread extreme during position (spread_bps=%.2f).", position_side, market.spread_bps)
+
+            # If we reached here: position + both brackets exist => good
+            # Synthetic OCO is handled by P5 user-stream logic; P6 just enforces invariants.
+
+        return out
+
+    # -----------------------------------------------------------------
+    # Emergency helpers
+    # -----------------------------------------------------------------
+
+    def _emergency_place_brackets(self, *, intent: RiskIntent, position_side: str) -> Dict[str, Any]:
+        """
+        Places both TP + SL as closePosition=true conditionals.
+        Uses deterministic client IDs so you can identify them.
+        """
+        exit_side = self._exit_side_for_pos(position_side)
+
+        open_ms = int(intent.open_time_ms or int(time.time() * 1000))
+        tp_cid = f"{self.cfg.client_id_prefix}{open_ms}_{position_side}_TP_EM"
+        sl_cid = f"{self.cfg.client_id_prefix}{open_ms}_{position_side}_SL_EM"
+
+        try:
+            tp = self.rest.create_close_position_stop(
+                symbol=self.cfg.symbol,
+                position_side=position_side,
+                side=exit_side,
+                stop_type="TAKE_PROFIT_MARKET",
+                stop_price=str(intent.tp_price),
+                client_id=tp_cid,
+            )
+            sl = self.rest.create_close_position_stop(
+                symbol=self.cfg.symbol,
+                position_side=position_side,
+                side=exit_side,
+                stop_type="STOP_MARKET",
+                stop_price=str(intent.sl_price),
+                client_id=sl_cid,
+            )
+            return {"tp": tp, "sl": sl}
+        except Exception as e:
+            logger.exception("Emergency bracket placement failed: %s", e)
+            if self.cfg.emergency_flatten_on_inconsistent_state:
+                flat = self._flatten_position(position_side=position_side, market=None, reason="emergency_bracket_place_failed")
+                return {"error": str(e), "flatten": flat}
+            return {"error": str(e)}
+
+    def _restore_missing_bracket(self, *, intent: RiskIntent, position_side: str, state: Dict[str, Any]) -> Dict[str, Any]:
+        exit_side = self._exit_side_for_pos(position_side)
+        open_ms = int(intent.open_time_ms or int(time.time() * 1000))
+        res: Dict[str, Any] = {}
+
+        try:
+            if len(state["tp_orders"]) == 0:
+                tp_cid = f"{self.cfg.client_id_prefix}{open_ms}_{position_side}_TP_RE"
+                res["tp"] = self.rest.create_close_position_stop(
+                    symbol=self.cfg.symbol,
+                    position_side=position_side,
+                    side=exit_side,
+                    stop_type="TAKE_PROFIT_MARKET",
+                    stop_price=str(intent.tp_price),
+                    client_id=tp_cid,
+                )
+            if len(state["sl_orders"]) == 0:
+                sl_cid = f"{self.cfg.client_id_prefix}{open_ms}_{position_side}_SL_RE"
+                res["sl"] = self.rest.create_close_position_stop(
+                    symbol=self.cfg.symbol,
+                    position_side=position_side,
+                    side=exit_side,
+                    stop_type="STOP_MARKET",
+                    stop_price=str(intent.sl_price),
+                    client_id=sl_cid,
+                )
+            return res
+        except Exception as e:
+            logger.exception("Restore missing bracket failed: %s", e)
+            if self.cfg.emergency_flatten_on_inconsistent_state:
+                flat = self._flatten_position(position_side=position_side, market=None, reason="restore_bracket_failed")
+                return {"error": str(e), "flatten": flat}
+            return {"error": str(e)}
+
+    def _flatten_position(self, *, position_side: str, market: Optional[MarketMicroSnapshot], reason: str) -> Dict[str, Any]:
+        """
+        Flatten via reduceOnly MARKET (simple + reliable).
+        If you want aggressive-limit flatten, implement in P5 where you already have tick sizes.
+        """
+        try:
+            # get position amt
+            st = self._get_side_state(self.cfg.symbol, position_side)
+            amt = float(st["positionAmt"])
+            if abs(amt) == 0.0:
+                return {"noop": True, "reason": "no_position"}
+
+            # cancel all orders first (prevents bracket triggering during flatten)
+            try:
+                self.rest.cancel_all_orders(self.cfg.symbol)
+            except Exception as e:
+                logger.warning("cancel_all_orders failed during flatten (continuing): %s", e)
+
+            # decide side + qty
+            exit_side = self._exit_side_for_pos(position_side)
+            qty = str(abs(amt))
+
+            cid = f"{self.cfg.client_id_prefix}{int(time.time()*1000)}_{position_side}_FLAT"
+            res = self.rest.create_market_flatten(
+                symbol=self.cfg.symbol,
+                side=exit_side,
+                position_side=position_side,
+                qty=qty,
+                client_id=cid,
+            )
+            self.lock_trading(f"flattened:{reason}")
+            return {"flattened": True, "reason": reason, "order": res}
+        except Exception as e:
+            self.lock_trading(f"flatten_failed:{reason}")
+            return {"flattened": False, "reason": reason, "error": str(e)}
+
+    # -----------------------------------------------------------------
+    # Kill switch
+    # -----------------------------------------------------------------
+
+    def execute_kill_switch(self, market: Optional[MarketMicroSnapshot] = None) -> Dict[str, Any]:
+        """
+        One-shot:
+        - cancel all open orders
+        - flatten both LONG and SHORT if any
+        - lock trading
+        """
+        results: Dict[str, Any] = {"cancel_all": None, "flatten": []}
+
+        try:
+            results["cancel_all"] = self.rest.cancel_all_orders(self.cfg.symbol)
+        except Exception as e:
+            results["cancel_all"] = {"error": str(e)}
+
+        for ps in ("LONG", "SHORT"):
+            try:
+                res = self._flatten_position(position_side=ps, market=market, reason="kill_switch")
+                results["flatten"].append({ps: res})
+            except Exception as e:
+                results["flatten"].append({ps: {"error": str(e)}})
+
+        self.lock_trading("kill_switch")
+        return results
 
 
 # =====================================================================
-# Vectorised application over a DataFrame (offline / backtest)
+# Minimal usage example (you will wire this into global orchestration)
 # =====================================================================
 
-def apply_safety_to_df(
-    df: pd.DataFrame,
-    cfg: Optional[SafetyConfig] = None,
-) -> pd.DataFrame:
-    """
-    Offline / research helper.
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
-    Takes the output of Pillar 2 final targets (plus regime columns) and
-    applies a structural trade-quality filter identical to the old
-    `system_filter_v1` from ExitFinalConfig.
+    p6 = Pillar6Safety()
 
-    It adds the following columns:
-
-        system_filter_v1              (backwards-compatible)
-        safety_trade_allowed          (currently == system_filter_v1)
-        safety_structure_filter_v1    (same bool)
-        safety_liquidity_guard        (False by default here)
-        safety_volatility_guard       (False by default here)
-        safety_news_guard             (False by default here)
-        safety_funding_guard          (False by default here)
-        safety_metadata_json          (stringified minimal metadata)
-
-    This is purposely *static* and does not model runtime state like
-    consecutive losses, latency spikes, or funding windows, which are
-    better handled by the live SafetyEngine.
-    """
-    cfg = cfg or SafetyConfig()
-    out = df.copy()
-
-    # Base "active trade" mask: has a decision, valid price & levels
-    col_decision = "entry_decision"
-    col_time = "open_time_ms"
-    col_tp = "optimal_tp"
-    col_sl = "optimal_sl"
-
-    if col_decision not in out.columns or col_tp not in out.columns or col_sl not in out.columns:
-        raise ValueError(
-            "[Safety] Expected columns 'entry_decision', 'optimal_tp', 'optimal_sl' "
-            "from Pillar 2 outputs."
-        )
-
-    decision = out[col_decision].astype(str)
-    entry_price = pd.to_numeric(out.get("close", np.nan), errors="coerce")
-    valid_levels = np.isfinite(out[col_tp]) & np.isfinite(out[col_sl])
-    active = (decision != "none") & np.isfinite(entry_price) & valid_levels
-
-    # R-multiple / distances
-    if "optimal_tp_distance" not in out.columns or "optimal_sl_distance" not in out.columns:
-        raise ValueError(
-            "[Safety] Expected 'optimal_tp_distance' and 'optimal_sl_distance' columns "
-            "from Pillar 2 outputs."
-        )
-
-    tp_d = pd.to_numeric(out["optimal_tp_distance"], errors="coerce").fillna(0.0)
-    sl_d = pd.to_numeric(out["optimal_sl_distance"], errors="coerce").fillna(cfg.eps)
-    r_multiple = tp_d / sl_d.replace(0, cfg.eps)
-
-    # Geometry conditions
-    cond_rr = r_multiple >= cfg.min_r_multiple_for_system
-    cond_sl = sl_d <= cfg.max_sl_dist_for_system
-    cond_tp = tp_d >= cfg.min_tp_dist_for_system
-
-    # Entry confidence
-    if "entry_confidence" in out.columns:
-        conf = pd.to_numeric(out["entry_confidence"], errors="coerce").fillna(0.0)
-        cond_conf = conf >= cfg.min_entry_conf_for_system
-    else:
-        cond_conf = pd.Series(True, index=out.index)
-
-    # Expected exit time
-    if "expected_exit_time" in out.columns:
-        exp_t = pd.to_numeric(out["expected_exit_time"], errors="coerce").fillna(0.0)
-        cond_exit = (exp_t >= cfg.min_expected_exit_time_for_system) & (
-            exp_t <= cfg.max_expected_exit_time_for_system
-        )
-    else:
-        cond_exit = pd.Series(True, index=out.index)
-
-    # Regime filter
-    if "regime_id_stable" in out.columns and cfg.exclude_regime_id_for_system:
-        reg = out["regime_id_stable"]
-        cond_regime = ~reg.isin(cfg.exclude_regime_id_for_system)
-    else:
-        cond_regime = pd.Series(True, index=out.index)
-
-    # Weekday filter (optional)
-    if cfg.exclude_saturday_in_system and col_time in out.columns:
-        ts = pd.to_datetime(out[col_time], unit="ms", utc=True)
-        weekday = ts.dt.weekday  # Monday=0, Saturday=5
-        cond_weekday = weekday != 5
-    else:
-        cond_weekday = pd.Series(True, index=out.index)
-
-    structure_filter_v1 = (
-        active
-        & cond_rr
-        & cond_sl
-        & cond_tp
-        & cond_conf
-        & cond_exit
-        & cond_regime
-        & cond_weekday
+    # Dummy market snapshot example (you should feed this from WS/market module)
+    m = MarketMicroSnapshot(
+        ts_ms=int(time.time() * 1000),
+        best_bid=0.0,
+        best_ask=0.0,
+        mid=0.0,
+        spread_bps=0.0,
+        volatility_bps=0.0,
     )
 
-    # Backwards-compatible column + safety flags
-    out["system_filter_v1"] = structure_filter_v1.astype(bool)
-    out["safety_trade_allowed"] = out["system_filter_v1"]
-    out["safety_structure_filter_v1"] = out["system_filter_v1"]
-    out["safety_liquidity_guard"] = False
-    out["safety_volatility_guard"] = False
-    out["safety_news_guard"] = False
-    out["safety_funding_guard"] = False
-
-    # Minimal metadata
-    meta = {
-        "min_r_multiple_for_system": cfg.min_r_multiple_for_system,
-        "max_sl_dist_for_system": cfg.max_sl_dist_for_system,
-        "min_tp_dist_for_system": cfg.min_tp_dist_for_system,
-        "min_entry_conf_for_system": cfg.min_entry_conf_for_system,
-        "min_expected_exit_time_for_system": cfg.min_expected_exit_time_for_system,
-        "max_expected_exit_time_for_system": cfg.max_expected_exit_time_for_system,
-    }
-    out["safety_metadata_json"] = json.dumps(meta)
-
-    # Logging like old ExitFinal
-    n_active = int(active.sum())
-    n_filtered = int(structure_filter_v1.sum())
-    logging.info(
-        "[Safety] system_filter_v1 (Pillar 6): %d / %d active trades kept (%.2f%%)",
-        n_filtered,
-        n_active,
-        100.0 * (n_filtered / max(n_active, 1)),
-    )
-
-    return out
-
-
-# =====================================================================
-# Internal helper: scalar version of the old system_filter_v1
-# =====================================================================
-
-def _structure_filter_v1_scalar(
-    cfg: SafetyConfig,
-    expected_exit_time: float,
-    optimal_tp_distance: float,
-    optimal_sl_distance: float,
-    r_multiple: float,
-    entry_confidence: float,
-    regime_id_stable: Optional[int],
-    open_time_ms: Optional[int],
-    weekday: Optional[int],
-) -> bool:
-    """
-    Scalar version of the old system_filter_v1 logic, used by SafetyEngine.
-    """
-    # Basic geometry
-    if not np.isfinite(r_multiple):
-        return False
-    if r_multiple < cfg.min_r_multiple_for_system:
-        return False
-    if not np.isfinite(optimal_sl_distance) or optimal_sl_distance > cfg.max_sl_dist_for_system:
-        return False
-    if not np.isfinite(optimal_tp_distance) or optimal_tp_distance < cfg.min_tp_dist_for_system:
-        return False
-
-    # Confidence
-    if entry_confidence < cfg.min_entry_conf_for_system:
-        return False
-
-    # Expected exit time
-    if not np.isfinite(expected_exit_time):
-        return False
-    if not (cfg.min_expected_exit_time_for_system <= expected_exit_time <= cfg.max_expected_exit_time_for_system):
-        return False
-
-    # Regime
-    if regime_id_stable is not None and cfg.exclude_regime_id_for_system:
-        if int(regime_id_stable) in cfg.exclude_regime_id_for_system:
-            return False
-
-    # Weekday (optional)
-    if cfg.exclude_saturday_in_system:
-        if weekday is None and open_time_ms is not None:
-            ts = pd.to_datetime(int(open_time_ms), unit="ms", utc=True)
-            weekday = int(ts.weekday())
-        if weekday == 5:
-            return False
-
-    return True
+    # If you just want to run kill switch quickly:
+    if p6.kill_switch_is_on():
+        print(p6.execute_kill_switch(market=m))
+    else:
+        print({"kill_switch": "off"})

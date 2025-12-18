@@ -81,7 +81,7 @@ def download_last_14_days() -> None:
     else:
         end_dt = datetime.now(timezone.utc).replace(second=0, microsecond=0)
 
-    window_minutes = int(LOOKBACK_DAYS * 24 * 60)
+    window_minutes = int(round(LOOKBACK_DAYS * 24 * 60))
     start_dt = end_dt - timedelta(minutes=window_minutes)
 
     start_ms = int(start_dt.timestamp() * 1000)
@@ -147,8 +147,14 @@ def download_last_14_days() -> None:
         # Final duplicate prevention
         df = df.drop_duplicates(subset=["open_time"]).sort_values("open_time")
 
-        # Enforce exact window size (end exclusive), keep last N minutes
+        # Enforce exact window bounds [start_ms, end_ms) and keep last N minutes
+        df["open_time_ms"] = (df["open_time"].astype("int64") // 1_000_000).astype("int64")
+        df = df[
+            (df["open_time_ms"] >= start_ms)
+            & (df["open_time_ms"] < end_ms)
+        ].copy()
         df = df.tail(window_minutes)
+        df = df.drop(columns=["open_time_ms"])
 
     # Fixed filename
     outfile = OUTPUT_DIR / "BTC_CANDLES.csv"

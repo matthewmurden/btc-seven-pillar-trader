@@ -46,7 +46,7 @@ def main() -> None:
     # Ensure count-style fields are floats so they get normalised (e.g. agg_trades)
     promote_to_float = [
         "agg_trades",
-        "agg_qty",
+        "qty",
         "agg_buy_qty",
         "agg_sell_qty",
         "agg_delta",

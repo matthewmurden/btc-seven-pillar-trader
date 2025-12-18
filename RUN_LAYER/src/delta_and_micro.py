@@ -632,10 +632,10 @@ def main() -> None:
     else:
         wall_finish = datetime.now(timezone.utc).replace(second=0, microsecond=0)
 
-    window_ms = int(LOOKBACK_DAYS * 24 * 60 * 60 * 1000)
+    window_ms = int(round(LOOKBACK_DAYS * 24 * 60 * 60 * 1000))
 
-    start_ms = int((wall_finish - timedelta(days=LOOKBACK_DAYS)).timestamp() * 1000)
     end_ms = int(wall_finish.timestamp() * 1000)  # end EXCLUSIVE
+    start_ms = end_ms - window_ms
 
     start_dt = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc)
     end_dt = datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc)

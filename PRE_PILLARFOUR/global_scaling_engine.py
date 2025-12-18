@@ -1,6 +1,7 @@
 import argparse
 import json
 import logging
+import math
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -105,12 +106,48 @@ def minmax_scale(
     """
     out = f"{col}_mm"
     if fit:
-        q_low = float(df[col].quantile(MM_Q_LOW))
-        q_high = float(df[col].quantile(MM_Q_HIGH))
+        series = df[col]
+        if series.null_count() == series.len():
+            logging.warning(
+                "minmax_scale: column %s is all null/None; skipping _mm and filling 0.0",
+                col,
+            )
+            params = {"q_low": 0.0, "q_high": 0.0, "skipped": True}
+            return df.with_columns(pl.lit(0.0).cast(pl.Float32).alias(out)), params
+        series = series.drop_nulls()
+        series = series.filter(~series.is_nan())
+        series = series.filter(~series.is_infinite())
+        if series.len() == 0:
+            logging.warning(
+                "minmax_scale: column %s has no finite values; skipping _mm and filling 0.0",
+                col,
+            )
+            params = {"q_low": 0.0, "q_high": 0.0, "skipped": True}
+            return df.with_columns(pl.lit(0.0).cast(pl.Float32).alias(out)), params
+        q_low = series.quantile(MM_Q_LOW)
+        q_high = series.quantile(MM_Q_HIGH)
+        if q_low is None or q_high is None:
+            logging.warning("minmax_scale: column %s quantile None; skipping _mm and filling 0.0", col)
+            params = {"q_low": 0.0, "q_high": 0.0, "skipped": True}
+            return df.with_columns(pl.lit(0.0).cast(pl.Float32).alias(out)), params
+        q_low = float(q_low)
+        q_high = float(q_high)
+        if not math.isfinite(q_low) or not math.isfinite(q_high):
+            logging.warning(
+                "minmax_scale: column %s quantiles not finite (q_low=%s, q_high=%s); skipping _mm and filling 0.0",
+                col,
+                q_low,
+                q_high,
+            )
+            params = {"q_low": 0.0, "q_high": 0.0, "skipped": True}
+            return df.with_columns(pl.lit(0.0).cast(pl.Float32).alias(out)), params
         if q_high <= q_low:
             q_high = q_low + 1e-6
         params = {"q_low": q_low, "q_high": q_high}
     else:
+        if not params or params.get("skipped"):
+            logging.warning("minmax_scale: column %s marked skipped; filling _mm with 0.0", col)
+            return df.with_columns(pl.lit(0.0).cast(pl.Float32).alias(out)), params or {"skipped": True}
         q_low, q_high = params["q_low"], params["q_high"]
 
     expr = (

@@ -28,19 +28,21 @@ High-level behaviour:
     • Run Pillar 4 live (regime detection).
     • Run Pillar 1 live (entry model).
     • Run Pillar 2 live (exit model).
-    • Run Pillar 3 + Pillar 5 live on the latest row only (sizing + execution).
+    • Run Pillar 3 risk engine (p3_engine) on latest row, then Pillar 6 safety,
+      then Pillar 5 execution engine, and log via Pillar 7 monitoring.
     • Trim key downstream parquet files to LOOKBACK_MINUTES rows.
     • Append the latest Pillar 5 row to a rolling log parquet.
 
 The loop runs indefinitely, aligned to minute boundaries.
 """
 
+import importlib.util
 import logging
 import sys
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Callable, Any, List
+from typing import Callable, Any, List, Optional, Dict
 
 import pandas as pd
 
@@ -48,7 +50,7 @@ import pandas as pd
 # Config
 # ---------------------------------------------------------------------
 # Change to 1440 for 1-day lookback in production
-LOOKBACK_MINUTES = 1440
+LOOKBACK_MINUTES = 5
 
 MAX_RETRIES = 3
 MAX_PRE_P4_TOPUPS = 5  # safety cap when trying to catch up to latest closed minute
@@ -65,6 +67,20 @@ NORM_PATH = PRE_P4_DIR / "normalised_features.parquet"
 
 LOG_PATH = RUN_PROCESSED / "live_combined_log.parquet"
 
+# Base pillar modules (non-live)
+P3_ENGINE_PATH = BASE_DIR / "PILLAR_THREE_RISK_MODEL" / "src" / "pipeline" / "p3_engine.py"
+P5_ENGINE_PATH = BASE_DIR / "PILLAR_FIVE_EXECUTION_ENGINE" / "src" / "execution" / "execution_engine.py"
+P6_ENGINE_PATH = BASE_DIR / "PILLAR_SIX_SAFETY_LAYER" / "src" / "safety" / "safety_engine.py"
+P7_MONITORING_PATH = BASE_DIR / "PILLAR_SEVEN_MONITORING" / "monitoring.py"
+P7_ROOT = RUN_PROCESSED / "PILLAR_SEVEN_MONITORING"
+
+# Downstream outputs
+P1_FINAL = RUN_PROCESSED / "PILLAR_ONE_ENTRY_MODEL" / "features_pillar1_final.parquet"
+P2_FINAL = RUN_PROCESSED / "PILLAR_TWO_EXIT_MODEL" / "exit_final_targets.parquet"
+P4_DET = RUN_PROCESSED / "PILLAR_FOUR_REGIME_DETECTION" / "deterministic_regime_engines.parquet"
+P3_OUT = RUN_PROCESSED / "PILLAR_THREE_RISK_MODEL" / "risk_intents.parquet"
+P5_OUT = RUN_PROCESSED / "PILLAR_FIVE_EXECUTION_ENGINE" / "execution_plans.parquet"
+
 # ---------------------------------------------------------------------
 # Import wiring for all live modules
 # ---------------------------------------------------------------------
@@ -74,14 +90,32 @@ SRC_DIRS: List[Path] = [
     THIS_DIR / "PILLAR_FOUR_REGIME_DETECTION_LIVE",
     THIS_DIR / "PILLAR_ONE_ENTRY_MODEL_LIVE",
     THIS_DIR / "PILLAR_TWO_EXIT_MODEL_LIVE",
-    THIS_DIR / "PILLAR_THREE_RISK_MODEL_LIVE",
-    THIS_DIR / "PILLAR_FIVE_EXECUTION_ENGINE_LIVE",
 ]
 
 for p in SRC_DIRS:
     ps = str(p)
     if ps not in sys.path:
         sys.path.append(ps)
+
+
+def _load_module(name: str, path: Path):
+    if not path.exists():
+        raise FileNotFoundError(f"Module path missing: {path}")
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load module {name} from {path}")
+    module = importlib.util.module_from_spec(spec)
+    # Ensure dataclasses can resolve module references during import.
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+# Base pillar modules (loaded by path to avoid import collisions)
+p3_engine = _load_module("p3_engine", P3_ENGINE_PATH)
+p5_engine_mod = _load_module("p5_engine", P5_ENGINE_PATH)
+p6_engine_mod = _load_module("p6_engine", P6_ENGINE_PATH)
+p7_monitoring = _load_module("p7_monitoring", P7_MONITORING_PATH)
 
 # Raw / rollups
 import delta_and_micro
@@ -129,23 +163,14 @@ from PILLAR_TWO_EXIT_MODEL_LIVE import (
     build_exit_final_targets_live,
 )
 
-# Pillar 3 live
-from PILLAR_THREE_RISK_MODEL_LIVE import build_position_sizing_live
-
-# Pillar 5 live
-from PILLAR_FIVE_EXECUTION_ENGINE_LIVE import build_execution_plans_live
-
-# NEW: Trade execution wiring (Binance demo futures)
-from the_executor import execute_latest_plan
 
 # ---------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------
-def _run_with_retries(func: Callable[[], Any], name: str) -> None:
+def _run_with_retries(func: Callable[[], Any], name: str) -> Any:
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            func()
-            return
+            return func()
         except Exception as exc:  # noqa: BLE001
             logging.exception(
                 "Stage %s failed (attempt %d/%d): %s",
@@ -217,6 +242,112 @@ def _log_latest_p5(p5_path: Path) -> None:
     logging.info("Appended latest Pillar5 row to log (%s)", LOG_PATH)
 
 
+def _load_latest_row(path: Path, time_col: str = "open_time_ms") -> Optional[pd.Series]:
+    if not path.exists():
+        return None
+    df = pd.read_parquet(path)
+    if df.empty:
+        return None
+    if time_col in df.columns:
+        df = df.sort_values(time_col)
+    return df.iloc[-1]
+
+
+def _append_or_replace_by_open_time(path: Path, row: Dict[str, Any], time_col: str = "open_time_ms") -> None:
+    df_new = pd.DataFrame([row])
+    if path.exists():
+        df = pd.read_parquet(path)
+        if time_col in df.columns and time_col in df_new.columns:
+            df = df[df[time_col] != df_new.iloc[0][time_col]]
+        df = pd.concat([df, df_new], ignore_index=True)
+    else:
+        df = df_new
+    if time_col in df.columns:
+        df = df.sort_values(time_col)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(path, index=False)
+
+
+def _first_present(row: Dict[str, Any] | pd.Series, keys: List[str], default: Any = None) -> Any:
+    for k in keys:
+        if k in row and not pd.isna(row[k]):
+            return row[k]
+    return default
+
+
+def _build_market_snapshot(p5_exec: Any, p1_row: pd.Series, spread_bps_hint: Optional[float]) -> Any:
+    snap = p5_exec.market.snapshot()
+    best_bid = snap.get("best_bid")
+    best_ask = snap.get("best_ask")
+    mid = snap.get("mid")
+    spread_bps = snap.get("spread_bps")
+
+    if (best_bid is None or best_ask is None) and hasattr(p5_exec, "client"):
+        try:
+            ticker = p5_exec.client.get_book_ticker(str(_first_present(p1_row, ["symbol"], "BTCUSDT")))
+            best_bid = float(ticker.get("bidPrice", best_bid or 0))
+            best_ask = float(ticker.get("askPrice", best_ask or 0))
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("P5 book ticker fallback failed: %s", exc)
+
+    if mid is None and best_bid is not None and best_ask is not None and best_bid > 0 and best_ask > 0:
+        mid = (best_bid + best_ask) / 2.0
+    if spread_bps is None and mid and best_bid is not None and best_ask is not None:
+        spread_bps = ((best_ask - best_bid) / mid) * 1e4
+    if spread_bps is None and spread_bps_hint is not None:
+        spread_bps = float(spread_bps_hint)
+
+    if mid is None:
+        mid = float(_first_present(p1_row, ["close", "open"], 0.0))
+    if best_bid is None:
+        best_bid = float(mid)
+    if best_ask is None:
+        best_ask = float(mid)
+    if spread_bps is None:
+        spread_bps = 0.0
+
+    close = float(_first_present(p1_row, ["close"], 0.0))
+    atr = float(_first_present(p1_row, ["vol_atr_14", "atr_14"], 0.0))
+    volatility_bps = (atr / close * 1e4) if close > 0 else 0.0
+
+    return p6_engine_mod.MarketMicroSnapshot(
+        ts_ms=int(time.time() * 1000),
+        best_bid=float(best_bid),
+        best_ask=float(best_ask),
+        mid=float(mid),
+        spread_bps=float(spread_bps),
+        volatility_bps=float(volatility_bps),
+    )
+
+
+def _build_p5_intent(p3_row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "open_time_ms": int(p3_row.get("open_time_ms")),
+        "symbol": str(p3_row.get("symbol", "BTCUSDT")),
+        "side": str(p3_row.get("side", "")).lower(),
+        "position_size": float(p3_row.get("final_position_size", 0.0)),
+        "leverage_to_apply": int(round(float(p3_row.get("leverage_to_apply", 1)))),
+        "tp_price": float(p3_row.get("tp_price", 0.0)),
+        "stop_price": float(p3_row.get("sl_price", p3_row.get("stop_price", 0.0))),
+        "max_fill_spread_bps": float(p3_row.get("max_fill_spread_bps", 0.0)),
+        "max_chase_bps": float(p3_row.get("max_chase_bps", 0.0)),
+        "time_budget_ms": int(p3_row.get("time_budget_ms", 0)),
+        "risk_mode": str(p3_row.get("risk_mode", "normal")),
+        "allowed_to_trade": bool(p3_row.get("allowed_to_trade", True)),
+        "veto_reason": str(p3_row.get("veto_reason", "")),
+        "execute": int(p3_row.get("execute", 1)),
+    }
+
+
+def _log_event_safe(logger: Optional[Any], **kwargs: Any) -> None:
+    if logger is None:
+        return
+    try:
+        logger.log_event(**kwargs)
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("P7 log_event failed: %s", exc)
+
+
 def _sleep_until_next_minute() -> None:
     """
     Sleep until the next whole-minute boundary (UTC).
@@ -275,9 +406,7 @@ def run_preload_full_window(end_ms: int, lookback_minutes: int) -> None:
     # 3) Build trades + microstructure using the *fresh* candles file
     _run_with_retries(delta_and_micro.main, "delta_and_micro")
 
-    # 4) Aggregate trades as needed
     _run_with_retries(trade_aggregator.main, "trade_aggregator")
-
 
 def run_preload_incremental(end_ms: int, lookback_minutes: int) -> None:
     """
@@ -509,29 +638,158 @@ def run_p2_live() -> None:
     _run_with_retries(build_exit_final_targets_live.main, "build_exit_final_targets_live")
 
 
-def run_p3_p5_live() -> None:
+def run_p3_p5_p6_p7(
+    p5_exec: Any,
+    p6_safety: Optional[Any],
+    p7_logger: Optional[Any],
+) -> None:
     """
-    For sizing & execution we deliberately use only the latest bar from
-    Pillar 2 final targets, and propagate that through to execution_plans.
+    Pillar 3 (risk) -> Pillar 6 (safety) -> Pillar 5 (execution) -> Pillar 7 (monitoring).
+    P3 selects the latest open_time_ms internally and aligns P2/P4 to it.
     """
-    p2_final = RUN_PROCESSED / "PILLAR_TWO_EXIT_MODEL" / "exit_final_targets.parquet"
-    _keep_latest_only(p2_final, "open_time_ms")
+    def _run_p3():
+        return p3_engine.run_pillar3(
+            p1_path=P1_FINAL,
+            p2_path=P2_FINAL,
+            p4_path=P4_DET,
+            out_path=P3_OUT,
+            live_account=True,
+            live_spread=True,
+        )
 
-    _run_with_retries(build_position_sizing_live.main, "build_position_sizing_live")
+    p3_row = _run_with_retries(_run_p3, "p3_engine")
+    if not p3_row:
+        raise RuntimeError("P3 returned empty risk intent.")
 
-    p2_with_sizing = RUN_PROCESSED / "PILLAR_TWO_EXIT_MODEL" / "exit_with_sizing.parquet"
-    _keep_latest_only(p2_with_sizing, "open_time_ms")
+    p5_intent = _build_p5_intent(p3_row)
+    trade_intent_id = f"{p5_intent['symbol']}_1m_{p5_intent['open_time_ms']}_{p5_intent['side']}"
+    decision_id = f"{p5_intent['symbol']}_1m_{p5_intent['open_time_ms']}"
 
-    _run_with_retries(build_execution_plans_live.main, "build_execution_plans_live")
+    _log_event_safe(
+        p7_logger,
+        event_type="P3_RISK_INTENT",
+        symbol=p5_intent["symbol"],
+        trade_intent_id=trade_intent_id,
+        decision_id=decision_id,
+        source="P3",
+        payload=p3_row,
+    )
 
-    p5_exec = RUN_PROCESSED / "PILLAR_FIVE_EXECUTION_ENGINE" / "execution_plans.parquet"
-    _keep_latest_only(p5_exec, "open_time_ms")
+    execute = (
+        p5_intent["execute"] == 1
+        and p5_intent["allowed_to_trade"]
+        and p5_intent["position_size"] > 0
+    )
+    p6_reason = ""
 
-    # NEW: actually send the trade to Binance demo futures
+    if execute and p6_safety is not None:
+        p1_row = _load_latest_row(P1_FINAL)
+        if p1_row is None:
+            logging.warning("P6 skipped: missing P1 final row.")
+        else:
+            market = _build_market_snapshot(
+                p5_exec,
+                p1_row,
+                spread_bps_hint=p3_row.get("spread_bps_used"),
+            )
+            entry_conf = p1_row.get("entry_confidence")
+            try:
+                entry_conf = float(entry_conf) if entry_conf is not None else None
+            except Exception:
+                entry_conf = None
+
+            entry_ref = p3_row.get("entry_ref_price")
+            try:
+                entry_ref = float(entry_ref) if entry_ref is not None else None
+            except Exception:
+                entry_ref = None
+
+            sl_dist = p3_row.get("sl_distance_abs")
+            try:
+                sl_dist = float(sl_dist) if sl_dist is not None else None
+            except Exception:
+                sl_dist = None
+
+            tp_dist = None
+            if entry_ref is not None:
+                try:
+                    tp_dist = abs(float(p5_intent["tp_price"]) - float(entry_ref))
+                except Exception:
+                    tp_dist = None
+
+            intent = p6_engine_mod.RiskIntent(
+                side=p5_intent["side"],
+                final_position_size=p5_intent["position_size"],
+                leverage_to_apply=p5_intent["leverage_to_apply"],
+                risk_mode=p5_intent.get("risk_mode", "normal"),
+                max_fill_spread_bps=p5_intent["max_fill_spread_bps"],
+                max_chase_bps=p5_intent["max_chase_bps"],
+                time_budget_ms=p5_intent["time_budget_ms"],
+                tp_price=p5_intent["tp_price"],
+                sl_price=p5_intent["stop_price"],
+                entry_ref_price=entry_ref,
+                sl_distance_abs=sl_dist,
+                tp_distance_abs=tp_dist,
+                entry_confidence=entry_conf,
+                open_time_ms=p5_intent["open_time_ms"],
+            )
+            decision = p6_safety.pre_trade_check(intent, market)
+            if not decision.allowed:
+                execute = False
+                p6_reason = decision.reason
+            else:
+                if decision.forced_max_chase_bps is not None:
+                    p5_intent["max_chase_bps"] = float(decision.forced_max_chase_bps)
+                if decision.forced_time_budget_ms is not None:
+                    p5_intent["time_budget_ms"] = int(decision.forced_time_budget_ms)
+
+            _log_event_safe(
+                p7_logger,
+                event_type="P6_VETO" if not decision.allowed else "P6_ALLOW",
+                symbol=p5_intent["symbol"],
+                trade_intent_id=trade_intent_id,
+                decision_id=decision_id,
+                source="P6",
+                payload={
+                    "allowed": decision.allowed,
+                    "reason": decision.reason,
+                    **(decision.metadata or {}),
+                },
+            )
+
+    p5_intent["execute"] = 1 if execute else 0
+    if p6_reason:
+        p5_intent["p6_reason"] = p6_reason
+
+    _append_or_replace_by_open_time(P5_OUT, p5_intent)
+
+    if not execute:
+        logging.info("Execution skipped (execute=0).")
+        return
+
+    # Execute via Pillar 5 engine
     try:
-        execute_latest_plan(p5_exec)
+        res = p5_exec.execute_intent(p5_intent)
+        _log_event_safe(
+            p7_logger,
+            event_type="P5_EXECUTION",
+            symbol=p5_intent["symbol"],
+            trade_intent_id=trade_intent_id,
+            decision_id=decision_id,
+            source="P5",
+            payload=res,
+        )
     except Exception as exc:  # noqa: BLE001
-        logging.exception("Live trade execution failed: %s", exc)
+        logging.exception("P5 execution failed: %s", exc)
+        _log_event_safe(
+            p7_logger,
+            event_type="P5_EXECUTION_FAIL",
+            symbol=p5_intent["symbol"],
+            trade_intent_id=trade_intent_id,
+            decision_id=decision_id,
+            source="P5",
+            payload={"error": str(exc)},
+        )
 
 
 # ---------------------------------------------------------------------
@@ -543,60 +801,62 @@ def main() -> None:
         format="%(asctime)s | %(levelname)s | %(message)s",
     )
 
+    p5_exec = p5_engine_mod.Pillar5ExecutionEngine()
+    p5_exec.start(use_websocket=True)
+
+    p6_safety = None
+    try:
+        p6_safety = p6_engine_mod.Pillar6Safety()
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("P6 safety init failed; skipping safety layer. %s", exc)
+
+    p7_logger = p7_monitoring.EventLogger(
+        p7_monitoring.Pillar7Config(root_dir=P7_ROOT)
+    )
+
     first_run = True
 
-    while True:
-        loop_start = time.time()
-        print("=== Live pipeline loop start ===")
+    try:
+        while True:
+            loop_start = time.time()
+            print("=== Live pipeline loop start ===")
 
-        # 1) Ensure Pre-Pillar4 has the latest closed minute (full normalised window)
-        ensure_pre_p4_current(initial=first_run)
-        first_run = False
+            # 1) Ensure Pre-Pillar4 has the latest closed minute (full normalised window)
+            ensure_pre_p4_current(initial=first_run)
+            first_run = False
 
-        # 2) Pillar 4 (regime detection)
-        run_p4_live()
+            # 2) Pillar 4 (regime detection)
+            run_p4_live()
 
-        # 3) Pillar 1 (entry model)
-        run_p1_live()
+            # 3) Pillar 1 (entry model)
+            run_p1_live()
 
-        # 4) Pillar 2 (exit model)
-        run_p2_live()
+            # 4) Pillar 2 (exit model)
+            run_p2_live()
 
-        # 5) Pillar 3 & 5 (sizing + execution, latest row only)
-        run_p3_p5_live()
+            # 5) Pillar 3 -> Pillar 6 -> Pillar 5 -> Pillar 7
+            run_p3_p5_p6_p7(
+                p5_exec=p5_exec,
+                p6_safety=p6_safety,
+                p7_logger=p7_logger,
+            )
 
-        # 6) Trim key parquets to rolling window
-        _trim_parquet(
-            RUN_PROCESSED / "PILLAR_ONE_ENTRY_MODEL" / "features_pillar1_final.parquet",
-            "open_time_ms",
-            LOOKBACK_MINUTES,
-        )
-        _trim_parquet(
-            RUN_PROCESSED / "PILLAR_TWO_EXIT_MODEL" / "exit_final_targets.parquet",
-            "open_time_ms",
-            LOOKBACK_MINUTES,
-        )
-        _trim_parquet(
-            RUN_PROCESSED / "PILLAR_TWO_EXIT_MODEL" / "exit_with_sizing.parquet",
-            "open_time_ms",
-            LOOKBACK_MINUTES,
-        )
-        _trim_parquet(
-            RUN_PROCESSED / "PILLAR_FIVE_EXECUTION_ENGINE" / "execution_plans.parquet",
-            "open_time_ms",
-            LOOKBACK_MINUTES,
-        )
+            # 6) Trim key parquets to rolling window
+            _trim_parquet(P1_FINAL, "open_time_ms", LOOKBACK_MINUTES)
+            _trim_parquet(P2_FINAL, "open_time_ms", LOOKBACK_MINUTES)
+            _trim_parquet(P3_OUT, "open_time_ms", LOOKBACK_MINUTES)
+            _trim_parquet(P5_OUT, "open_time_ms", LOOKBACK_MINUTES)
 
-        # 7) Log latest P5 row
-        _log_latest_p5(
-            RUN_PROCESSED / "PILLAR_FIVE_EXECUTION_ENGINE" / "execution_plans.parquet"
-        )
+            # 7) Log latest P5 row
+            _log_latest_p5(P5_OUT)
 
-        loop_dur = time.time() - loop_start
-        print(f"=== Live pipeline loop complete in {loop_dur:.1f}s ===")
+            loop_dur = time.time() - loop_start
+            print(f"=== Live pipeline loop complete in {loop_dur:.1f}s ===")
 
-        # 8) Wait for next whole-minute boundary
-        _sleep_until_next_minute()
+            # 8) Wait for next whole-minute boundary
+            _sleep_until_next_minute()
+    finally:
+        p5_exec.stop()
 
 
 if __name__ == "__main__":
