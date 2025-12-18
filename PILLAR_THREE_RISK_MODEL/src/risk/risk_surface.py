@@ -18,6 +18,14 @@ Pillar 2 + backtest behaviour:
   - Leverage governor is nudged in the same direction: low-vol regimes
     get a mild cut, clearly positive volatility_score regimes get a
     mild boost, all within hard leverage caps.
+
+IMPORTANT FIX:
+This version computes:
+  - position_notional = USDT notional to deploy
+  - position_size     = base-asset quantity (e.g., BTC)
+  - position_leverage = leverage to apply (separate from size)
+
+Your previous version effectively did: position_size = leverage, which is wrong.
 """
 
 import logging
@@ -50,8 +58,6 @@ class RiskSurfaceConfig:
     liq_drought_multiplier: float = 0.3  # extra cut in liq drought regime
 
     # Volatility score weighting (used in 5.4)
-    # NOTE: positive volatility_score is empirically good for this system
-    # (higher mean returns), so we now map higher scores → larger size.
     vol_score_weight: float = 0.2
 
     # Exit-time & MFE scaling
@@ -107,11 +113,8 @@ class RiskSurfaceConfig:
     col_valid_flag: str = "signal_is_valid"
 
     # Pillar 2 system filter
-    # By default, Pillar 3 *gates* by system_filter_v1 to mirror the
-    # system_backtest pipeline.
     col_system_filter: str = "system_filter_v1"
     use_system_filter_as_gate: bool = True
-    # If gate is off, we can still downweight non-system trades:
     non_system_risk_downscale: float = 0.2  # 20% of baseline risk
 
     # Signal-aligned scaling (5.5)
@@ -123,6 +126,12 @@ class RiskSurfaceConfig:
     col_meta_trend_align: str = "meta_regime_trend_confirmation"
     col_breakout_prob_up: str = "breakout_prob_up"
     col_mean_reversion_prob_up: str = "mean_reversion_prob_up"
+
+    # --- NEW: equity + leverage target (so sizing becomes % of funds) ---
+    capital_base_usdt: float = 1000.0      # default if you don't have live equity column yet
+    target_leverage: float = 5.0           # baseline leverage to apply (before multipliers)
+    max_margin_frac: float = 0.90          # don't allocate 100% of margin
+    col_equity_usdt: str = "equity_usdt"   # optional: populate this in live runner
 
     # Numerical stability
     eps: float = 1e-8
@@ -162,7 +171,6 @@ def _compute_volatility_size_multiplier(
     n = len(df_active)
     eps = cfg.eps
 
-    # --- volatility_score component ---
     if cfg.col_volatility_score in df_active.columns:
         vol_score = pd.to_numeric(
             df_active[cfg.col_volatility_score], errors="coerce"
@@ -172,7 +180,6 @@ def _compute_volatility_size_multiplier(
     else:
         vol_component = np.ones(n, dtype=float)
 
-    # --- expected_exit_time component ---
     if cfg.col_exit_time in df_active.columns:
         t = pd.to_numeric(df_active[cfg.col_exit_time], errors="coerce")
         t_clip = t.clip(cfg.exit_time_floor, cfg.exit_time_cap)
@@ -180,7 +187,6 @@ def _compute_volatility_size_multiplier(
     else:
         time_component = np.ones(n, dtype=float)
 
-    # --- MFE variance proxy component (mfe_dir^2) ---
     if cfg.col_mfe_dir in df_active.columns:
         mfe = pd.to_numeric(df_active[cfg.col_mfe_dir], errors="coerce").fillna(0.0)
         mfe_var_proxy = mfe ** 2
@@ -189,7 +195,6 @@ def _compute_volatility_size_multiplier(
     else:
         mfe_component = np.ones(n, dtype=float)
 
-    # --- SL risk factor from Pillar 2 ---
     if cfg.col_sl_risk_factor in df_active.columns:
         sl_rf = pd.to_numeric(
             df_active[cfg.col_sl_risk_factor], errors="coerce"
@@ -217,14 +222,12 @@ def _compute_signal_alignment_multiplier(
     """
     idx = df_active.index
     n = len(df_active)
-    eps = cfg.eps
 
     direction = pd.to_numeric(
         df_active.get(cfg.col_direction, 0.0), errors="coerce"
     ).fillna(0.0)
     sign_dir = np.sign(direction.to_numpy(dtype=float))
 
-    # --- Directional entry probability ---
     p_dir = np.full(n, 0.5, dtype=float)
     if (
         cfg.col_entry_prob_up in df_active.columns
@@ -238,7 +241,6 @@ def _compute_signal_alignment_multiplier(
     prob_component = 2.0 * (p_dir - 0.5) + 1.0
     prob_component = np.clip(prob_component, 0.2, 2.0)
 
-    # --- Engine agreement vs conflict ---
     if cfg.col_meta_agreement in df_active.columns:
         agree = pd.to_numeric(
             df_active[cfg.col_meta_agreement], errors="coerce"
@@ -258,7 +260,6 @@ def _compute_signal_alignment_multiplier(
     else:
         conf_component = np.ones(n, dtype=float)
 
-    # --- Trend alignment ---
     if cfg.col_trend_score in df_active.columns:
         trend = pd.to_numeric(
             df_active[cfg.col_trend_score], errors="coerce"
@@ -282,7 +283,6 @@ def _compute_signal_alignment_multiplier(
     else:
         trend_component = np.ones(n, dtype=float)
 
-    # --- Breakout vs mean-reversion weighting ---
     if (
         cfg.col_breakout_prob_up in df_active.columns
         and cfg.col_mean_reversion_prob_up in df_active.columns
@@ -334,7 +334,6 @@ def _compute_regime_multiplier(
 
     mult = np.ones(n, dtype=float)
 
-    # Base flags
     trend = pd.to_numeric(
         df_active.get(cfg.col_regime_trend_flag, 0.0), errors="coerce"
     ).fillna(0.0)
@@ -360,11 +359,7 @@ def _compute_regime_multiplier(
         vol_compress_flag = np.zeros(n, dtype=float)
 
     mult = np.where(chop > 0.5, mult * 0.4, mult)
-    mult = np.where(
-        (trend > 0.5) & (chop <= 0.5),
-        mult * 1.2,
-        mult,
-    )
+    mult = np.where((trend > 0.5) & (chop <= 0.5), mult * 1.2, mult)
     mult = np.where(mean_rev > 0.5, mult * 0.8, mult)
     mult = np.where(vol_exp > 0.5, mult * 0.8, mult)
     mult = np.where(vol_compress_flag > 0.5, mult * 0.6, mult)
@@ -415,13 +410,8 @@ def _compute_label_return_for_dd(
     sl = sl_dist.to_numpy(dtype=float)
 
     ret = np.zeros(len(df_active), dtype=float)
-    ret[outcome_arr == "tp_first"] = tp[outcome_arr == "tp_first"] * sign_dir[
-        outcome_arr == "tp_first"
-    ]
-    ret[outcome_arr == "sl_first"] = -sl[outcome_arr == "sl_first"] * sign_dir[
-        outcome_arr == "sl_first"
-    ]
-    # timeout → approx 0
+    ret[outcome_arr == "tp_first"] = tp[outcome_arr == "tp_first"] * sign_dir[outcome_arr == "tp_first"]
+    ret[outcome_arr == "sl_first"] = -sl[outcome_arr == "sl_first"] * sign_dir[outcome_arr == "sl_first"]
 
     return pd.Series(ret, index=df_active.index, dtype="float32")
 
@@ -446,10 +436,7 @@ def _compute_drawdown_multiplier(
         )
 
     if cfg.col_time not in df_active.columns:
-        logging.warning(
-            "[RiskSurface] Drawdown governor: %s missing; using neutral.",
-            cfg.col_time,
-        )
+        logging.warning("[RiskSurface] Drawdown governor: %s missing; using neutral.", cfg.col_time)
         mult = np.ones(n, dtype=float)
         state = np.full(n, "none", dtype=object)
         return (
@@ -465,7 +452,7 @@ def _compute_drawdown_multiplier(
     ret_shifted = np.concatenate([[0.0], ret[:-1]])
     equity = 1.0 + np.cumsum(ret_shifted)
     max_equity = np.maximum.accumulate(equity)
-    dd = equity / np.maximum(max_equity, cfg.eps) - 1.0  # in [-1, 0]
+    dd = equity / np.maximum(max_equity, cfg.eps) - 1.0
 
     mult = np.ones_like(dd)
     state = np.full(dd.shape, "ok", dtype=object)
@@ -484,11 +471,8 @@ def _compute_drawdown_multiplier(
 
     mult = np.clip(mult, cfg.drawdown_mult_min, cfg.drawdown_mult_max)
 
-    dd_mult_series = pd.Series(mult.astype("float32"), index=df_dd.index)
-    dd_state_series = pd.Series(state, index=df_dd.index, dtype="object")
-
-    dd_mult_series = dd_mult_series.reindex(idx)
-    dd_state_series = dd_state_series.reindex(idx)
+    dd_mult_series = pd.Series(mult.astype("float32"), index=df_dd.index).reindex(idx)
+    dd_state_series = pd.Series(state, index=df_dd.index, dtype="object").reindex(idx)
 
     return dd_mult_series, dd_state_series
 
@@ -508,15 +492,11 @@ def _compute_leverage_multiplier(
     n = len(df_active)
 
     if cfg.col_volatility_score in df_active.columns:
-        vol_score = pd.to_numeric(
-            df_active[cfg.col_volatility_score], errors="coerce"
-        ).fillna(0.0)
+        vol_score = pd.to_numeric(df_active[cfg.col_volatility_score], errors="coerce").fillna(0.0)
     else:
         vol_score = pd.Series(np.zeros(n, dtype=float), index=idx)
 
-    vol_exp = pd.to_numeric(
-        df_active.get(cfg.col_regime_vol_expansion_flag, 0.0), errors="coerce"
-    ).fillna(0.0)
+    vol_exp = pd.to_numeric(df_active.get(cfg.col_regime_vol_expansion_flag, 0.0), errors="coerce").fillna(0.0)
 
     mult = np.ones(n, dtype=float)
 
@@ -539,46 +519,25 @@ def _compute_exposure_cap_multiplier(
 ) -> pd.Series:
     """
     Exposure cap multiplier (per trade).
-
-    NOTE:
-      - In backtest mode, this uses recent trade directions to gently
-        cut size when you're heavily one-sided.
-      - In live mode, if we only see a handful of trades (or just one),
-        we return a neutral multiplier = 1.0 to avoid false "one-sided"
-        cuts from degenerate history.
     """
     idx = df_active.index
     n = len(df_active)
 
-    if (
-        n == 0
-        or cfg.col_time not in df_active.columns
-        or cfg.col_direction not in df_active.columns
-    ):
-        return pd.Series(
-            np.ones(n, dtype="float32"),
-            index=idx,
-        )
+    if n == 0 or cfg.col_time not in df_active.columns or cfg.col_direction not in df_active.columns:
+        return pd.Series(np.ones(n, dtype="float32"), index=idx)
 
-    # If there isn't enough history, don't second-guess exposure here.
-    # Pillar 5 can still enforce true portfolio-level caps.
     min_history = 50
     if n < min_history:
-        return pd.Series(
-            np.ones(n, dtype="float32"),
-            index=idx,
-        )
+        return pd.Series(np.ones(n, dtype="float32"), index=idx)
 
-    df_exp = df_active[[cfg.col_time, cfg.col_direction]].copy()
-    df_exp = df_exp.sort_values(cfg.col_time)
+    df_exp = df_active[[cfg.col_time, cfg.col_direction]].copy().sort_values(cfg.col_time)
 
     direction = pd.to_numeric(df_exp[cfg.col_direction], errors="coerce").fillna(0.0)
     sign_dir = np.sign(direction.to_numpy(dtype=float))
 
-    window = 200
-    window = min(window, n)
+    window = min(200, n)
     rolling_mean = pd.Series(sign_dir).rolling(window=window, min_periods=window).mean()
-    skew = rolling_mean.to_numpy(dtype=float)  # in [-1, 1]
+    skew = rolling_mean.to_numpy(dtype=float)
 
     mult = np.ones_like(skew)
     mult[np.abs(skew) > 0.7] = 0.6
@@ -586,10 +545,7 @@ def _compute_exposure_cap_multiplier(
 
     mult = np.clip(mult, cfg.exposure_mult_min, cfg.exposure_mult_max)
 
-    mult_series = pd.Series(mult.astype("float32"), index=df_exp.index)
-    mult_series = mult_series.reindex(idx)
-
-    return mult_series
+    return pd.Series(mult.astype("float32"), index=df_exp.index).reindex(idx)
 
 
 # ---------------------------------------------------------------------
@@ -611,12 +567,7 @@ def compute_risk_surface_and_sizing(
 
     _require_cols(
         df,
-        [
-            cfg.col_decision,
-            cfg.col_direction,
-            cfg.col_entry_price,
-            cfg.col_sl_level,
-        ],
+        [cfg.col_decision, cfg.col_direction, cfg.col_entry_price, cfg.col_sl_level],
         context="base P3 sizing",
     )
 
@@ -671,14 +622,10 @@ def compute_risk_surface_and_sizing(
     df_active = df.loc[active_mask].copy()
 
     # 5.3 Risk surface: SL distance, vol_factor, liq_factor
-    entry_price = pd.to_numeric(
-        df_active[cfg.col_entry_price], errors="coerce"
-    ).astype(float)
+    entry_price = pd.to_numeric(df_active[cfg.col_entry_price], errors="coerce").astype(float)
     sl_level = pd.to_numeric(df_active[cfg.col_sl_level], errors="coerce").astype(float)
 
-    sl_distance = np.abs(sl_level - entry_price) / np.clip(
-        entry_price.abs(), cfg.eps, np.inf
-    )
+    sl_distance = np.abs(sl_level - entry_price) / np.clip(entry_price.abs(), cfg.eps, np.inf)
     sl_distance = sl_distance.clip(lower=cfg.min_sl_distance)
 
     df["sl_distance"] = np.nan
@@ -689,13 +636,9 @@ def compute_risk_surface_and_sizing(
         atr_pct = atr / np.clip(entry_price.abs(), cfg.eps, np.inf)
         med_atr_pct = _nanmedian_safe(atr_pct, fallback=0.005)
         atr_norm = (atr_pct / (med_atr_pct + cfg.eps)).clip(0.1, 10.0)
-        vol_factor = (1.0 / np.sqrt(atr_norm)).clip(
-            cfg.vol_factor_min, cfg.vol_factor_max
-        )
+        vol_factor = (1.0 / np.sqrt(atr_norm)).clip(cfg.vol_factor_min, cfg.vol_factor_max)
     else:
-        logging.warning(
-            "[RiskSurface] ATR column %s missing; using vol_factor=1.0.", cfg.col_atr
-        )
+        logging.warning("[RiskSurface] ATR column %s missing; using vol_factor=1.0.", cfg.col_atr)
         vol_factor = np.ones(len(df_active), dtype=float)
 
     if cfg.col_volume in df_active.columns:
@@ -704,25 +647,16 @@ def compute_risk_surface_and_sizing(
         vol_norm = (vol / (med_vol + cfg.eps)).clip(0.1, 10.0)
         liq_factor = (np.sqrt(vol_norm)).clip(cfg.liq_factor_min, cfg.liq_factor_max)
     else:
-        logging.warning(
-            "[RiskSurface] Volume column %s missing; using liq_factor=1.0.",
-            cfg.col_volume,
-        )
+        logging.warning("[RiskSurface] Volume column %s missing; using liq_factor=1.0.", cfg.col_volume)
         liq_factor = np.ones(len(df_active), dtype=float)
 
     if cfg.col_regime_liq_drought_flag in df_active.columns:
-        liq_drought_flag = pd.to_numeric(
-            df_active[cfg.col_regime_liq_drought_flag], errors="coerce"
-        ).fillna(0.0)
+        liq_drought_flag = pd.to_numeric(df_active[cfg.col_regime_liq_drought_flag], errors="coerce").fillna(0.0)
         drought_arr = liq_drought_flag.to_numpy(dtype=float)
-        liq_factor = liq_factor * np.where(
-            drought_arr > 0, cfg.liq_drought_multiplier, 1.0
-        )
+        liq_factor = liq_factor * np.where(drought_arr > 0, cfg.liq_drought_multiplier, 1.0)
 
     baseline_risk = cfg.max_risk_pct * vol_factor * liq_factor
-    baseline_risk = np.clip(
-        baseline_risk, cfg.min_risk_pct, cfg.max_risk_pct * 1.5
-    )
+    baseline_risk = np.clip(baseline_risk, cfg.min_risk_pct, cfg.max_risk_pct * 1.5)
 
     if (system_filter is not None) and (not cfg.use_system_filter_as_gate):
         sf_arr = system_filter.loc[df_active.index].to_numpy(dtype=bool)
@@ -733,9 +667,7 @@ def compute_risk_surface_and_sizing(
     regime_mult = _compute_regime_multiplier(df_active, cfg)
 
     label_return = _compute_label_return_for_dd(df_active, cfg)
-    drawdown_mult, drawdown_state = _compute_drawdown_multiplier(
-        df_active, label_return, cfg
-    )
+    drawdown_mult, drawdown_state = _compute_drawdown_multiplier(df_active, label_return, cfg)
 
     leverage_mult = _compute_leverage_multiplier(df_active, cfg)
     exposure_mult = _compute_exposure_cap_multiplier(df_active, cfg)
@@ -751,33 +683,38 @@ def compute_risk_surface_and_sizing(
 
     combined_mult = np.clip(
         combined_mult,
-        cfg.vol_size_mult_min
-        * cfg.signal_mult_min
-        * cfg.regime_mult_min
-        * cfg.drawdown_mult_min
-        * cfg.leverage_mult_min
-        * cfg.exposure_mult_min,
-        cfg.vol_size_mult_max
-        * cfg.signal_mult_max
-        * cfg.regime_mult_max
-        * cfg.drawdown_mult_max
-        * cfg.leverage_mult_max
-        * cfg.exposure_mult_max,
+        cfg.vol_size_mult_min * cfg.signal_mult_min * cfg.regime_mult_min * cfg.drawdown_mult_min * cfg.leverage_mult_min * cfg.exposure_mult_min,
+        cfg.vol_size_mult_max * cfg.signal_mult_max * cfg.regime_mult_max * cfg.drawdown_mult_max * cfg.leverage_mult_max * cfg.exposure_mult_max,
     )
 
     raw_risk_frac = baseline_risk * combined_mult
-    risk_per_trade_frac = np.clip(
-        raw_risk_frac, cfg.min_risk_pct, cfg.max_risk_pct
-    )
+    risk_per_trade_frac = np.clip(raw_risk_frac, cfg.min_risk_pct, cfg.max_risk_pct)
+
+    # -------------------- FIXED SIZING (initial) --------------------
+    if cfg.col_equity_usdt in df_active.columns:
+        equity_usdt = pd.to_numeric(df_active[cfg.col_equity_usdt], errors="coerce").fillna(cfg.capital_base_usdt)
+    else:
+        equity_usdt = pd.Series(cfg.capital_base_usdt, index=df_active.index, dtype=float)
+    equity_arr = equity_usdt.to_numpy(dtype=float)
+
+    risk_usdt = equity_arr * risk_per_trade_frac
 
     sl_dist_arr = sl_distance.to_numpy(dtype=float)
-    position_notional = risk_per_trade_frac / np.clip(
-        sl_dist_arr, cfg.min_sl_distance, np.inf
-    )
-    position_leverage = np.clip(position_notional, 0.0, cfg.max_leverage)
+    position_notional = risk_usdt / np.clip(sl_dist_arr, cfg.min_sl_distance, np.inf)  # USDT notional
 
-    position_notional = position_leverage
-    position_size = position_notional
+    position_leverage = np.clip(
+        float(cfg.target_leverage) * leverage_mult.to_numpy(dtype=float),
+        1.0,
+        cfg.max_leverage,
+    )
+
+    max_notional = equity_arr * position_leverage * float(cfg.max_margin_frac)
+    position_notional = np.minimum(position_notional, max_notional)
+
+    entry_px_arr = entry_price.to_numpy(dtype=float)
+    position_size = position_notional / np.clip(entry_px_arr, cfg.eps, np.inf)  # base qty
+
+    # ----------------------------------------------------------------
 
     df["vol_factor"] = np.nan
     df["liq_factor"] = np.nan
@@ -821,15 +758,10 @@ def compute_risk_surface_and_sizing(
 
     risk_mode = np.full(size_vol.shape, "normal", dtype=object)
     dd_state_arr = df.loc[active_mask, "drawdown_state"].to_numpy(dtype=object)
-
     risk_mode[dd_state_arr == "severe"] = "crisis"
 
-    chop_flag = pd.to_numeric(
-        df_active.get(cfg.col_regime_chop_flag, 0.0), errors="coerce"
-    ).fillna(0.0)
-    vol_exp_flag = pd.to_numeric(
-        df_active.get(cfg.col_regime_vol_expansion_flag, 0.0), errors="coerce"
-    ).fillna(0.0)
+    chop_flag = pd.to_numeric(df_active.get(cfg.col_regime_chop_flag, 0.0), errors="coerce").fillna(0.0)
+    vol_exp_flag = pd.to_numeric(df_active.get(cfg.col_regime_vol_expansion_flag, 0.0), errors="coerce").fillna(0.0)
     defensive_mask = (
         (dd_state_arr == "moderate")
         | (chop_flag.to_numpy(dtype=float) > 0.5)
@@ -838,9 +770,7 @@ def compute_risk_surface_and_sizing(
     risk_mode[defensive_mask & (risk_mode != "crisis")] = "defensive"
 
     sig_mult_arr = signal_mult.to_numpy(dtype=float)
-    aggressive_mask = (
-        (sig_mult_arr > 1.3) & (dd_state_arr == "ok") & (size_vol >= 0.9)
-    )
+    aggressive_mask = (sig_mult_arr > 1.3) & (dd_state_arr == "ok") & (size_vol >= 0.9)
     risk_mode[aggressive_mask & (risk_mode == "normal")] = "aggressive"
 
     df.loc[active_mask, "risk_mode"] = risk_mode
@@ -858,35 +788,42 @@ def compute_risk_surface_and_sizing(
     rpt = np.clip(rpt, cfg.min_risk_pct, cfg.max_risk_pct)
     df.loc[active_mask, "risk_per_trade_frac"] = rpt.astype("float32")
 
+    # -------------------- FIXED SIZING (final) --------------------
+    if cfg.col_equity_usdt in df.columns:
+        equity_final = pd.to_numeric(df.loc[active_mask, cfg.col_equity_usdt], errors="coerce").fillna(cfg.capital_base_usdt).to_numpy(dtype=float)
+    else:
+        equity_final = np.full(rpt.shape, float(cfg.capital_base_usdt), dtype=float)
+
+    risk_usdt_final = equity_final * rpt
+
     sl_dist_arr_final = df.loc[active_mask, "sl_distance"].to_numpy(dtype=float)
-    position_notional_final = rpt / np.clip(
-        sl_dist_arr_final, cfg.min_sl_distance, np.inf
-    )
-    position_leverage_final = np.clip(position_notional_final, 0.0, cfg.max_leverage)
-    position_notional_final = position_leverage_final
-    position_size_final = position_notional_final
+    entry_px_arr_final = pd.to_numeric(df.loc[active_mask, cfg.col_entry_price], errors="coerce").to_numpy(dtype=float)
+
+    position_notional_final = risk_usdt_final / np.clip(sl_dist_arr_final, cfg.min_sl_distance, np.inf)
+
+    lev_mult_arr_final = df.loc[active_mask, "leverage_multiplier"].to_numpy(dtype=float)
+    position_leverage_final = np.clip(float(cfg.target_leverage) * lev_mult_arr_final, 1.0, cfg.max_leverage)
+
+    max_notional_final = equity_final * position_leverage_final * float(cfg.max_margin_frac)
+    position_notional_final = np.minimum(position_notional_final, max_notional_final)
+
+    position_size_final = position_notional_final / np.clip(entry_px_arr_final, cfg.eps, np.inf)
 
     df.loc[active_mask, "position_notional"] = position_notional_final.astype("float32")
     df.loc[active_mask, "position_size"] = position_size_final.astype("float32")
     df.loc[active_mask, "position_leverage"] = position_leverage_final.astype("float32")
+    # -------------------------------------------------------------
 
-    pos_risk_score = np.clip(
-        rpt / (cfg.max_risk_pct + cfg.eps),
-        0.0,
-        1.0,
-    )
+    pos_risk_score = np.clip(rpt / (cfg.max_risk_pct + cfg.eps), 0.0, 1.0)
     df.loc[active_mask, "position_risk_score"] = pos_risk_score.astype("float32")
 
     reg_mult_arr = regime_mult.to_numpy(dtype=float)
     dd_mult_arr = drawdown_mult.to_numpy(dtype=float)
-    lev_mult_arr = leverage_mult.to_numpy(dtype=float)
+    lev_mult_arr = df.loc[active_mask, "leverage_multiplier"].to_numpy(dtype=float)
+
     meta = []
-    for sv, sg, rg, ddm, lm in zip(
-        size_vol, sig_mult_arr, reg_mult_arr, dd_mult_arr, lev_mult_arr
-    ):
-        meta.append(
-            f"vol={sv:.2f}|sig={sg:.2f}|reg={rg:.2f}|dd={ddm:.2f}|lev={lm:.2f}"
-        )
+    for sv, sg, rg, ddm, lm in zip(size_vol, sig_mult_arr, reg_mult_arr, dd_mult_arr, lev_mult_arr):
+        meta.append(f"vol={sv:.2f}|sig={sg:.2f}|reg={rg:.2f}|dd={ddm:.2f}|lev={lm:.2f}")
     df.loc[active_mask, "scaling_metadata"] = meta
 
     _log_mem(df, "[RiskSurface] Output trades_df + full P3 sizing")
@@ -902,16 +839,6 @@ def compute_risk_surface_and_sizing(
         "[RiskSurface] risk_per_trade_frac: mean=%.4f, max=%.4f",
         float(df.loc[active_mask, "risk_per_trade_frac"].mean()),
         float(df.loc[active_mask, "risk_per_trade_frac"].max()),
-    )
-    logging.info(
-        "[RiskSurface] size_volatility_multiplier: mean=%.3f, std=%.3f",
-        float(df.loc[active_mask, "size_volatility_multiplier"].mean()),
-        float(df.loc[active_mask, "size_volatility_multiplier"].std()),
-    )
-    logging.info(
-        "[RiskSurface] signal_alignment_multiplier: mean=%.3f, std=%.3f",
-        float(df.loc[active_mask, "signal_alignment_multiplier"].mean()),
-        float(df.loc[active_mask, "signal_alignment_multiplier"].std()),
     )
 
     return df

@@ -12,20 +12,31 @@ It does NOT change:
 Instead, it chooses:
   - order type (limit / market / layered / etc.)
   - price(s)
-  - allowed slippage
+  - allowed slippage (how far we’ll chase)
   - layering strategy
   - fee vs. slippage trade-off
-  - basic cancel/replace thresholds
+  - deterministic cancel/replace + escalation policy (in metadata)
 
-Everything here is deterministic + research-friendly; you can unit test
-it offline by feeding it synthetic market snapshots and pillar outputs.
+Design goals:
+  - deterministic + research-friendly
+  - unit-testable offline with synthetic market snapshots
+  - produces a single ExecutionPlan with enough metadata for your live executor
+    to implement chase / escalation robustly (without guessing)
+
+IMPORTANT NOTE (based on your live issue):
+  - POST_ONLY entries will often NOT fill quickly.
+  - This engine will only choose POST_ONLY when urgency is low, and it will
+    emit a deterministic “chase + escalate” policy in execution_metadata so
+    your executor can either:
+      (a) reprice post-only at the top-of-book, or
+      (b) escalate to aggressive_limit/market after a timeout.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional, Dict, Literal, Tuple
+from typing import List, Optional, Dict, Tuple
 import math
 import time
 
@@ -46,7 +57,7 @@ class OrderType(str, Enum):
     AGGRESSIVE_LIMIT = "aggressive_limit"
     MARKET = "market"
     LAYERED = "layered"
-    HYBRID = "hybrid"          # mixture of limit + market
+    HYBRID = "hybrid"          # mixture of limit + market (executor-managed)
     SYNTHETIC_ICEBERG = "synthetic_iceberg"
 
 
@@ -155,14 +166,32 @@ class MarketSnapshot:
 
 @dataclass
 class ExecutionConfig:
+    # Fees (bps)
     maker_fee_bps: float = -1.0       # negative = rebate
     taker_fee_bps: float = 2.5
-    max_chase_bps: float = 10.0       # how far we’ll chase price
+
+    # How far we’ll chase price (bps)
+    max_chase_bps: float = 10.0
+
+    # Layering
     max_layer_levels: int = 3
     min_layer_size_fraction: float = 0.1
+
+    # Cancel/replace
     cancel_reprice_threshold_bps: float = 2.0
+
+    # Timing / escalation
     latency_safety_ms: int = 500
-    timeout_sec: float = 5.0          # max waiting time before escalation
+    timeout_sec: float = 8.0          # base timeout before escalation (engine emits policy)
+
+    # Deterministic scoring weights (for order-type selection)
+    # Lower score = better.
+    w_slippage: float = 1.00
+    w_fee: float = 0.80
+    w_nonfill: float = 1.50
+    w_exec_risk: float = 0.60
+    # Non-fill penalty scaling (bps-equivalent)
+    nonfill_penalty_bps: float = 25.0
 
 
 # =====================================================================
@@ -174,7 +203,7 @@ class OrderLayer:
     price: float
     size: float                  # absolute size of this layer
     post_only: bool
-    aggressive: bool             # whether it is allowed to cross mid after small moves
+    aggressive: bool             # whether it is allowed to cross later (executor-managed)
 
 
 @dataclass
@@ -204,16 +233,24 @@ class ExecutionEngine:
     """
     Core Pillar 5 engine.
 
-    Usage:
-        engine = ExecutionEngine(config)
-        plan = engine.build_execution_plan(
-            entry_signal=...,
-            exit_plan=...,
-            risk_params=...,
-            regime=...,
-            safety=...,
-            market=...
-        )
+    Deterministically chooses the entry style and emits:
+      - order_type
+      - order_price (or None for market)
+      - allowed_slippage_bps (max chase budget)
+      - (optional) order_layers
+      - execution_metadata that tells your live executor exactly how to chase/escalate
+
+    Your executor should implement the metadata policy roughly like:
+
+      if order_type == POST_ONLY:
+         place at best bid/ask (maker)
+         every chase_interval_sec:
+             if mid moved >= cancel_reprice_threshold_bps:
+                 cancel/replace at new best bid/ask (still maker)
+             stop chasing if moved beyond allowed_slippage_bps from original mid
+         if not filled after entry_timeout_sec:
+             escalate to next order_type (e.g. AGGRESSIVE_LIMIT or MARKET)
+
     """
 
     def __init__(self, config: Optional[ExecutionConfig] = None):
@@ -233,11 +270,17 @@ class ExecutionEngine:
         market: MarketSnapshot,
         now_ms: Optional[int] = None,
     ) -> ExecutionPlan:
-        """
-        Main entrypoint: from pillars + market → ExecutionPlan.
-        """
         if now_ms is None:
             now_ms = int(time.time() * 1000)
+
+        # 0) Basic market sanity
+        if market.mid_price <= 0 or market.best_bid <= 0 or market.best_ask <= 0:
+            return self._build_vetoed_plan(
+                entry_signal=entry_signal,
+                exit_plan=exit_plan,
+                risk_params=risk_params,
+                safety=SafetyStatus(allowed=False, extra_reasons=["bad_market_prices"]),
+            )
 
         # 1) Safety veto
         if (
@@ -253,15 +296,27 @@ class ExecutionEngine:
                 safety=safety,
             )
 
-        # 2) Core scores
+        # 2) Hard execution guard: spread too wide for our plan
+        if market.spread_bps > max(0.0, risk_params.max_fill_spread_bps):
+            return self._build_vetoed_plan(
+                entry_signal=entry_signal,
+                exit_plan=exit_plan,
+                risk_params=risk_params,
+                safety=SafetyStatus(
+                    allowed=False,
+                    extra_reasons=[f"spread_too_wide:{market.spread_bps:.2f}bps"],
+                ),
+            )
+
+        # 3) Core scores
         urgency = self._compute_urgency(entry_signal, exit_plan, regime)
         execution_risk_score = self._compute_execution_risk(regime, market)
         distance_to_invalidation_bps = self._distance_to_invalidation_bps(
             entry_signal, exit_plan, market
         )
 
-        # 3) Order routing choice (limit / market / layered / hybrid)
-        order_type = self._choose_order_type(
+        # 4) Order routing choice: score candidate types deterministically
+        order_type = self._choose_order_type_scored(
             entry_signal=entry_signal,
             risk_params=risk_params,
             regime=regime,
@@ -271,7 +326,7 @@ class ExecutionEngine:
             distance_to_invalidation_bps=distance_to_invalidation_bps,
         )
 
-        # 4) Base order price + allowed slippage
+        # 5) Base order price + allowed slippage (chase budget)
         base_price, allowed_slippage_bps = self._choose_base_price_and_slippage(
             order_type=order_type,
             entry_signal=entry_signal,
@@ -279,21 +334,24 @@ class ExecutionEngine:
             regime=regime,
             market=market,
             urgency=urgency,
+            distance_to_invalidation_bps=distance_to_invalidation_bps,
         )
 
-        # 5) Layering (if applicable)
+        # 6) Layering (if applicable)
         layers: List[OrderLayer] = []
         if order_type in (OrderType.LAYERED, OrderType.HYBRID, OrderType.SYNTHETIC_ICEBERG):
+            # For HYBRID, layers represent the LIMIT/Maker part; executor may “top-up” with taker
             layers = self._build_layers(
-                base_price=base_price,
+                base_price=base_price or market.mid_price,
                 entry_signal=entry_signal,
                 risk_params=risk_params,
                 regime=regime,
                 market=market,
                 urgency=urgency,
+                allowed_slippage_bps=allowed_slippage_bps,
             )
 
-        # 6) Slippage + fill probability models
+        # 7) Slippage + fill probability models
         slippage_estimate_bps = self._estimate_slippage_bps(
             order_type=order_type,
             risk_params=risk_params,
@@ -307,23 +365,28 @@ class ExecutionEngine:
             regime=regime,
             market=market,
             allowed_slippage_bps=allowed_slippage_bps,
+            urgency=urgency,
         )
 
-        # 7) Fee model
-        fee_estimate_bps = self._estimate_fee_bps(
+        # 8) Fee model
+        fee_estimate_bps = self._estimate_fee_bps(order_type=order_type, regime=regime)
+
+        # 9) Expiration time (signal validity)
+        expiration_time_ms = self._compute_expiration(now_ms=now_ms, entry_signal=entry_signal, exit_plan=exit_plan)
+
+        # 10) Deterministic executor policy (chase + escalation)
+        policy = self._build_executor_policy(
             order_type=order_type,
+            urgency=urgency,
+            risk_params=risk_params,
             regime=regime,
+            market=market,
+            distance_to_invalidation_bps=distance_to_invalidation_bps,
+            allowed_slippage_bps=allowed_slippage_bps,
         )
 
-        # 8) Expiration time (signal validity)
-        expiration_time_ms = self._compute_expiration(
-            now_ms=now_ms,
-            entry_signal=entry_signal,
-            exit_plan=exit_plan,
-        )
-
-        # 9) Final plan
-        plan = ExecutionPlan(
+        # 11) Final plan
+        return ExecutionPlan(
             order_type=order_type,
             side=entry_signal.side,
             order_price=base_price,
@@ -338,22 +401,28 @@ class ExecutionEngine:
             fill_probability=fill_probability,
             fee_estimate_bps=fee_estimate_bps,
             execution_metadata={
-                "urgency": urgency,
-                "execution_risk_score": execution_risk_score,
-                "distance_to_invalidation_bps": distance_to_invalidation_bps,
+                "urgency": float(urgency),
+                "execution_risk_score": float(execution_risk_score),
+                "distance_to_invalidation_bps": float(distance_to_invalidation_bps),
                 "risk_mode": risk_params.risk_mode.value,
                 "regime_final": regime.regime_final,
                 "vol_regime": regime.volatility_regime.value,
                 "liq_regime": regime.liquidity_regime.value,
+                "spread_bps": float(market.spread_bps),
+                "volatility_bps": float(market.volatility_bps),
+                "depth_imbalance": float(market.depth_imbalance),
+                # Policy that your executor should follow (deterministic instructions)
+                **policy,
+                # Your runner should manage OCO: if TP fills -> cancel SL; if SL fills -> cancel TP
+                "oco_managed_by_runner": True,
             },
         )
-        return plan
 
     # =================================================================
-    # 6.3.1 Order Routing Decision Model
+    # Order routing decision (scored candidates)
     # =================================================================
 
-    def _choose_order_type(
+    def _choose_order_type_scored(
         self,
         entry_signal: EntrySignal,
         risk_params: RiskParams,
@@ -364,83 +433,113 @@ class ExecutionEngine:
         distance_to_invalidation_bps: float,
     ) -> OrderType:
         """
-        Choose between:
-          - limit / post-only / aggressive_limit / market / layered / hybrid
-        based on regimes, urgency, risk mode, spread, liquidity, etc.
+        Deterministically score candidate order types and pick the best.
+
+        Score approximates "expected total cost":
+          score = w_slippage*slip + w_fee*fee + w_nonfill*nonfill_penalty + w_exec_risk*execution_risk_score
+
+        Nonfill penalty increases with urgency and (1-fill_probability).
         """
-        # Basic convenience flags
-        high_momentum = entry_signal.pattern_momentum_score > 0.4
-        strong_signal = entry_signal.signal_confidence > 0.7 and entry_signal.entry_probability > 0.6
-        short_validity = entry_signal.time_sensitivity > 0.7
-        spread_ok = market.spread_bps <= risk_params.max_fill_spread_bps
-
-        # Liquidity drought → no market orders if possible
-        liquidity_poor = regime.liquidity_regime == LiquidityRegime.POOR
-
-        # Very high volatility → prefer layered or hybrid, avoid pure market
-        very_high_vol = regime.volatility_regime in (VolatilityRegime.HIGH, VolatilityRegime.EXTREME)
-
-        # Conservative risk mode → favour passive / layered
         conservative = risk_params.risk_mode == RiskMode.CONSERVATIVE
         aggressive = risk_params.risk_mode == RiskMode.AGGRESSIVE
+        liquidity_poor = regime.liquidity_regime == LiquidityRegime.POOR
+        very_high_vol = regime.volatility_regime in (VolatilityRegime.HIGH, VolatilityRegime.EXTREME)
 
-        # Distance to SL:
-        # small distance (tight SL) => more sensitive to bad fills, be careful with market
+        # Tight SL: penalize taker-heavy routes
         tight_invalidation = distance_to_invalidation_bps < 10.0
 
-        # Trend vs chop logic
-        in_trend = regime.chop_trend_flag == TrendChopFlag.TREND
-        in_chop = regime.chop_trend_flag == TrendChopFlag.CHOP
+        # Candidate set (deterministic)
+        candidates: List[OrderType] = [OrderType.LIMIT, OrderType.AGGRESSIVE_LIMIT]
 
-        # Heuristic rules:
+        # Maker-only is only sensible at low/moderate urgency
+        if urgency <= 0.55 and not aggressive:
+            candidates.append(OrderType.POST_ONLY)
 
-        # 1) Liquidity drought: avoid market, use layered small sizes.
-        if liquidity_poor:
-            if very_high_vol:
-                return OrderType.LAYERED
-            else:
-                return OrderType.SYNTHETIC_ICEBERG
+        # Layering candidates
+        if very_high_vol or liquidity_poor:
+            candidates.append(OrderType.LAYERED)
+            candidates.append(OrderType.SYNTHETIC_ICEBERG)
 
-        # 2) High momentum + short validity + strong signal
-        if in_trend and high_momentum and short_validity and strong_signal:
-            if spread_ok and aggressive and not tight_invalidation:
-                # We can afford some taker usage for speed
-                return OrderType.HYBRID
-            else:
-                return OrderType.AGGRESSIVE_LIMIT
+        # Hybrid for high urgency in volatile/trend scenarios (but still avoid if super tight SL)
+        if urgency >= 0.65 and (very_high_vol or entry_signal.pattern_momentum_score > 0.4):
+            candidates.append(OrderType.HYBRID)
 
-        # 3) Chop regime: passive only, minimise fees
-        if in_chop:
-            if conservative or not spread_ok:
-                return OrderType.POST_ONLY
-            else:
-                return OrderType.LIMIT
+        # Market is last resort: only if not liquidity poor and not super tight SL
+        if (not liquidity_poor) and (not conservative) and (not tight_invalidation) and urgency >= 0.7:
+            candidates.append(OrderType.MARKET)
 
-        # 4) Very high volatility: layered / hybrid with protective layers
-        if very_high_vol:
-            if urgency > 0.7 and not conservative:
-                return OrderType.HYBRID
-            else:
-                return OrderType.LAYERED
+        # Always keep deterministic order (for tie-breaking)
+        candidates = self._dedupe_preserve_order(candidates)
 
-        # 5) Medium urgency, normal regime
-        if urgency > 0.6:
-            # Some urgency, but not crazy
-            if spread_ok and aggressive:
-                return OrderType.AGGRESSIVE_LIMIT
-            else:
-                return OrderType.LIMIT
+        best_ot = candidates[0]
+        best_score = float("inf")
 
-        # 6) Low urgency: maker-only preference
-        if not aggressive or conservative:
-            return OrderType.POST_ONLY
+        for ot in candidates:
+            base_price, allowed_slip = self._choose_base_price_and_slippage(
+                order_type=ot,
+                entry_signal=entry_signal,
+                risk_params=risk_params,
+                regime=regime,
+                market=market,
+                urgency=urgency,
+                distance_to_invalidation_bps=distance_to_invalidation_bps,
+            )
 
-        # Fallback
-        return OrderType.LIMIT
+            layers: List[OrderLayer] = []
+            if ot in (OrderType.LAYERED, OrderType.HYBRID, OrderType.SYNTHETIC_ICEBERG):
+                layers = self._build_layers(
+                    base_price=base_price or market.mid_price,
+                    entry_signal=entry_signal,
+                    risk_params=risk_params,
+                    regime=regime,
+                    market=market,
+                    urgency=urgency,
+                    allowed_slippage_bps=allowed_slip,
+                )
+
+            slip = self._estimate_slippage_bps(ot, risk_params, regime, market, layers)
+            fee = self._estimate_fee_bps(ot, regime)
+            fill = self._estimate_fill_probability(ot, entry_signal, regime, market, allowed_slip, urgency)
+
+            # Non-fill penalty in bps-equivalent
+            nonfill_pen = (1.0 - fill) * self.config.nonfill_penalty_bps * (0.5 + urgency)
+
+            # Extra penalty: tight invalidation hates taker
+            if tight_invalidation and ot in (OrderType.MARKET, OrderType.HYBRID, OrderType.AGGRESSIVE_LIMIT):
+                nonfill_pen += 6.0
+
+            # Extra penalty: conservative mode hates market
+            if conservative and ot == OrderType.MARKET:
+                nonfill_pen += 10.0
+
+            score = (
+                self.config.w_slippage * slip
+                + self.config.w_fee * fee
+                + self.config.w_nonfill * nonfill_pen
+                + self.config.w_exec_risk * (execution_risk_score * 10.0)  # scale into bps-ish
+            )
+
+            # Deterministic tiebreak: prefer less complex if close
+            if score < best_score - 1e-9:
+                best_score = score
+                best_ot = ot
+
+        return best_ot
+
+    @staticmethod
+    def _dedupe_preserve_order(items: List[OrderType]) -> List[OrderType]:
+        seen = set()
+        out: List[OrderType] = []
+        for x in items:
+            if x in seen:
+                continue
+            seen.add(x)
+            out.append(x)
+        return out
 
     # =================================================================
-    # 6.3.2 Slippage Model
-    # =================================================================
+    # Slippage Model
+    # =====================================================================
 
     def _estimate_slippage_bps(
         self,
@@ -450,58 +549,49 @@ class ExecutionEngine:
         market: MarketSnapshot,
         layers: List[OrderLayer],
     ) -> float:
-        """
-        Very simple slippage model.
+        spread = max(0.0, market.spread_bps)
+        vol = max(0.0, market.volatility_bps)
 
-        Rough assumptions:
-          - Market orders slip by ~ half spread + volatility term.
-          - Aggressive limits slip by ~ 0.25 * spread + smaller vol term.
-          - Passive limits / post-only have near-zero ex-ante slippage,
-            but higher non-fill risk (handled by fill prob).
-          - Layered orders: weighted average of layer aggressiveness.
-        """
-        spread = market.spread_bps
-        vol = market.volatility_bps
-
+        # baseline by order type
         if order_type == OrderType.MARKET:
-            base = 0.5 * spread + 0.3 * vol
+            base = 0.6 * spread + 0.35 * vol
         elif order_type == OrderType.AGGRESSIVE_LIMIT:
-            base = 0.25 * spread + 0.15 * vol
+            base = 0.35 * spread + 0.20 * vol
         elif order_type in (OrderType.LIMIT, OrderType.POST_ONLY):
-            base = 0.05 * spread + 0.05 * vol
+            base = 0.10 * spread + 0.08 * vol
         elif order_type in (OrderType.LAYERED, OrderType.SYNTHETIC_ICEBERG, OrderType.HYBRID):
             if not layers:
-                base = 0.2 * spread + 0.1 * vol
+                base = 0.25 * spread + 0.15 * vol
             else:
-                # Weighted by size and "aggressive" flag
                 total_size = sum(l.size for l in layers) or 1.0
+                # if many layers are aggressive -> more slip
                 agg_weight = 0.0
                 for l in layers:
-                    layer_factor = 1.0 if l.aggressive else 0.3
+                    layer_factor = 1.0 if l.aggressive else 0.25
                     agg_weight += (l.size / total_size) * layer_factor
-                base = (0.2 + 0.2 * agg_weight) * spread + (0.1 + 0.1 * agg_weight) * vol
+                base = (0.18 + 0.28 * agg_weight) * spread + (0.10 + 0.18 * agg_weight) * vol
         else:
             base = 0.0
 
-        # Volatility regime adjustment
+        # regime adjustments
         if regime.volatility_regime == VolatilityRegime.LOW:
-            base *= 0.7
+            base *= 0.75
         elif regime.volatility_regime == VolatilityRegime.HIGH:
-            base *= 1.2
+            base *= 1.20
         elif regime.volatility_regime == VolatilityRegime.EXTREME:
-            base *= 1.5
+            base *= 1.45
 
-        # Risk mode adjustment
+        # risk mode adjustments
         if risk_params.risk_mode == RiskMode.CONSERVATIVE:
-            base *= 0.9
+            base *= 0.90
         elif risk_params.risk_mode == RiskMode.AGGRESSIVE:
-            base *= 1.1
+            base *= 1.08
 
-        return float(max(base, 0.0))
+        return float(max(0.0, base))
 
     # =================================================================
-    # 6.3.3 Fill Probability Estimator
-    # =================================================================
+    # Fill Probability Estimator
+    # =====================================================================
 
     def _estimate_fill_probability(
         self,
@@ -510,45 +600,61 @@ class ExecutionEngine:
         regime: RegimeInfo,
         market: MarketSnapshot,
         allowed_slippage_bps: float,
+        urgency: float,
     ) -> float:
-        """
-        Heuristic fill probability (0–1).
-        Higher in good liquidity & higher allowed_slippage.
-        Lower for post-only deep in the book; higher for market.
-        """
-        base: float
-
+        # base by type
         if order_type == OrderType.MARKET:
-            base = 0.99
-        elif order_type in (OrderType.AGGRESSIVE_LIMIT, OrderType.HYBRID):
-            base = 0.85
+            base = 0.995
+        elif order_type == OrderType.AGGRESSIVE_LIMIT:
+            base = 0.90
+        elif order_type == OrderType.HYBRID:
+            base = 0.92
         elif order_type in (OrderType.LAYERED, OrderType.SYNTHETIC_ICEBERG):
-            base = 0.8
+            base = 0.84
         elif order_type == OrderType.LIMIT:
-            base = 0.7
+            base = 0.78
         elif order_type == OrderType.POST_ONLY:
-            base = 0.6
+            base = 0.62
         else:
             return 0.0
 
-        # Liquidity regime
+        # liquidity regime
         if regime.liquidity_regime == LiquidityRegime.GOOD:
-            base *= 1.1
-        elif regime.liquidity_regime == LiquidityRegime.POOR:
-            base *= 0.7
+            base *= 1.10
+        elif regime.liquidity_regime == LiquidityRegime.AVERAGE:
+            base *= 1.00
+        else:  # POOR
+            base *= 0.75
 
-        # Allowed slippage: more slippage => willing to chase more => higher fill
-        base *= 1.0 + min(allowed_slippage_bps / 50.0, 0.5)  # up to +50%
+        # spread hurts passive fills more than taker fills
+        spread = max(0.0, market.spread_bps)
+        if order_type in (OrderType.POST_ONLY, OrderType.LIMIT):
+            base *= 1.0 - min(spread / 80.0, 0.25)  # up to -25%
+        else:
+            base *= 1.0 - min(spread / 200.0, 0.10)  # up to -10%
 
-        # Signal urgency: if we care a lot, we will chase more => effective fill prob higher
-        base *= 1.0 + 0.3 * entry_signal.time_sensitivity
+        # allowed slippage increases effective fill probability (you’ll chase more)
+        base *= 1.0 + min(max(allowed_slippage_bps, 0.0) / 40.0, 0.50)
 
-        # Clamp
+        # urgency: you will chase + escalate more
+        base *= 1.0 + 0.25 * urgency
+
+        # depth imbalance alignment with side
+        # if LONG and bid-heavy (positive imbalance) -> higher fill for passive buys
+        imb = max(-1.0, min(1.0, market.depth_imbalance))
+        if entry_signal.side == OrderSide.LONG:
+            align = (imb + 1.0) / 2.0  # 0..1
+        else:
+            align = (1.0 - imb) / 2.0  # 0..1
+
+        if order_type in (OrderType.POST_ONLY, OrderType.LIMIT):
+            base *= 0.90 + 0.20 * align  # 0.90..1.10
+
         return float(max(0.0, min(1.0, base)))
 
     # =================================================================
-    # 6.3.4 Order Layering Engine
-    # =================================================================
+    # Order Layering Engine
+    # =====================================================================
 
     def _build_layers(
         self,
@@ -558,121 +664,114 @@ class ExecutionEngine:
         regime: RegimeInfo,
         market: MarketSnapshot,
         urgency: float,
+        allowed_slippage_bps: float,
     ) -> List[OrderLayer]:
         """
-        Build a stack of layered orders:
-          - passive layer at best bid/ask
-          - mid-aggressive layer inside spread
-          - defensive layer slightly behind
-        Sizes are fractions of final_position_size.
+        Build deterministic layers that respect the idea:
+          - layer0: maker at top-of-book (post_only)
+          - layer1: slightly more aggressive (not post_only)
+          - layer2: defensive maker behind
+
+        Note: with tiny spreads (often 1 tick), "inside spread" may equal best bid/ask.
+        That's fine — the executor can treat "aggressive" as permission to cross later.
         """
         side = entry_signal.side
-        total_size = risk_params.final_position_size
-        max_levels = min(self.config.max_layer_levels, 3)
-
-        if total_size <= 0 or max_levels <= 0:
+        total_size = float(max(0.0, risk_params.final_position_size))
+        if total_size <= 0:
             return []
 
-        # Default layer fractions (will be rescaled)
-        base_fractions = [0.4, 0.4, 0.2][:max_levels]
-        frac_sum = sum(base_fractions)
-        fractions = [f / frac_sum for f in base_fractions]
+        max_levels = int(max(0, min(self.config.max_layer_levels, 3)))
+        if max_levels <= 0:
+            return []
 
-        # Adjust based on urgency: high urgency → more size in aggressive layer
-        if urgency > 0.7 and max_levels >= 2:
-            fractions[1] += 0.1
-            fractions[0] -= 0.05
+        # base fractions
+        fracs = [0.45, 0.40, 0.15][:max_levels]
+
+        # urgency shifts size to the aggressive layer
+        if urgency >= 0.7 and max_levels >= 2:
+            fracs[1] += 0.08
+            fracs[0] -= 0.05
             if max_levels == 3:
-                fractions[2] -= 0.05
+                fracs[2] -= 0.03
 
-        # Ensure min fraction
-        min_frac = self.config.min_layer_size_fraction
-        if any(f < min_frac for f in fractions):
-            # push floor up, then renormalise
-            fractions = [max(f, min_frac) for f in fractions]
-            s = sum(fractions)
-            fractions = [f / s for f in fractions]
+        # min fraction floor
+        min_frac = float(max(0.0, self.config.min_layer_size_fraction))
+        fracs = [max(f, min_frac) for f in fracs]
+        s = sum(fracs) or 1.0
+        fracs = [f / s for f in fracs]
+
+        # Price offsets in bps, bounded by allowed_slippage_bps
+        # (we avoid putting layers absurdly far away)
+        chase = float(max(0.0, allowed_slippage_bps))
+        off_aggressive = min(max(1.0, 0.25 * chase), chase) if chase > 0 else 1.0
+        off_defensive = min(max(1.0, 0.50 * chase), chase) if chase > 0 else 1.0
+
+        def bps_to_price(px: float, bps: float, direction: int) -> float:
+            # direction: +1 increases price, -1 decreases
+            return float(px * (1.0 + direction * (bps / 1e4)))
 
         layers: List[OrderLayer] = []
 
-        # Build 1–3 layers based on side and current spread
         for idx in range(max_levels):
-            frac = fractions[idx]
-            size = total_size * frac
+            size = total_size * fracs[idx]
             if size <= 0:
                 continue
 
             if idx == 0:
-                # Passive at best bid/ask
+                # maker at top-of-book
                 price = market.best_bid if side == OrderSide.LONG else market.best_ask
                 post_only = True
                 aggressive = False
+
             elif idx == 1:
-                # Slightly inside spread (mid-aggressive)
+                # more aggressive: closer to opposite side (permission to cross)
                 if side == OrderSide.LONG:
-                    price = min(base_price, market.best_ask - 0.25 * market.spread)
+                    # higher price is more aggressive
+                    price = min(market.best_ask, bps_to_price(market.best_bid, off_aggressive, +1))
                 else:
-                    price = max(base_price, market.best_bid + 0.25 * market.spread)
+                    price = max(market.best_bid, bps_to_price(market.best_ask, off_aggressive, -1))
                 post_only = False
                 aggressive = True
+
             else:
-                # Defensive layer slightly behind = more conservative
+                # defensive maker behind
                 if side == OrderSide.LONG:
-                    price = market.best_bid - 0.5 * market.spread
+                    price = bps_to_price(market.best_bid, off_defensive, -1)
                 else:
-                    price = market.best_ask + 0.5 * market.spread
+                    price = bps_to_price(market.best_ask, off_defensive, +1)
                 post_only = True
                 aggressive = False
 
-            layers.append(
-                OrderLayer(
-                    price=float(price),
-                    size=float(size),
-                    post_only=post_only,
-                    aggressive=aggressive,
-                )
-            )
+            layers.append(OrderLayer(price=float(price), size=float(size), post_only=post_only, aggressive=aggressive))
 
         return layers
 
     # =================================================================
-    # 6.3.5 Fee Optimisation Engine
-    # =================================================================
+    # Fee Model
+    # =====================================================================
 
-    def _estimate_fee_bps(
-        self,
-        order_type: OrderType,
-        regime: RegimeInfo,
-    ) -> float:
-        """
-        Estimate effective fee in bps based on order type and regime.
-        """
-        maker = self.config.maker_fee_bps
-        taker = self.config.taker_fee_bps
+    def _estimate_fee_bps(self, order_type: OrderType, regime: RegimeInfo) -> float:
+        maker = float(self.config.maker_fee_bps)
+        taker = float(self.config.taker_fee_bps)
 
         if order_type == OrderType.MARKET:
-            return float(taker)
+            return taker
         if order_type == OrderType.POST_ONLY:
-            return float(maker)
+            return maker
         if order_type == OrderType.LIMIT:
-            # Mostly maker, but some endpoints behave like taker
-            return float(0.8 * maker + 0.2 * taker)
+            return 0.85 * maker + 0.15 * taker
         if order_type == OrderType.AGGRESSIVE_LIMIT:
-            return float(0.4 * maker + 0.6 * taker)
+            return 0.35 * maker + 0.65 * taker
         if order_type in (OrderType.LAYERED, OrderType.SYNTHETIC_ICEBERG):
-            # Mix depending on regime (more taker in high vol)
             if regime.volatility_regime in (VolatilityRegime.HIGH, VolatilityRegime.EXTREME):
-                return float(0.5 * maker + 0.5 * taker)
-            else:
-                return float(0.7 * maker + 0.3 * taker)
+                return 0.55 * maker + 0.45 * taker
+            return 0.75 * maker + 0.25 * taker
         if order_type == OrderType.HYBRID:
-            # Roughly half taker, half maker
-            return float(0.5 * maker + 0.5 * taker)
-
+            return 0.50 * maker + 0.50 * taker
         return 0.0
 
     # =================================================================
-    # 6.3.6 Cancel/Replace Logic (framework only)
+    # Cancel/Replace Logic (framework)
     # =====================================================================
 
     def should_cancel_and_reprice(
@@ -681,14 +780,6 @@ class ExecutionEngine:
         original_market: MarketSnapshot,
         new_market: MarketSnapshot,
     ) -> bool:
-        """
-        Framework for cancel/replace decision.
-
-        For live trading, call this when the market has moved and you still
-        sit in the book unfilled. Simple rule here:
-          - if mid moves more than cancel_reprice_threshold_bps
-            away from our main order_price, we consider re-pricing.
-        """
         if current_plan.order_type == OrderType.NONE or current_plan.order_price is None:
             return False
 
@@ -701,77 +792,50 @@ class ExecutionEngine:
         return move_bps >= self.config.cancel_reprice_threshold_bps
 
     # =================================================================
-    # 6.3.7 Execution Risk Guard
+    # Execution Risk Guard
     # =====================================================================
 
-    def _compute_execution_risk(
-        self,
-        regime: RegimeInfo,
-        market: MarketSnapshot,
-    ) -> float:
-        """
-        Rough scalar execution risk score (0–1).
-        Higher when vol is high, liquidity is poor, depth imbalance is extreme.
-        """
-        # Start from volatility
+    def _compute_execution_risk(self, regime: RegimeInfo, market: MarketSnapshot) -> float:
         if regime.volatility_regime == VolatilityRegime.LOW:
-            base = 0.2
+            base = 0.20
         elif regime.volatility_regime == VolatilityRegime.NORMAL:
-            base = 0.4
+            base = 0.40
         elif regime.volatility_regime == VolatilityRegime.HIGH:
-            base = 0.6
+            base = 0.62
         else:  # EXTREME
-            base = 0.8
+            base = 0.82
 
-        # Liquidity penalty
         if regime.liquidity_regime == LiquidityRegime.POOR:
             base += 0.15
         elif regime.liquidity_regime == LiquidityRegime.AVERAGE:
-            base += 0.05
+            base += 0.06
 
-        # Depth imbalance: extreme imbalance can increase execution risk
-        imbalance = abs(market.depth_imbalance)
-        base += 0.2 * imbalance
+        base += 0.18 * abs(float(max(-1.0, min(1.0, market.depth_imbalance))))
 
-        # Clamp
         return float(max(0.0, min(1.0, base)))
 
     # =================================================================
-    # 6.4: Regime-specific urgency / philosophy
+    # Urgency
     # =====================================================================
 
-    def _compute_urgency(
-        self,
-        entry_signal: EntrySignal,
-        exit_plan: ExitPlan,
-        regime: RegimeInfo,
-    ) -> float:
-        """
-        Urgency: 0–1, combining:
-          - time_sensitivity of signal
-          - expected_exit_time
-          - trend vs chop
-          - regime confidence
-          - momentum vs mean reversion
-        """
-        # Base from signal time-sensitivity
-        u = 0.5 * entry_signal.time_sensitivity
+    def _compute_urgency(self, entry_signal: EntrySignal, exit_plan: ExitPlan, regime: RegimeInfo) -> float:
+        u = 0.55 * float(max(0.0, min(1.0, entry_signal.time_sensitivity)))
 
-        # Short expected exit time → more urgency
-        # map [10s, 2h] → [1, 0]
-        horizon = max(exit_plan.expected_exit_time_sec, 1.0)
+        # expected exit time: shorter horizon => more urgency
+        horizon = max(float(exit_plan.expected_exit_time_sec), 1.0)
+        # log-map [10s, 2h] -> [1, 0]
         horizon_norm = (math.log(horizon) - math.log(10.0)) / (math.log(7200.0) - math.log(10.0))
         horizon_norm = max(0.0, min(1.0, horizon_norm))
-        u += 0.3 * (1.0 - horizon_norm)
+        u += 0.25 * (1.0 - horizon_norm)
 
-        # Trend + momentum → urgency up
+        # trend + momentum -> urgency up
         if regime.chop_trend_flag == TrendChopFlag.TREND and entry_signal.pattern_momentum_score > 0.3:
-            u += 0.1
+            u += 0.08
 
-        # High regime confidence → you trust the regime more
-        u += 0.1 * regime.regime_confidence
+        # high regime confidence -> trust
+        u += 0.12 * float(max(0.0, min(1.0, regime.regime_confidence)))
 
-        # Clamp
+        # clamp
         return float(max(0.0, min(1.0, u)))
 
     # =================================================================
@@ -786,48 +850,182 @@ class ExecutionEngine:
         regime: RegimeInfo,
         market: MarketSnapshot,
         urgency: float,
+        distance_to_invalidation_bps: float,
     ) -> Tuple[Optional[float], float]:
-        """
-        Decide the main order price and allowed_slippage window in bps.
-        """
         side = entry_signal.side
-        mid = market.mid_price
 
-        # Default: price at best bid/ask or mid
-        if order_type in (OrderType.LIMIT, OrderType.POST_ONLY, OrderType.LAYERED, OrderType.SYNTHETIC_ICEBERG):
+        # Base price rules (deterministic)
+        if order_type in (OrderType.POST_ONLY, OrderType.LIMIT, OrderType.LAYERED, OrderType.SYNTHETIC_ICEBERG):
+            # maker-friendly reference price
             base_price = market.best_bid if side == OrderSide.LONG else market.best_ask
+
         elif order_type in (OrderType.AGGRESSIVE_LIMIT, OrderType.HYBRID):
-            # Slightly through mid towards opposite side
-            if side == OrderSide.LONG:
-                base_price = min(market.best_ask, mid * (1.0 + market.spread_bps / 2e4))
-            else:
-                base_price = max(market.best_bid, mid * (1.0 - market.spread_bps / 2e4))
+            # marketable / near-touch reference (executor may still place as LIMIT)
+            base_price = market.best_ask if side == OrderSide.LONG else market.best_bid
+
         elif order_type == OrderType.MARKET:
-            base_price = None  # exchange will decide at execution time
+            base_price = None
+
         else:
             base_price = None
 
-        # Allowed slippage: base on aggressiveness + urgency + risk mode.
-        base_slip = self.config.max_chase_bps * risk_params.aggressiveness * urgency
+        # Allowed slippage = deterministic chase budget.
+        # Bigger when: urgency high, aggressiveness high, volatility high.
+        aggr = float(max(0.0, min(1.0, risk_params.aggressiveness)))
+        u = float(max(0.0, min(1.0, urgency)))
 
-        # Volatility regime adjusts how far we’re allowed to chase
+        # baseline chase budget
+        chase = self.config.max_chase_bps * (0.25 + 0.75 * aggr) * (0.30 + 0.70 * u)
+
+        # volatility regime adjustment
         if regime.volatility_regime == VolatilityRegime.LOW:
-            base_slip *= 0.6
+            chase *= 0.70
         elif regime.volatility_regime == VolatilityRegime.HIGH:
-            base_slip *= 1.2
+            chase *= 1.20
         elif regime.volatility_regime == VolatilityRegime.EXTREME:
-            base_slip *= 1.5
+            chase *= 1.45
 
-        # Risk mode
+        # risk mode adjustment
         if risk_params.risk_mode == RiskMode.CONSERVATIVE:
-            base_slip *= 0.7
+            chase *= 0.65
         elif risk_params.risk_mode == RiskMode.AGGRESSIVE:
-            base_slip *= 1.3
+            chase *= 1.25
 
-        # Clamp by max_fill_spread
-        base_slip = min(base_slip, risk_params.max_fill_spread_bps, self.config.max_chase_bps)
+        # Tight invalidation => cap chase (don’t destroy R:R by chasing into your stop)
+        if distance_to_invalidation_bps > 0:
+            chase = min(chase, max(2.0, 0.40 * distance_to_invalidation_bps))
 
-        return (base_price, float(max(base_slip, 0.0)))
+        # Clamp by both fill spread limit and global max chase
+        chase = min(chase, float(max(0.0, risk_params.max_fill_spread_bps)), float(self.config.max_chase_bps))
+        chase = float(max(0.0, chase))
+
+        return base_price, chase
+
+    # =================================================================
+    # Deterministic executor policy emitted via metadata
+    # =====================================================================
+
+    def _build_executor_policy(
+        self,
+        order_type: OrderType,
+        urgency: float,
+        risk_params: RiskParams,
+        regime: RegimeInfo,
+        market: MarketSnapshot,
+        distance_to_invalidation_bps: float,
+        allowed_slippage_bps: float,
+    ) -> Dict[str, float | str | bool]:
+        """
+        This does NOT execute anything. It emits deterministic instructions
+        your live executor should follow.
+
+        Key idea (fixes your “post-only never fills” reality):
+          - if we ever choose POST_ONLY, we also emit:
+              chase_enabled=True
+              reprice at top-of-book on threshold
+              escalate after timeout to more aggressive type
+        """
+        u = float(max(0.0, min(1.0, urgency)))
+        conservative = risk_params.risk_mode == RiskMode.CONSERVATIVE
+        liquidity_poor = regime.liquidity_regime == LiquidityRegime.POOR
+        very_high_vol = regime.volatility_regime in (VolatilityRegime.HIGH, VolatilityRegime.EXTREME)
+        tight_invalidation = distance_to_invalidation_bps < 10.0
+
+        # Base timeout (sec) before escalation. Higher urgency -> shorter timeout.
+        base_timeout = float(self.config.timeout_sec)
+        timeout = base_timeout * (1.15 - 0.55 * u)
+        timeout = float(max(2.0, min(20.0, timeout)))
+
+        # Chase interval: faster in high urgency, but don’t go insane.
+        chase_interval = 0.35 + 0.40 * (1.0 - u)   # 0.35..0.75
+        chase_interval = float(max(0.25, min(1.0, chase_interval)))
+
+        # Decide escalation ladder (deterministic)
+        # NOTE: if liquidity poor or very high vol, prefer aggressive_limit over market.
+        if tight_invalidation or conservative or liquidity_poor:
+            escalate_to = OrderType.AGGRESSIVE_LIMIT.value
+        else:
+            escalate_to = (OrderType.MARKET.value if (u >= 0.8 and not very_high_vol) else OrderType.AGGRESSIVE_LIMIT.value)
+
+        # For HYBRID, executor can:
+        #   - place maker/limit portion from layers first
+        #   - if still not filled after timeout, “top up” with aggressive_limit/market
+        if order_type == OrderType.HYBRID:
+            return {
+                "policy_mode": "hybrid",
+                "entry_timeout_sec": timeout,
+                "chase_enabled": True,
+                "chase_interval_sec": chase_interval,
+                "cancel_reprice_threshold_bps": float(self.config.cancel_reprice_threshold_bps),
+                "max_chase_bps": float(allowed_slippage_bps),
+                "escalate_to_order_type": escalate_to,
+                "hybrid_taker_topup_fraction": float(max(0.1, min(0.6, 0.15 + 0.50 * u))),
+            }
+
+        # For POST_ONLY: explicitly require chase + escalation.
+        if order_type == OrderType.POST_ONLY:
+            return {
+                "policy_mode": "post_only_chase",
+                "entry_timeout_sec": timeout,
+                "chase_enabled": True,
+                "chase_interval_sec": chase_interval,
+                "cancel_reprice_threshold_bps": float(self.config.cancel_reprice_threshold_bps),
+                "max_chase_bps": float(allowed_slippage_bps),
+                "escalate_to_order_type": escalate_to,
+            }
+
+        # For LIMIT: optional chase; if urgency high, allow cancel/replace then escalate
+        if order_type == OrderType.LIMIT:
+            chase = bool(u >= 0.55)
+            return {
+                "policy_mode": "limit",
+                "entry_timeout_sec": timeout,
+                "chase_enabled": chase,
+                "chase_interval_sec": chase_interval if chase else 0.0,
+                "cancel_reprice_threshold_bps": float(self.config.cancel_reprice_threshold_bps),
+                "max_chase_bps": float(allowed_slippage_bps),
+                "escalate_to_order_type": escalate_to if chase else OrderType.NONE.value,
+            }
+
+        # For AGGRESSIVE_LIMIT: short timeout; may escalate to market unless tight/poor
+        if order_type == OrderType.AGGRESSIVE_LIMIT:
+            timeout2 = float(max(1.5, min(10.0, timeout * 0.70)))
+            esc = OrderType.MARKET.value if (not tight_invalidation and not liquidity_poor and not conservative and u >= 0.85) else OrderType.NONE.value
+            return {
+                "policy_mode": "aggressive_limit",
+                "entry_timeout_sec": timeout2,
+                "chase_enabled": True,
+                "chase_interval_sec": float(max(0.25, min(0.6, chase_interval))),
+                "cancel_reprice_threshold_bps": float(max(0.5, self.config.cancel_reprice_threshold_bps * 0.75)),
+                "max_chase_bps": float(allowed_slippage_bps),
+                "escalate_to_order_type": esc,
+            }
+
+        # For MARKET: no chase.
+        if order_type == OrderType.MARKET:
+            return {
+                "policy_mode": "market",
+                "entry_timeout_sec": 0.0,
+                "chase_enabled": False,
+                "chase_interval_sec": 0.0,
+                "cancel_reprice_threshold_bps": 0.0,
+                "max_chase_bps": float(allowed_slippage_bps),
+                "escalate_to_order_type": OrderType.NONE.value,
+            }
+
+        # Layered / Iceberg: chase by rebuilding layers; escalation as needed
+        if order_type in (OrderType.LAYERED, OrderType.SYNTHETIC_ICEBERG):
+            return {
+                "policy_mode": "layered",
+                "entry_timeout_sec": timeout,
+                "chase_enabled": True,
+                "chase_interval_sec": chase_interval,
+                "cancel_reprice_threshold_bps": float(self.config.cancel_reprice_threshold_bps),
+                "max_chase_bps": float(allowed_slippage_bps),
+                "escalate_to_order_type": OrderType.AGGRESSIVE_LIMIT.value if (u >= 0.75 and not conservative) else OrderType.NONE.value,
+            }
+
+        return {"policy_mode": "none"}
 
     # =================================================================
     # Misc helpers
@@ -839,39 +1037,19 @@ class ExecutionEngine:
         exit_plan: ExitPlan,
         market: MarketSnapshot,
     ) -> float:
-        """
-        Distance from mid to SL in bps.
-        """
         mid = market.mid_price
         if mid <= 0:
             return 0.0
-
-        if entry_signal.side == OrderSide.LONG:
-            dist = abs(mid - exit_plan.sl_price)
-        else:
-            dist = abs(exit_plan.sl_price - mid)
-
+        dist = abs(mid - exit_plan.sl_price)
         return float(dist / mid * 1e4)
 
-    def _compute_expiration(
-        self,
-        now_ms: int,
-        entry_signal: EntrySignal,
-        exit_plan: ExitPlan,
-    ) -> Optional[int]:
-        """
-        Turn signal validity + expected exit time into an order expiration timestamp.
-        """
-        # Heuristic: base validity = min(expected_exit_time, 1/4 of it)
+    def _compute_expiration(self, now_ms: int, entry_signal: EntrySignal, exit_plan: ExitPlan) -> Optional[int]:
         base_valid_sec = min(
-            exit_plan.expected_exit_time_sec,
-            max(30.0, exit_plan.expected_exit_time_sec / 4.0),
+            float(exit_plan.expected_exit_time_sec),
+            max(30.0, float(exit_plan.expected_exit_time_sec) / 4.0),
         )
-
-        # Scale by time_sensitivity (more sensitive -> shorter validity)
-        scale = 1.0 - 0.5 * entry_signal.time_sensitivity
+        scale = 1.0 - 0.5 * float(max(0.0, min(1.0, entry_signal.time_sensitivity)))
         valid_sec = max(10.0, base_valid_sec * scale)
-
         return now_ms + int(valid_sec * 1000)
 
     def _build_vetoed_plan(
@@ -881,9 +1059,6 @@ class ExecutionEngine:
         risk_params: RiskParams,
         safety: SafetyStatus,
     ) -> ExecutionPlan:
-        """
-        Build a "no trade" plan when Pillar 6 or safety vetoes execution.
-        """
         reasons: List[str] = []
         if not safety.allowed:
             reasons.append("allowed=False")
@@ -909,7 +1084,5 @@ class ExecutionEngine:
             slippage_estimate_bps=0.0,
             fill_probability=0.0,
             fee_estimate_bps=0.0,
-            execution_metadata={
-                "veto_reasons": ",".join(reasons),
-            },
+            execution_metadata={"veto_reasons": ",".join(reasons)},
         )
