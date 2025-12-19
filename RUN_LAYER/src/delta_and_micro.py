@@ -1,6 +1,8 @@
 import logging
 import sys
 import time
+import zipfile
+from io import BytesIO
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, List, Tuple
@@ -10,6 +12,7 @@ import pandas as pd
 import requests
 from requests.exceptions import HTTPError
 import warnings
+import math
 
 # ============================================================
 # CONFIG / PATHS
@@ -28,6 +31,16 @@ CANDLES_PATH = RAW_DIR / "BTC_CANDLES.csv"
 SYMBOL = "BTCUSDT"
 BASE_URL = "https://fapi.binance.com"
 ENDPOINT = "/fapi/v1/aggTrades"
+
+# Optional: use Binance daily aggTrades dumps for the portion of the lookback
+# that lies before today's UTC 00:00. This reduces API calls when the window
+# crosses midnight.
+USE_DAILY_DUMPS = True
+BINANCE_VISION_BASE = (
+    "https://data.binance.vision/data/futures/um/daily/aggTrades"
+)
+# Toggle to reduce verbose per-request logging and show a simple progress bar
+SHOW_PROGRESS = True
 
 # How much history you want in the final window.
 # Example: LOOKBACK_DAYS = 30 for 30 days; right now ~30 minutes for testing
@@ -105,21 +118,22 @@ def get_agg_trades(symbol: str, start_ms: int, end_ms: int, limit: int = LIMIT) 
         "limit": limit,
     }
 
-    # NEW: log every request
-    logging.info(
-        "Requesting aggTrades: %s | params=%s",
-        url,
-        params,
-    )
+    if not SHOW_PROGRESS:
+        logging.info(
+            "Requesting aggTrades: %s | params=%s",
+            url,
+            params,
+        )
 
     resp = requests.get(url, params=params, timeout=10)
 
-    # Log basic response info before raising on error
-    logging.info(
-        "aggTrades response: status=%s, bytes=%s",
-        resp.status_code,
-        len(resp.content),
-    )
+    if not SHOW_PROGRESS:
+        # Log basic response info before raising on error
+        logging.info(
+            "aggTrades response: status=%s, bytes=%s",
+            resp.status_code,
+            len(resp.content),
+        )
 
     resp.raise_for_status()
     data = resp.json()
@@ -129,12 +143,13 @@ def get_agg_trades(symbol: str, start_ms: int, end_ms: int, limit: int = LIMIT) 
         raise RuntimeError(f"Unexpected aggTrades response: {data}")
 
     # Also log how many trades we actually got in this raw payload
-    logging.info(
-        "aggTrades payload decoded: trades=%s (start_ms=%s, end_ms=%s)",
-        len(data),
-        start_ms,
-        end_ms,
-    )
+    if not SHOW_PROGRESS:
+        logging.info(
+            "aggTrades payload decoded: trades=%s (start_ms=%s, end_ms=%s)",
+            len(data),
+            start_ms,
+            end_ms,
+        )
 
     return data
 
@@ -166,6 +181,8 @@ def stream_trades_range(start_ms: int, end_ms: int) -> Iterable[pd.DataFrame]:
     window_start = start_ms
     window_idx = 0
     total_trades = 0
+    total_range_ms = end_ms - start_ms
+    total_windows = max(1, math.ceil(total_range_ms / max(window_ms, 1)))
 
     while window_start < end_ms:
         window_idx += 1
@@ -232,14 +249,21 @@ def stream_trades_range(start_ms: int, end_ms: int) -> Iterable[pd.DataFrame]:
 
                 chunk_size = len(df)
                 total_trades += chunk_size
-
-                logging.info(
-                    "Window %d: fetched %s trades (chunk=%s), total=%s",
-                    window_idx,
-                    SYMBOL,
-                    f"{chunk_size:,}",
-                    f"{total_trades:,}",
-                )
+                if SHOW_PROGRESS:
+                    chunk_last_ts = int(df["timestamp"].iloc[-1])
+                    progress = (chunk_last_ts - start_ms) / max(total_range_ms, 1)
+                    sys.stdout.write(
+                        f"\rFetching trades: {progress*100:5.1f}% | window {window_idx}/{total_windows} | total {total_trades:,}"
+                    )
+                    sys.stdout.flush()
+                else:
+                    logging.info(
+                        "Window %d: fetched %s trades (chunk=%s), total=%s",
+                        window_idx,
+                        SYMBOL,
+                        f"{chunk_size:,}",
+                        f"{total_trades:,}",
+                    )
 
                 # Reset retry counters after a successful request
                 backoff_429 = 10.0
@@ -324,7 +348,100 @@ def stream_trades_range(start_ms: int, end_ms: int) -> Iterable[pd.DataFrame]:
 
         window_start = window_end  # advance to next window
 
+    if SHOW_PROGRESS:
+        sys.stdout.write(f"\rFetching trades: 100.0% | window {total_windows}/{total_windows} | total {total_trades:,} | done\n")
+        sys.stdout.flush()
     logging.info("All windows complete.")
+
+
+def _dates_between(start_ms: int, end_ms: int) -> List[datetime.date]:
+    start_date = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).date()
+    end_date = datetime.fromtimestamp((end_ms - 1) / 1000, tz=timezone.utc).date()
+    days = []
+    cur = start_date
+    while cur <= end_date:
+        days.append(cur)
+        cur += timedelta(days=1)
+    return days
+
+
+def fetch_trades_from_dumps(start_ms: int, end_ms: int) -> pd.DataFrame:
+    """
+    Attempt to load aggTrades from Binance daily dumps for the date range covering [start_ms, end_ms).
+    Returns a DataFrame with columns: price, qty, timestamp, is_buyer_maker.
+    """
+    dfs: List[pd.DataFrame] = []
+    for d in _dates_between(start_ms, end_ms):
+        url = f"{BINANCE_VISION_BASE}/{SYMBOL}/{SYMBOL}-aggTrades-{d}.zip"
+        logging.info("Attempting daily dump: %s", url)
+        try:
+            resp = requests.get(url, timeout=30)
+            if resp.status_code != 200:
+                logging.warning("Daily dump not available (%s): HTTP %s", d, resp.status_code)
+                continue
+            with zipfile.ZipFile(BytesIO(resp.content)) as z:
+                members = z.namelist()
+                if not members:
+                    logging.warning("Daily dump %s zip empty", d)
+                    continue
+                with z.open(members[0]) as f:
+                    df = pd.read_csv(
+                        f,
+                        header=None,
+                        names=[
+                            "agg_trade_id",
+                            "price",
+                            "qty",
+                            "first_trade_id",
+                            "last_trade_id",
+                            "timestamp",
+                            "is_buyer_maker",
+                        ],
+                    )
+            df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
+            df["price"] = pd.to_numeric(df["price"], errors="coerce")
+            df["qty"] = pd.to_numeric(df["qty"], errors="coerce")
+            df = df.dropna(subset=["timestamp", "qty", "price"])
+            df["timestamp"] = df["timestamp"].astype("int64")
+            df["qty"] = df["qty"].astype("float64")
+            df["price"] = df["price"].astype("float64")
+            df["is_buyer_maker"] = (
+                df["is_buyer_maker"]
+                .astype(str)
+                .str.lower()
+                .map({"true": True, "false": False, "1": True, "0": False})
+                .astype(bool)
+            )
+            df = df[(df["timestamp"] >= start_ms) & (df["timestamp"] < end_ms)]
+            if not df.empty:
+                dfs.append(df[["price", "qty", "timestamp", "is_buyer_maker"]])
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Failed to load daily dump %s: %s", d, exc)
+            continue
+
+    if dfs:
+        return pd.concat(dfs, ignore_index=True)
+    return pd.DataFrame(columns=["price", "qty", "timestamp", "is_buyer_maker"])
+
+
+def compute_micro_from_trades_df(df_all: pd.DataFrame, start_ms: int, end_ms: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Compute microstructure from a preloaded trades DataFrame over [start_ms, end_ms).
+    Returns (micro_df, trades_df).
+    """
+    if df_all.empty:
+        return build_empty_micro_frame(start_ms, end_ms), df_all
+
+    df_all = df_all.copy()
+    df_all["delta"] = np.where(~df_all["is_buyer_maker"], df_all["qty"], -df_all["qty"])
+    df_all["minute"] = (df_all["timestamp"] // 60_000) * 60_000
+
+    micro = compute_minute_microstructure(df_all)
+    full_idx = np.arange(start_ms, end_ms, 60_000, dtype="int64")
+    micro = micro.reindex(full_idx, fill_value=0.0)
+    micro.index.name = "open_time_ms"
+
+    return micro.reset_index(), df_all
 
 
 # ============================================================
@@ -662,13 +779,36 @@ def main() -> None:
             & (candles["open_time_ms"] < end_ms)
         ].copy()
 
-        # ---- 3) Process in 1-hour buckets, streaming trades ----
+        # ---- 3) Process trades, optionally using daily dumps for the pre-today portion ----
         bucket_ms = 60 * 60 * 1000
-        current_start = start_ms
-
         micro_parts: List[pd.DataFrame] = []
         first_trades = True
 
+        today_start_ms = int(
+            datetime.now(timezone.utc)
+            .replace(hour=0, minute=0, second=0, microsecond=0)
+            .timestamp()
+            * 1000
+        )
+
+        # Historical portion from daily dumps (if enabled and window crosses midnight)
+        current_start = start_ms
+        if USE_DAILY_DUMPS and start_ms < today_start_ms:
+            hist_end_ms = min(end_ms, today_start_ms)
+            logging.info(
+                "Fetching historical trades from daily dumps for %s -> %s",
+                datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc),
+                datetime.fromtimestamp(hist_end_ms / 1000, tz=timezone.utc),
+            )
+            trades_hist = fetch_trades_from_dumps(start_ms, hist_end_ms)
+            micro_hist, trades_hist = compute_micro_from_trades_df(trades_hist, start_ms, hist_end_ms)
+            micro_parts.append(micro_hist)
+            if not trades_hist.empty:
+                append_trades_csv(trades_hist, header=first_trades)
+                first_trades = False
+            current_start = hist_end_ms
+
+        # Live/API portion for the remaining window
         while current_start < end_ms:
             current_end = min(current_start + bucket_ms, end_ms)
 

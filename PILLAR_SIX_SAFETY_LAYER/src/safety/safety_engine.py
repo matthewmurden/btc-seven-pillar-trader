@@ -65,7 +65,7 @@ class Pillar6Config:
     volatility_shock_abs_bps: float = float(os.getenv("P6_VOL_SHOCK_ABS_BPS", "30.0"))  # or absolute trigger
 
     # System-level pre-trade guards
-    min_r_multiple_for_system: float = float(os.getenv("P6_MIN_R_MULTIPLE", "2.0"))  # tp_dist / sl_dist
+    min_r_multiple_for_system: float = float(os.getenv("P6_MIN_R_MULTIPLE", "0.8"))  # tp_dist / sl_dist
     max_sl_dist_for_system: float = float(os.getenv("P6_MAX_SL_DIST", "0.003"))  # SL <= 0.3%
     min_tp_dist_for_system: float = float(os.getenv("P6_MIN_TP_DIST", "0.003"))  # TP >= 0.3%
     min_entry_conf_for_system: float = float(os.getenv("P6_MIN_ENTRY_CONF", "0.40"))

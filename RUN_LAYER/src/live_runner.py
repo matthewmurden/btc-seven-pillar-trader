@@ -50,7 +50,7 @@ import pandas as pd
 # Config
 # ---------------------------------------------------------------------
 # Change to 1440 for 1-day lookback in production
-LOOKBACK_MINUTES = 5
+LOOKBACK_MINUTES = 1440
 
 MAX_RETRIES = 3
 MAX_PRE_P4_TOPUPS = 5  # safety cap when trying to catch up to latest closed minute

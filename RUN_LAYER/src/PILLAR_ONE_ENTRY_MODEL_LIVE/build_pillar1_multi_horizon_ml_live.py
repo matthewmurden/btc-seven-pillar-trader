@@ -280,13 +280,16 @@ def main() -> None:
     if extra:
         logging.info("[MH] Dropping %d extra numeric columns not in training template: %s", len(extra), extra)
 
-    # Build aligned feature matrix
-    aligned = pd.DataFrame(index=df.index)
-    for col in template_features:
-        if col in live_numeric.columns:
-            aligned[col] = live_numeric[col]
-        else:
-            aligned[col] = 0.0
+    # Build aligned feature matrix without repeated column inserts
+    feat_dtype = cfg.feature_dtype or np.float32
+    aligned = pd.DataFrame(
+        np.zeros((len(df), len(template_features)), dtype=feat_dtype),
+        columns=template_features,
+        index=df.index,
+    )
+    common_cols = [c for c in template_features if c in live_numeric.columns]
+    if common_cols:
+        aligned.loc[:, common_cols] = live_numeric[common_cols].to_numpy(copy=False)
 
     logging.info(
         "[MH] Aligned features to training template: %d cols (expected 731)",
