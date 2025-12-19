@@ -50,6 +50,17 @@ def main() -> None:
 
     stable_df = stab_mod.smooth(fused, ml, det)
 
+    # Add prefixed aliases to mirror training artifacts (stable_* names)
+    alias_map = {
+        "regime_label_stable": "stable_regime_label_stable",
+        "regime_label_prev": "stable_regime_label_prev",
+        "hold_length": "stable_hold_length",
+        "smoothing_mode": "stable_smoothing_mode",
+    }
+    for src, dst in alias_map.items():
+        if src in stable_df.columns and dst not in stable_df.columns:
+            stable_df[dst] = stable_df[src]
+
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     stable_df.to_parquet(OUTPUT_PATH, index=False)
     logging.info("Saved live stable regimes -> %s", OUTPUT_PATH)

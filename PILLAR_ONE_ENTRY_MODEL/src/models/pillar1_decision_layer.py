@@ -60,6 +60,21 @@ def _ensure_required_cols(df: pd.DataFrame, cfg: DecisionConfig) -> None:
     If `cfg.prob_col` is missing, we try a list of sensible fallbacks that the
     calibration step might have written, and update cfg.prob_col in-place.
     """
+    # If both up/down probabilities exist, derive a combined entry_probability
+    if "entry_prob_up" in df.columns and "entry_prob_down" in df.columns:
+        up = pd.to_numeric(df["entry_prob_up"], errors="coerce")
+        down = pd.to_numeric(df["entry_prob_down"], errors="coerce")
+        total = up + down
+        prob_combined = (up / total.replace(0, np.nan)).fillna(up).clip(0.0, 1.0)
+        df["entry_probability"] = prob_combined
+        cfg.prob_col = "entry_probability"
+        if cfg.raw_col not in df.columns:
+            logging.warning(
+                "DecisionLayer: raw aggregator column '%s' missing; metadata will use 0.0.",
+                cfg.raw_col,
+            )
+        return
+
     # Already fine
     if cfg.prob_col in df.columns:
         # raw_col is optional – warn if missing, but don't block.

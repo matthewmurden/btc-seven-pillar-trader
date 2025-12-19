@@ -630,7 +630,6 @@ def run_p1_live() -> None:
 
 def run_p2_live() -> None:
     _run_with_retries(build_exit_raw_features_live.main, "build_exit_raw_features_live")
-    _run_with_retries(build_exit_labels_live.main, "build_exit_labels_live")
     _run_with_retries(build_exit_mini_engines_live.main, "build_exit_mini_engines_live")
     _run_with_retries(build_exit_deterministic_live.main, "build_exit_deterministic_live")
     _run_with_retries(build_exit_ml_models_live.main, "build_exit_ml_models_live")
@@ -830,6 +829,25 @@ def main() -> None:
 
             # 3) Pillar 1 (entry model)
             run_p1_live()
+
+            # Short-circuit if Pillar 1 produced no actionable trade
+            p1_latest = _load_latest_row(P1_FINAL)
+            try:
+                latest_direction = float(p1_latest.get("entry_direction", 0))
+            except Exception:  # noqa: BLE001
+                latest_direction = 0.0
+
+            no_trade = (
+                p1_latest is None
+                or str(p1_latest.get("entry_decision", "none")).lower() == "none"
+                or latest_direction == 0
+            )
+            if no_trade:
+                logging.info("P1 produced no trade on latest bar; skipping Pillars 2/3/5/6 this loop.")
+                loop_dur = time.time() - loop_start
+                print(f"=== Live pipeline loop complete (no trade) in {loop_dur:.1f}s ===")
+                _sleep_until_next_minute()
+                continue
 
             # 4) Pillar 2 (exit model)
             run_p2_live()

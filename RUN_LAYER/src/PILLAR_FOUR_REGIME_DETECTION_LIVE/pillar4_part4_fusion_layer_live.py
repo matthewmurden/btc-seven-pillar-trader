@@ -48,6 +48,18 @@ def main() -> None:
 
     fused_df = fusion_mod.fuse(det, ml)
 
+    # Add prefixed aliases to mirror training artifacts (fused_* names)
+    alias_map = {
+        "regime_label_fused": "fused_regime_label_fused",
+        "ml_confidence": "fused_ml_confidence",
+        "fusion_mode": "fused_fusion_mode",
+        "regime_pred": "fused_regime_pred",
+        "deterministic_label": "fused_deterministic_label",
+    }
+    for src, dst in alias_map.items():
+        if src in fused_df.columns and dst not in fused_df.columns:
+            fused_df[dst] = fused_df[src]
+
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     fused_df.to_parquet(OUTPUT_PATH, index=False)
     logging.info("Saved live fused regimes -> %s", OUTPUT_PATH)

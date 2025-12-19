@@ -32,6 +32,17 @@ for p in (P1_BASE, P1_SRC):
     if ps not in sys.path:
         sys.path.append(ps)
 
+# Pillar 6 shared decision config (optional)
+P6_SRC = BASE_DIR / "PILLAR_SIX_SAFETY_LAYER" / "src"
+if str(P6_SRC) not in sys.path:
+    sys.path.append(str(P6_SRC))
+
+try:  # noqa: SIM105
+    from safety.p1_decision_config import P1_DECISION_CONFIG  # type: ignore
+except Exception:  # noqa: BLE001
+    P1_DECISION_CONFIG = None
+    logging.warning("P1_DECISION_CONFIG not found; using defaults.")
+
 from models.pillar1_decision_layer import (  # type: ignore
     DecisionConfig,
     apply_decision_layer,
@@ -56,13 +67,17 @@ def main() -> None:
     if "open_time_ms" in df.columns:
         df = df.sort_values("open_time_ms").reset_index(drop=True)
 
-    cfg = DecisionConfig(
-        long_threshold=0.55,
-        short_threshold=0.45,
-        min_confidence_for_entry=0.10,
-    )
+    if P1_DECISION_CONFIG is not None:
+        cfg = DecisionConfig(**P1_DECISION_CONFIG)
+        logging.info("Applying Pillar 1 decision layer (live) with shared config: %s", cfg)
+    else:
+        cfg = DecisionConfig(
+            long_threshold=0.55,
+            short_threshold=0.45,
+            min_confidence_for_entry=0.10,
+        )
+        logging.info("Applying Pillar 1 decision layer (live) with local defaults: %s", cfg)
 
-    logging.info("Applying Pillar 1 decision layer (live) with config: %s", cfg)
     df_out = apply_decision_layer(df, cfg=cfg)
     _log_mem(df_out, "[Decision] After decision layer")
 

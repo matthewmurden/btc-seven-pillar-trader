@@ -1,38 +1,37 @@
 from __future__ import annotations
 
 """
-Live helper to score Pillar 1 multi-horizon ML models using the already
-trained models on disk. No training is performed.
+Live scorer for Pillar 1 multi-horizon ML models using pre-trained artifacts.
 
-Inputs (live):
-  RUN_LAYER/data/processed/PILLAR_ONE_ENTRY_MODEL/features_pillar1_with_engines.parquet
+This mirrors the training pipeline logic in:
+  - PILLAR_ONE_ENTRY_MODEL/src/pipeline/build_pillar1_multi_horizon_ml.py
+  - PILLAR_ONE_ENTRY_MODEL/src/models/pillar1_multi_horizon_ml.py
 
-Model artifacts (offline trained):
-  PILLAR_ONE_ENTRY_MODEL/models/pillar1_multi_horizon/*.pkl
-
-Output (live):
-  RUN_LAYER/data/processed/PILLAR_ONE_ENTRY_MODEL/features_pillar1_with_ml.parquet
+Differences:
+  - No training; models are loaded from disk and used for inference only.
+  - Inputs/outputs are the live RUN_LAYER/data/processed parquet files.
 """
 
+import gc
 import logging
 import sys
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List
+import pyarrow.parquet as pq
 
 import numpy as np
 import pandas as pd
 import warnings
 from sklearn.exceptions import InconsistentVersionWarning
 
-THIS_DIR = Path(__file__).resolve().parent
-BASE_DIR = THIS_DIR.parents[2]
+BASE_DIR = Path(__file__).resolve().parents[3]
 RUN_PROCESSED = BASE_DIR / "RUN_LAYER" / "data" / "processed"
 
 P1_PROCESSED = RUN_PROCESSED / "PILLAR_ONE_ENTRY_MODEL"
 FEATURES_PATH = P1_PROCESSED / "features_pillar1_with_engines.parquet"
+LABELS_PATH = P1_PROCESSED / "labels_pillar1.parquet"
 OUTPUT_PATH = P1_PROCESSED / "features_pillar1_with_ml.parquet"
 
-# Offline model dir (no need to touch training features in live)
 P1_BASE = BASE_DIR / "PILLAR_ONE_ENTRY_MODEL"
 P1_SRC = P1_BASE / "src"
 MODEL_DIR = P1_BASE / "models" / "pillar1_multi_horizon"
@@ -42,93 +41,38 @@ if str(P1_SRC) not in sys.path:
 
 from models.pillar1_multi_horizon_ml import (  # type: ignore
     MultiHorizonTrainingConfig,
+    MultiHorizonModelSpec,
     default_model_specs,
     load_models,
     _extract_probs,
 )
 
-# Silence sklearn version mismatch chatter (models are already trained)
 warnings.filterwarnings("ignore", category=InconsistentVersionWarning)
 
-# -----------------------------------------------------------------------------
-# Simple module-level caches to avoid reloading on every call
-# -----------------------------------------------------------------------------
-_MODEL_CACHE: Optional[Dict[str, object]] = None
-_LABELS_CACHE: Optional[pd.DataFrame] = None
+# Set False to allow scoring when a label column is entirely NaN (small live windows).
+# Set True once your live window is large enough to populate all labels.
+STRICT_LABEL_CHECK = False
+
+TRAINING_FEATURES_PATH = P1_BASE / "data" / "processed" / "features_pillar1_with_engines.parquet"
+TRAINING_LABELS_PATH = P1_BASE / "data" / "processed" / "labels_pillar1.parquet"
 
 
 def _log_mem(df: pd.DataFrame, msg: str) -> None:
-    mb = df.memory_usage(deep=True).sum() / (1024**2)
+    mb = df.memory_usage(deep=True).sum() / (1024 ** 2)
     logging.info("%s | shape=%s | approx_mem=%.1f MB", msg, df.shape, mb)
 
 
-def _align_features(
-    df: pd.DataFrame,
-    feature_cols: List[str],
-    dtype: np.dtype,
-    expected_count: int | None = None,
-) -> np.ndarray:
+def _slim_ml_output(df: pd.DataFrame, specs: List[MultiHorizonModelSpec]) -> pd.DataFrame:
     """
-    Align to exactly the columns expected by the model (order matters).
-    Missing columns are filled with 0.0; extra columns are ignored.
-    All columns are coerced to numeric to avoid drop-by-dtype.
+    Cut the saved ML file down to what later stages actually need.
+    This is copied 1:1 from the training pipeline.
     """
-    if expected_count is not None:
-        if len(feature_cols) > expected_count:
-            logging.warning(
-                "[MH] feature_cols (%d) > model expected (%d); trimming to first %d columns",
-                len(feature_cols),
-                expected_count,
-                expected_count,
-            )
-            feature_cols = feature_cols[:expected_count]
-        elif len(feature_cols) < expected_count:
-            missing = expected_count - len(feature_cols)
-            logging.warning(
-                "[MH] feature_cols (%d) < model expected (%d); padding %d zero-columns",
-                len(feature_cols),
-                expected_count,
-                missing,
-            )
-            feature_cols = feature_cols + [f"__missing_{i}" for i in range(missing)]
+    keep_cols: List[str] = []
 
-    aligned = df.reindex(columns=feature_cols, fill_value=0)
-    aligned = aligned.apply(pd.to_numeric, errors="coerce").fillna(0)
-    aligned = aligned.astype(dtype, copy=False)
-    return aligned.to_numpy(copy=False)
+    if "open_time_ms" in df.columns:
+        keep_cols.append("open_time_ms")
 
-
-def _load_models_cached(cfg: MultiHorizonTrainingConfig, specs):
-    global _MODEL_CACHE
-    if _MODEL_CACHE is not None:
-        return _MODEL_CACHE
-    _MODEL_CACHE = load_models(cfg, specs)
-    return _MODEL_CACHE
-
-
-def _load_labels_cached(label_cols: List[str]) -> Optional[pd.DataFrame]:
-    global _LABELS_CACHE
-    if _LABELS_CACHE is not None:
-        return _LABELS_CACHE
-    labels_path = P1_BASE / "data" / "processed" / "labels_pillar1.parquet"
-    if not labels_path.exists():
-        return None
-    df = pd.read_parquet(labels_path)
-    if "open_time_ms" not in df.columns:
-        return None
-    # Keep only needed label columns
-    cols = ["open_time_ms"] + [c for c in label_cols if c in df.columns]
-    _LABELS_CACHE = df[cols].copy()
-    return _LABELS_CACHE
-
-
-def _slim_output(df: pd.DataFrame, specs) -> pd.DataFrame:
-    """
-    Produce the exact column set expected downstream (same order as training slim),
-    while keeping any extra prediction columns if they exist.
-    """
-    desired = [
-        "open_time_ms",
+    base_cols = [
         "open",
         "close",
         "high",
@@ -136,14 +80,28 @@ def _slim_output(df: pd.DataFrame, specs) -> pd.DataFrame:
         "volume",
         "vol_atr_14",
         "rev_zscore_50",
+    ]
+    for col in base_cols:
+        if col in df.columns:
+            keep_cols.append(col)
+
+    of_struct_cols = [
         "of_delta",
         "of_delta_ema_20",
+        "of_imbalance",
         "of_sweep_flag",
-        "y_breakout",
-        "y_dir_15_30",
-        "y_dir_1_2",
-        "y_dir_5_10",
-        "y_mean_reversion",
+        "struct_fair_value",
+        "struct_nearest_level_dist",
+        "struct_last_sweep_dir",
+    ]
+    for col in of_struct_cols:
+        if col in df.columns:
+            keep_cols.append(col)
+
+    label_cols = sorted({spec.label_col for spec in specs if spec.label_col in df.columns})
+    keep_cols.extend(label_cols)
+
+    for col in [
         "momentum_score",
         "trend_score",
         "volatility_score",
@@ -151,64 +109,38 @@ def _slim_output(df: pd.DataFrame, specs) -> pd.DataFrame:
         "orderflow_score",
         "structure_score",
         "pattern_score",
-        "regime_id_stable",
-        "regime_confidence",
-        "regime_is_trend",
-        "regime_is_chop",
-        "regime_is_mean_reversion",
-        "regime_is_vol_expansion",
-        "regime_is_liq_drought",
-        "regime_hold_length_norm",
-        "regime_chop_mask",
-        "mean_reversion_flag",
-        "short_dir_prob_up",
-        "short_dir_prob_down",
-        "short_dir_prob_neutral",
-        "short_dir_confidence",
-        "short_dir_pred",
-        "dir_5_10_prob_up",
-        "dir_5_10_prob_down",
-        "dir_5_10_prob_neutral",
-        "dir_5_10_confidence",
-        "dir_5_10_pred",
-        "dir_15_30_prob_up",
-        "dir_15_30_prob_down",
-        "dir_15_30_prob_neutral",
-        "dir_15_30_confidence",
-        "dir_15_30_pred",
-        "breakout_prob_up",
-        "breakout_prob_down",
-        "breakout_confidence",
-        "breakout_pred",
-        "mean_reversion_prob_up",
-        "mean_reversion_prob_down",
-        "mean_reversion_confidence",
-        "mean_reversion_pred",
-    ]
+    ]:
+        if col in df.columns:
+            keep_cols.append(col)
 
-    # Warn about missing expected columns
-    missing = [c for c in desired if c not in df.columns]
-    if missing:
-        logging.warning("[MH] Missing expected columns (will be skipped): %s", missing)
+    regime_cols = [c for c in df.columns if c.startswith("regime_")]
+    keep_cols.extend(regime_cols)
 
-    # Keep desired in order if present
-    keep = [c for c in desired if c in df.columns]
-
-    # Add any extra prediction columns not already included
     pred_prefixes = [spec.name for spec in specs]
-    extra_preds = [
-        c for c in df.columns if any(c.startswith(pfx) for pfx in pred_prefixes) and c not in keep
-    ]
-    keep.extend(extra_preds)
+    pred_cols = [c for c in df.columns if any(c.startswith(pfx) for pfx in pred_prefixes)]
+    keep_cols.extend(pred_cols)
 
-    slim = df[keep].copy()
+    seen = set()
+    ordered_keep: List[str] = []
+    for c in keep_cols:
+        if c not in seen and c in df.columns:
+            seen.add(c)
+            ordered_keep.append(c)
 
-    # Downcast float64 -> float32
+    expected = set(base_cols + of_struct_cols + label_cols)
+    missing = [c for c in expected if c not in df.columns]
+    if missing:
+        logging.warning(
+            "[MH] Some expected columns for slim output are missing and will be skipped: %s",
+            missing,
+        )
+
+    slim = df[ordered_keep].copy()
+
     float_cols = slim.select_dtypes(include=["float64"]).columns
     if len(float_cols) > 0:
         slim[float_cols] = slim[float_cols].astype("float32")
 
-    # Downcast small ints where safe
     int_cols = slim.select_dtypes(include=["int64"]).columns
     for col in int_cols:
         col_max = slim[col].max()
@@ -220,16 +152,66 @@ def _slim_output(df: pd.DataFrame, specs) -> pd.DataFrame:
     return slim
 
 
-def _load_existing_ml() -> Optional[pd.DataFrame]:
+def _zero_pred_columns(
+    df: pd.DataFrame,
+    spec: MultiHorizonModelSpec,
+    dtype: np.dtype,
+) -> None:
     """
-    Load existing slim ML output if present.
+    Add zero-filled prediction columns for a spec when we skip scoring.
+    Mirrors the column names produced by _extract_probs.
     """
-    if not OUTPUT_PATH.exists():
-        return None
-    df = pd.read_parquet(OUTPUT_PATH)
-    if df.empty or "open_time_ms" not in df.columns:
-        return None
-    return df.sort_values("open_time_ms").reset_index(drop=True)
+    n = len(df)
+    prob_dtype = np.dtype(dtype) if dtype is not None else np.float32
+    pred_dtype = np.int16
+
+    if spec.problem_type == "binary":
+        df[f"{spec.name}_prob_up"] = np.zeros(n, dtype=prob_dtype)
+        df[f"{spec.name}_prob_down"] = np.zeros(n, dtype=prob_dtype)
+        df[f"{spec.name}_confidence"] = np.zeros(n, dtype=prob_dtype)
+    else:
+        df[f"{spec.name}_prob_up"] = np.zeros(n, dtype=prob_dtype)
+        df[f"{spec.name}_prob_down"] = np.zeros(n, dtype=prob_dtype)
+        df[f"{spec.name}_prob_neutral"] = np.zeros(n, dtype=prob_dtype)
+        df[f"{spec.name}_confidence"] = np.zeros(n, dtype=prob_dtype)
+
+    df[f"{spec.name}_pred"] = np.zeros(n, dtype=pred_dtype)
+
+
+def _load_template_feature_list() -> List[str]:
+    """
+    Read the training-time feature column order (numeric columns only,
+    excluding labels and open_time_ms) from the original training parquet
+    schema. This gives us an explicit 731-column template to align to.
+    """
+    if not TRAINING_FEATURES_PATH.exists():
+        raise FileNotFoundError(
+            f"Training features parquet not found: {TRAINING_FEATURES_PATH}"
+        )
+    if not TRAINING_LABELS_PATH.exists():
+        raise FileNotFoundError(
+            f"Training labels parquet not found: {TRAINING_LABELS_PATH}"
+        )
+
+    pf_feat = pq.ParquetFile(TRAINING_FEATURES_PATH)
+    pf_lbl = pq.ParquetFile(TRAINING_LABELS_PATH)
+
+    label_cols = set(pf_lbl.schema.names)
+    label_cols.discard("open_time_ms")
+
+    template: List[str] = []
+    for i, name in enumerate(pf_feat.schema.names):
+        if name in label_cols or name == "open_time_ms":
+            continue
+        ftype = pf_feat.schema_arrow[i].type
+        if ftype is None:
+            continue
+        from pyarrow import types as pat
+        if pat.is_integer(ftype) or pat.is_floating(ftype):
+            template.append(name)
+
+    logging.info("[MH] Loaded training template feature list (%d cols)", len(template))
+    return template
 
 
 def main() -> None:
@@ -237,155 +219,136 @@ def main() -> None:
 
     if not FEATURES_PATH.exists():
         raise FileNotFoundError(f"Features parquet not found: {FEATURES_PATH}")
+    if not LABELS_PATH.exists():
+        raise FileNotFoundError(f"Labels parquet not found: {LABELS_PATH}")
 
-    specs = default_model_specs()
-    label_cols = [s.label_col for s in specs]
+    logging.info("Loading features: %s", FEATURES_PATH)
+    feats = pd.read_parquet(FEATURES_PATH)
+    _log_mem(feats, "[MH] Loaded features")
 
-    cfg = MultiHorizonTrainingConfig(model_dir=MODEL_DIR)
-    models = _load_models_cached(cfg, specs)
-    labels_df = _load_labels_cached(label_cols)
+    logging.info("Loading labels: %s", LABELS_PATH)
+    labels = pd.read_parquet(LABELS_PATH)
+    _log_mem(labels, "[MH] Loaded labels")
 
-    logging.info("Loading live features_with_engines from %s", FEATURES_PATH)
-    base_df = pd.read_parquet(FEATURES_PATH)
-    if "open_time_ms" in base_df.columns:
-        base_df = base_df.sort_values("open_time_ms").reset_index(drop=True)
-    _log_mem(base_df, "[MH] Loaded live features_with_engines")
+    if "open_time_ms" not in feats.columns:
+        raise ValueError("Features parquet is missing 'open_time_ms'.")
+    if "open_time_ms" not in labels.columns:
+        raise ValueError("Labels parquet is missing 'open_time_ms'.")
 
-    if "open_time_ms" not in base_df.columns:
-        raise RuntimeError("features_pillar1_with_engines.parquet missing 'open_time_ms' column")
+    feats = feats.sort_values("open_time_ms").reset_index(drop=True)
+    labels = labels.sort_values("open_time_ms").reset_index(drop=True)
 
-    current_times = base_df["open_time_ms"].to_numpy()
+    logging.info("Merging features and labels on open_time_ms (inner join)")
+    n_feats_before = len(feats)
+    n_labels_before = len(labels)
+    df = feats.merge(labels, on="open_time_ms", how="inner", suffixes=("", "_lbl"))
+    _log_mem(df, "[MH] After merge")
 
-    # Fallback feature set if a model doesn't expose feature_names_in_
-    numeric_feature_cols = [
-        c
-        for c in base_df.columns
-        if c not in (["open_time_ms"] + label_cols)
-        and pd.api.types.is_numeric_dtype(base_df[c])
-    ]
+    del feats, labels
+    gc.collect()
 
-    # Load existing slim ML output (if any)
-    existing_slim = _load_existing_ml()
-    if existing_slim is not None and not existing_slim.empty:
-        last_scored_ms = int(existing_slim["open_time_ms"].max())
-    else:
-        last_scored_ms = -1
-
-    # Determine which rows need (re)scoring: strictly newer than last_scored_ms
-    new_mask = base_df["open_time_ms"] > last_scored_ms
-    new_df = base_df.loc[new_mask].copy()
-
-    if new_df.empty and existing_slim is not None:
-        # No new rows to score; just align existing ML to the current feature window and rewrite
-        logging.info(
-            "[MH] No new rows to score; aligning existing ML output to current feature window."
-        )
-        aligned_existing = existing_slim[existing_slim["open_time_ms"].isin(current_times)].copy()
-        aligned_existing = aligned_existing.sort_values("open_time_ms").reset_index(drop=True)
-        _log_mem(aligned_existing, "[MH] Reused existing ML output (no new rows)")
-        OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-        aligned_existing.to_parquet(OUTPUT_PATH, index=False, compression="zstd")
-        logging.info("Saved live Pillar 1 ML predictions (reused only) -> %s", OUTPUT_PATH)
-        return
-
-    if new_df.empty:
-        # No existing slim, but nothing marked as "new" (e.g. first run edgecase) -> score all
-        logging.info("[MH] No existing ML output; scoring entire current feature window.")
-        new_df = base_df.copy()
-
-    _log_mem(new_df, "[MH] Rows to score (new window subset)")
-
-    logging.info("Scoring multi-horizon models (pre-trained)")
-
-    # If all models share the same feature_names_in_, align once and reuse
-    shared_feature_names = None
-    shared_expected_count = None
-    if all(getattr(models[spec.name], "feature_names_in_", None) is not None for spec in specs):
-        first = specs[0].name
-        shared_feature_names = list(models[first].feature_names_in_)
-        shared_expected_count = getattr(models[first], "n_features_in_", None)
-        # Sanity: ensure all identical
-        for spec in specs[1:]:
-            if list(models[spec.name].feature_names_in_) != shared_feature_names:
-                shared_feature_names = None
-                shared_expected_count = None
-                break
-
-    aligned_cache = None
-    if shared_feature_names is not None:
-        aligned_cache = _align_features(
-            new_df,
-            shared_feature_names,
-            cfg.feature_dtype,
-            expected_count=shared_expected_count,
-        )
-
-    # Run each spec on the new_df subset
-    for spec in specs:
-        model = models[spec.name]
-        model_feature_cols = shared_feature_names
-        expected_count = shared_expected_count
-
-        if model_feature_cols is None:
-            model_feature_cols = getattr(model, "feature_names_in_", None)
-            if model_feature_cols is not None:
-                model_feature_cols = list(model_feature_cols)
-                expected_count = getattr(model, "n_features_in_", None)
-            else:
-                # Final fallback: use all numeric live columns
-                logging.warning(
-                    "[MH] Model %s has no feature_names_in_; falling back to all numeric live features.",
-                    spec.name,
-                )
-                model_feature_cols = numeric_feature_cols
-                expected_count = getattr(model, "n_features_in_", None)
-
-        if aligned_cache is not None and shared_feature_names is not None:
-            X = aligned_cache
-        else:
-            X = _align_features(
-                new_df,
-                model_feature_cols,
-                cfg.feature_dtype,
-                expected_count=expected_count,
-            )
-
-        prob_dict = _extract_probs(model, X, spec)
-        for k, v in prob_dict.items():
-            new_df[k] = v
-
-    # Merge labels (if available) for downstream compatibility (only for new rows)
-    if labels_df is not None and "open_time_ms" in new_df.columns:
-        new_df = new_df.merge(
-            labels_df[["open_time_ms"] + label_cols],
-            on="open_time_ms",
-            how="left",
-            suffixes=("", "_lbl"),
-        )
-        logging.info("[MH] Merged labels into live ML output (new rows only)")
-
-    # Slim just the new rows to the downstream schema
-    new_slim = _slim_output(new_df, specs)
-
-    # Combine with existing slim ML, drop duplicates on open_time_ms, and align to current window
-    if existing_slim is not None:
-        combined = pd.concat([existing_slim, new_slim], ignore_index=True)
-    else:
-        combined = new_slim
-
-    combined = combined.sort_values("open_time_ms").drop_duplicates(
-        subset="open_time_ms", keep="last"
+    logging.info(
+        "[MH] Row counts: features=%d, labels=%d, merged=%d",
+        n_feats_before,
+        n_labels_before,
+        len(df),
     )
 
-    # Keep only rows that are in the current feature window (so shapes line up downstream)
-    combined = combined[combined["open_time_ms"].isin(current_times)].copy()
-    combined = combined.sort_values("open_time_ms").reset_index(drop=True)
+    if len(df) < min(n_feats_before, n_labels_before) * 0.5:
+        logging.warning(
+            "[MH] Merged dataset has < 50%% of rows of min(features, labels). "
+            "Check label alignment and horizons."
+        )
 
-    _log_mem(combined, "[MH] Final df with ML predictions (live)")
+    specs = default_model_specs()
+    cfg = MultiHorizonTrainingConfig(model_dir=MODEL_DIR)
+    models = load_models(cfg, specs)
+
+    label_cols = [spec.label_col for spec in specs]
+    drop_cols = set(label_cols)
+    if "open_time_ms" in df.columns:
+        drop_cols.add("open_time_ms")
+
+    # Align to the exact training feature template (731 columns, fixed order)
+    template_features = _load_template_feature_list()
+
+    live_numeric = df.drop(columns=list(drop_cols), errors="ignore").select_dtypes(include=[np.number])
+    missing = [c for c in template_features if c not in live_numeric.columns]
+    extra = [c for c in live_numeric.columns if c not in template_features]
+    if missing:
+        logging.warning("[MH] Live data missing %d template features; filling with 0.0: %s", len(missing), missing)
+    if extra:
+        logging.info("[MH] Dropping %d extra numeric columns not in training template: %s", len(extra), extra)
+
+    # Build aligned feature matrix
+    aligned = pd.DataFrame(index=df.index)
+    for col in template_features:
+        if col in live_numeric.columns:
+            aligned[col] = live_numeric[col]
+        else:
+            aligned[col] = 0.0
+
+    logging.info(
+        "[MH] Aligned features to training template: %d cols (expected 731)",
+        aligned.shape[1],
+    )
+
+    if cfg.feature_dtype:
+        aligned = aligned.astype(cfg.feature_dtype, copy=False)
+
+    X_all = aligned.to_numpy(copy=False)
+    del aligned, live_numeric
+    gc.collect()
+
+    logging.info(
+        "[MH] Feature matrix built: shape=%s, dtype=%s",
+        X_all.shape,
+        X_all.dtype,
+    )
+
+    results = df
+
+    for spec in specs:
+        label_series = results[spec.label_col]
+        mask = label_series.notna().to_numpy()
+        if not mask.any():
+            if STRICT_LABEL_CHECK:
+                raise ValueError(f"No non-NaN rows for label {spec.label_col}")
+            logging.warning(
+                "[MH] Label %s is all NaN; skipping model '%s' and zero-filling preds.",
+                spec.label_col,
+                spec.name,
+            )
+            _zero_pred_columns(results, spec, cfg.feature_dtype)
+            continue
+
+        idx_all = np.flatnonzero(mask)
+        X_label = X_all[idx_all, :]
+
+        model = models[spec.name]
+        prob_dict = _extract_probs(model, X_label, spec)
+
+        for k, v in prob_dict.items():
+            if np.issubdtype(v.dtype, np.floating):
+                v = v.astype(cfg.feature_dtype, copy=False)
+            results.loc[idx_all, k] = v
+
+        del X_label, idx_all
+        gc.collect()
+
+    pred_prefixes = [spec.name for spec in specs]
+    pred_cols = [c for c in results.columns if any(c.startswith(p) for p in pred_prefixes)]
+    if pred_cols:
+        results[pred_cols] = results[pred_cols].fillna(0.0)
+
+    df_slim = _slim_ml_output(results, specs=specs)
 
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    combined.to_parquet(OUTPUT_PATH, index=False, compression="zstd")
+    df_slim.to_parquet(OUTPUT_PATH, index=False, compression="zstd")
     logging.info("Saved live Pillar 1 ML predictions -> %s", OUTPUT_PATH)
+
+    del df, results, df_slim
+    gc.collect()
 
 
 if __name__ == "__main__":

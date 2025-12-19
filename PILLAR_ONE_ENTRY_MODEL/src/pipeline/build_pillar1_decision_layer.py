@@ -24,6 +24,7 @@ Run:
 
 import logging
 from pathlib import Path
+import sys
 
 import pandas as pd
 
@@ -31,6 +32,17 @@ from src.models.pillar1_decision_layer import DecisionConfig, apply_decision_lay
 
 BASE_DIR = Path(__file__).resolve().parents[3]
 P1_BASE = BASE_DIR / "PILLAR_ONE_ENTRY_MODEL"
+
+# Optional shared decision config from Pillar 6
+P6_SRC = BASE_DIR / "PILLAR_SIX_SAFETY_LAYER" / "src"
+if str(P6_SRC) not in sys.path:
+    sys.path.append(str(P6_SRC))
+
+try:  # noqa: SIM105
+    from safety.p1_decision_config import P1_DECISION_CONFIG  # type: ignore
+except Exception:  # noqa: BLE001
+    P1_DECISION_CONFIG = None
+    logging.warning("P1_DECISION_CONFIG not found; using defaults.")
 
 INPUT_PATH = P1_BASE / "data" / "processed" / "features_pillar1_with_calib.parquet"
 OUTPUT_PATH = P1_BASE / "data" / "processed" / "features_pillar1_final.parquet"
@@ -58,14 +70,18 @@ def main() -> None:
     if "open_time_ms" in df.columns:
         df = df.sort_values("open_time_ms").reset_index(drop=True)
 
-    # Default config; you can tweak thresholds later if needed
-    cfg = DecisionConfig(
-        long_threshold=0.55,
-        short_threshold=0.45,
-        min_confidence_for_entry=0.10,
-    )
+    # Load shared config if available; otherwise fallback to defaults
+    if P1_DECISION_CONFIG is not None:
+        cfg = DecisionConfig(**P1_DECISION_CONFIG)
+        logging.info("Applying Pillar 1 decision layer with shared config: %s", cfg)
+    else:
+        cfg = DecisionConfig(
+            long_threshold=0.55,
+            short_threshold=0.45,
+            min_confidence_for_entry=0.10,
+        )
+        logging.info("Applying Pillar 1 decision layer with local defaults: %s", cfg)
 
-    logging.info("Applying Pillar 1 decision layer with config: %s", cfg)
     df_out = apply_decision_layer(df, cfg=cfg)
     _log_mem(df_out, "[Decision] After decision layer")
 

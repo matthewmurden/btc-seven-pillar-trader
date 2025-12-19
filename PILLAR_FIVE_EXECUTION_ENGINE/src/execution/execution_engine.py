@@ -144,6 +144,10 @@ class BinanceFuturesClient:
     def _require_json(self, resp: Response, path: str) -> Any:
         ct = (resp.headers.get("Content-Type", "") or "").lower()
         if "application/json" not in ct:
+            text = (resp.text or "").strip()
+            if text.lower() == "ok":
+                logger.warning("Non-JSON OK response from %s; treating as success.", path)
+                return {"ok": True}
             raise RuntimeError(f"Expected JSON from {path}, got content-type={ct!r}: {resp.text[:200]!r}")
         return resp.json()
 
@@ -219,7 +223,9 @@ class BinanceFuturesClient:
                     if int(data.get("code", 0)) == -4059:
                         return {"noop": True, "mode": desired, "result": data}
                 except Exception:
-                    pass
+                    text = (resp.text or "").lower()
+                    if "no need to change position side" in text:
+                        return {"noop": True, "mode": desired, "result": {"code": -4059, "msg": resp.text}}
             raise
 
     def set_leverage(self, symbol: str, leverage: int) -> Any:
@@ -451,7 +457,7 @@ class BinanceFuturesClient:
         if not resp.ok:
             logger.error("POST /fapi/v1/listenKey failed (%s): %s", resp.status_code, (resp.text or "")[:300])
             resp.raise_for_status()
-        data = resp.json()
+        data = self._require_json(resp, "/fapi/v1/listenKey")
         lk = str(data.get("listenKey", ""))
         if not lk:
             raise RuntimeError(f"listenKey missing in response: {data}")
@@ -542,7 +548,11 @@ class WebSocketRunner:
             logger.warning("WebSocket disabled (missing deps). Install `pip install websockets`. Reason: %s", e)
             return
 
-        self.listen_key = self.client.start_listen_key()
+        try:
+            self.listen_key = self.client.start_listen_key()
+        except Exception as e:
+            logger.warning("WebSocket disabled (listenKey error): %s", e)
+            return
 
         self._thread = threading.Thread(target=self._run_loop_thread, daemon=True)
         self._thread.start()
