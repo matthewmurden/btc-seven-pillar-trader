@@ -50,6 +50,11 @@ def main() -> None:
 
     stable_df = stab_mod.smooth(fused, ml, det)
 
+    # Normalise regime label columns to strings to avoid mixed dtypes downstream
+    for col in ["regime_label_stable", "regime_label_prev"]:
+        if col in stable_df.columns:
+            stable_df[col] = stable_df[col].astype(str)
+
     # Add prefixed aliases to mirror training artifacts (stable_* names)
     alias_map = {
         "regime_label_stable": "stable_regime_label_stable",

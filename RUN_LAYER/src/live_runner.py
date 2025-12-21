@@ -66,6 +66,10 @@ PRE_P4_DIR = RUN_PROCESSED / "PRE_PILLARFOUR"
 NORM_PATH = PRE_P4_DIR / "normalised_features.parquet"
 
 LOG_PATH = RUN_PROCESSED / "live_combined_log.parquet"
+LAST_EXEC_FILE = RUN_PROCESSED / "PILLAR_FIVE_EXECUTION_ENGINE" / "last_executed_wall_ms.txt"
+
+# Prevent rapid double-fires; adjust if you want a longer/shorter cool-down
+ENTRY_COOLDOWN_MS = 10_000
 
 # Base pillar modules (non-live)
 P3_ENGINE_PATH = BASE_DIR / "PILLAR_THREE_RISK_MODEL" / "src" / "pipeline" / "p3_engine.py"
@@ -366,6 +370,23 @@ def _current_closed_minute_ms() -> int:
     now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
     closed = now - pd.Timedelta(minutes=1)
     return int(closed.timestamp() * 1000)
+
+
+def _load_last_exec_wall_ms() -> Optional[int]:
+    try:
+        if LAST_EXEC_FILE.exists():
+            return int(LAST_EXEC_FILE.read_text().strip())
+    except Exception:
+        logging.warning("Could not read %s", LAST_EXEC_FILE)
+    return None
+
+
+def _save_last_exec_wall_ms(ts_ms: int) -> None:
+    try:
+        LAST_EXEC_FILE.parent.mkdir(parents=True, exist_ok=True)
+        LAST_EXEC_FILE.write_text(str(int(ts_ms)))
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Could not write %s: %s", LAST_EXEC_FILE, exc)
 
 
 def _load_norm_features() -> pd.DataFrame | None:
@@ -681,6 +702,20 @@ def run_p3_p5_p6_p7(
     )
     p6_reason = ""
 
+    # Cooldown guard to avoid rapid double-fire within ENTRY_COOLDOWN_MS
+    if execute:
+        now_ms = int(time.time() * 1000)
+        last_exec_ms = _load_last_exec_wall_ms()
+        if last_exec_ms is not None and (now_ms - last_exec_ms) < ENTRY_COOLDOWN_MS:
+            execute = False
+            p6_reason = f"cooldown_active_{ENTRY_COOLDOWN_MS}ms"
+            logging.info(
+                "Execution skipped due to cooldown (last_exec_ms=%s, now_ms=%s, delta_ms=%s)",
+                last_exec_ms,
+                now_ms,
+                now_ms - last_exec_ms,
+            )
+
     if execute and p6_safety is not None:
         p1_row = _load_latest_row(P1_FINAL)
         if p1_row is None:
@@ -768,6 +803,8 @@ def run_p3_p5_p6_p7(
 
     # Execute via Pillar 5 engine
     try:
+        # Persist wall-clock time of this execution to enforce cooldown across loops
+        _save_last_exec_wall_ms(int(time.time() * 1000))
         res = p5_exec.execute_intent(p5_intent)
         _log_event_safe(
             p7_logger,

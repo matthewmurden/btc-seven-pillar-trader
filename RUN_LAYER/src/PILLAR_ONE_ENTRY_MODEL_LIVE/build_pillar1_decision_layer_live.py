@@ -81,6 +81,11 @@ def main() -> None:
     df_out = apply_decision_layer(df, cfg=cfg)
     _log_mem(df_out, "[Decision] After decision layer")
 
+    # Quick distribution for debugging gating/none prevalence
+    if "entry_decision" in df_out.columns:
+        dist = df_out["entry_decision"].value_counts(dropna=False).to_dict()
+        logging.info("[Decision] entry_decision distribution: %s", dist)
+
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     df_out.to_parquet(OUTPUT_PATH, index=False)
     logging.info("Saved Pillar 1 final features (live) -> %s", OUTPUT_PATH)

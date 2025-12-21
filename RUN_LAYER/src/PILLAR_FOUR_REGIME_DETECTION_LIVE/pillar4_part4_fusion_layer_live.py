@@ -48,6 +48,11 @@ def main() -> None:
 
     fused_df = fusion_mod.fuse(det, ml)
 
+    # Normalise regime label columns to strings to avoid mixed dtypes downstream
+    for col in ["regime_label_fused", "regime_pred", "deterministic_label"]:
+        if col in fused_df.columns:
+            fused_df[col] = fused_df[col].astype(str)
+
     # Add prefixed aliases to mirror training artifacts (fused_* names)
     alias_map = {
         "regime_label_fused": "fused_regime_label_fused",

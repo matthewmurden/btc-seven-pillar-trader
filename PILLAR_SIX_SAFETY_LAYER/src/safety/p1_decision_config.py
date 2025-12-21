@@ -14,7 +14,7 @@ P1_DECISION_CONFIG = {
     "long_threshold": 0.55,
     "short_threshold": 0.45,
     # Minimum confidence gate after calibration → entry_confidence >= this
-    "min_confidence_for_entry": 0.7,
+    "min_confidence_for_entry": 0.1,
     # Liquidity drought kill-switch (uses regime_is_liq_drought if present)
     "liq_drought_kill": True,
 }

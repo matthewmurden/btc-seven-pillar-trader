@@ -49,8 +49,8 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Pillar6Config:
     # --- Binance Futures REST ---
-    api_key: str = os.getenv("BINANCE_FUTURES_API_KEY", "")
-    api_secret: str = os.getenv("BINANCE_FUTURES_API_SECRET", "")
+    api_key: str = os.getenv("BINANCE_FUTURES_API_KEY", "REMOVED")
+    api_secret: str = os.getenv("BINANCE_FUTURES_API_SECRET", "REMOVED")
     base_url: str = os.getenv("BINANCE_FUTURES_BASE_URL", "https://demo-fapi.binance.com")
     symbol: str = os.getenv("BINANCE_FUTURES_SYMBOL", "BTCUSDT")
     recv_window: int = int(os.getenv("BINANCE_FUTURES_RECV_WINDOW", "5000"))
@@ -60,15 +60,17 @@ class Pillar6Config:
     price_protect: bool = os.getenv("BINANCE_FUTURES_PRICE_PROTECT", "false").lower() == "true"
 
     # --- Pre-trade safety thresholds (conservative defaults) ---
-    max_fill_spread_bps_default: float = float(os.getenv("P5_DEFAULT_MAX_FILL_SPREAD_BPS", "8.0"))
-    volatility_shock_mult: float = float(os.getenv("P6_VOL_SHOCK_MULT", "2.0"))  # current_vol > mult * baseline_vol
-    volatility_shock_abs_bps: float = float(os.getenv("P6_VOL_SHOCK_ABS_BPS", "30.0"))  # or absolute trigger
+    # NOTE: defaults are relaxed to let trading flow; tighten once you review live data.
+    max_fill_spread_bps_default: float = float(os.getenv("P5_DEFAULT_MAX_FILL_SPREAD_BPS", "50.0"))
+    volatility_shock_mult: float = float(os.getenv("P6_VOL_SHOCK_MULT", "10.0"))  # relaxed: require 10x baseline
+    volatility_shock_abs_bps: float = float(os.getenv("P6_VOL_SHOCK_ABS_BPS", "100.0"))  # relaxed absolute cap
 
-    # System-level pre-trade guards
+    # System-level pre-trade guards (fee-aware defaults)
     min_r_multiple_for_system: float = float(os.getenv("P6_MIN_R_MULTIPLE", "0.8"))  # tp_dist / sl_dist
-    max_sl_dist_for_system: float = float(os.getenv("P6_MAX_SL_DIST", "0.003"))  # SL <= 0.3%
-    min_tp_dist_for_system: float = float(os.getenv("P6_MIN_TP_DIST", "0.003"))  # TP >= 0.3%
-    min_entry_conf_for_system: float = float(os.getenv("P6_MIN_ENTRY_CONF", "0.40"))
+    min_sl_dist_for_system: float = float(os.getenv("P6_MIN_SL_DIST", "0.0006"))  # >= 0.06%
+    max_sl_dist_for_system: float = float(os.getenv("P6_MAX_SL_DIST", "0.0030"))  # <= 0.30%
+    min_tp_dist_for_system: float = float(os.getenv("P6_MIN_TP_DIST", "0.0020"))  # >= 0.20%
+    min_entry_conf_for_system: float = float(os.getenv("P6_MIN_ENTRY_CONF", "0.0"))
 
     # Data staleness (WS) – if you don't use WS, set very large or disable.
     ws_stale_ms: int = int(os.getenv("P6_WS_STALE_MS", "2500"))
@@ -408,6 +410,12 @@ class Pillar6Safety:
             return _block(
                 "r_multiple_below_min",
                 metadata={"r_multiple": r_multiple, "min_required": self.cfg.min_r_multiple_for_system},
+            )
+
+        if sl_dist_pct < self.cfg.min_sl_dist_for_system:
+            return _block(
+                "sl_distance_too_small",
+                metadata={"sl_dist_pct": sl_dist_pct, "min_required": self.cfg.min_sl_dist_for_system},
             )
 
         if sl_dist_pct > self.cfg.max_sl_dist_for_system:

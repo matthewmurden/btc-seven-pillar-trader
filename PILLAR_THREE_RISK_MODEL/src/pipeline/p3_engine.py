@@ -305,10 +305,26 @@ class Pillar3RiskModel:
         if open_time_ms <= 0:
             raise ValueError("Missing open_time_ms alignment key in P1/P2 inputs.")
 
-        side = str(_first_present(p1, ["side", "entry_direction", "entry_side"], "")).lower().strip()
+        side_raw = _first_present(p1, ["side", "entry_direction", "entry_side"], "")
+        side = str(side_raw).lower().strip()
+
+        # Map numeric directions to long/short if needed
+        if side not in ("long", "short"):
+            try:
+                v = float(side_raw)
+                if v >= 0.5:
+                    side = "long"
+                elif v <= -0.5:
+                    side = "short"
+            except Exception:
+                pass
+
         if side not in ("long", "short"):
             # Sometimes P1 uses decision labels; try to infer from sign
-            side = "long" if str(_first_present(p1, ["entry_decision"], "")).lower() == "long" else side
+            dec = str(_first_present(p1, ["entry_decision"], "")).lower()
+            if dec in ("long", "short"):
+                side = dec
+
         if side not in ("long", "short"):
             raise ValueError(f"Bad side in P1 row: {side!r}")
 
