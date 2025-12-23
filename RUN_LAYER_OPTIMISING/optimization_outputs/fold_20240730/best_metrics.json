@@ -1,0 +1,52 @@
+{
+  "fold_id": "20240730",
+  "fit_start_utc": "2024-01-02T23:36:00+00:00",
+  "val_start_utc": "2024-06-30T23:36:00+00:00",
+  "test_start_utc": "2024-07-30T23:36:00+00:00",
+  "test_end_utc": "2024-08-29T23:36:00+00:00",
+  "rows_val": 36778,
+  "rows_test": 36565,
+  "candles_val": 43200,
+  "candles_test": 43200,
+  "selected_on": "VAL",
+  "best_params": {
+    "long_threshold": 0.5218032944662445,
+    "short_threshold": 0.47126488040020487,
+    "conf_floor": 0.35151651891745683,
+    "tp_floor_pct": 0.0047891123196421035,
+    "sl_floor_pct": 0.002838423771692059,
+    "sl_cap_pct": 0.008070189901715957,
+    "rr_min": 3.3261521380286245,
+    "tp_first_prob_min": 0.47716885606761106
+  },
+  "equity_base": 1.0,
+  "drawdown_definition": "(equity - peak) / peak, with equity starting at equity_base",
+  "val": {
+    "score": -0.3452943334100153,
+    "n": 72,
+    "max_dd": 0.02857536237449492,
+    "tuw": 0.6527777777777778,
+    "mean_r": 0.003685732636498052,
+    "total_r": 0.26537274982785974,
+    "sharpe": 3.0419967292768555
+  },
+  "test": {
+    "score": -0.22807070813567276,
+    "n": 72,
+    "max_dd": 0.016299289370763977,
+    "tuw": 0.4583333333333333,
+    "mean_r": 0.00993895624044214,
+    "total_r": 0.7156048493118341,
+    "sharpe": 5.399820203617144
+  },
+  "realized_settings": {
+    "max_hold_minutes": 240,
+    "no_overlap": true,
+    "same_bar_rule": "SL_FIRST",
+    "costs": {
+      "slippage_bps": 3.0,
+      "entry_fee": 0.00036,
+      "exit_fee": 0.0004
+    }
+  }
+}

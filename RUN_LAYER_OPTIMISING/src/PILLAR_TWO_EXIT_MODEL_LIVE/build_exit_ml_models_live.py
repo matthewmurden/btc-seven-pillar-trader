@@ -49,6 +49,23 @@ def _log_mem(df: pd.DataFrame, msg: str) -> None:
     logging.info("%s | shape=%s | approx_mem=%.1f MB", msg, df.shape, mb)
 
 
+def _neutralize_label_leaks(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Remove future-looking label columns before feeding the ML models.
+
+    The trained bundles unfortunately include y_* labels in their feature list;
+    during live/test runs those labels are computed from future price moves,
+    so we must zero them out to avoid leakage while keeping the expected
+    column names/dimensions for the loaded model artifacts.
+    """
+    leak_prefixes = ("y_dir_", "y_breakout", "y_mean_reversion")
+    leak_cols = [c for c in df.columns if c.startswith(leak_prefixes)]
+    if leak_cols:
+        logging.warning("[ExitML] Zeroing label/leak columns for inference: %s", leak_cols)
+        df.loc[:, leak_cols] = 0.0
+    return df
+
+
 def _load_bundle(spec: ExitModelSpec):
     path = MODEL_DIR / f"{spec.name}.joblib"
     if not path.exists():
@@ -217,6 +234,9 @@ def main() -> None:
     logging.info("Loading exit_with_deterministic (live): %s", INPUT_PATH)
     df = pd.read_parquet(INPUT_PATH)
     _log_mem(df, "[ExitML] Loaded deterministic features")
+
+    # Prevent future-label leakage by zeroing y_* columns before model inference.
+    df = _neutralize_label_leaks(df)
 
     specs = default_exit_model_specs()
 
