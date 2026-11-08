@@ -1,0 +1,52 @@
+# ---------- Secrets ----------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# ---------- Virtual environments ----------
+venv/
+.venv/
+env/
+ENV/
+
+# ---------- Testing / tooling caches ----------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# ---------- Data, models and results (generated - never commit) ----------
+data/
+processed/
+models/
+folds/
+optimization_outputs/
+live_candles/
+live_aggtrades/
+*.parquet
+*.csv
+*.joblib
+*.pkl
+*.png
+*.log
+
+# ---------- OS / editor junk ----------
+.DS_Store
+.metadata_never_index
+Thumbs.db
+.vscode/
+.idea/
+*.swp

@@ -49,8 +49,8 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Pillar6Config:
     # --- Binance Futures REST ---
-    api_key: str = os.getenv("BINANCE_FUTURES_API_KEY", "REMOVED")
-    api_secret: str = os.getenv("BINANCE_FUTURES_API_SECRET", "REMOVED")
+    api_key: str = os.getenv("BINANCE_FUTURES_API_KEY", "")
+    api_secret: str = os.getenv("BINANCE_FUTURES_API_SECRET", "")
     base_url: str = os.getenv("BINANCE_FUTURES_BASE_URL", "https://demo-fapi.binance.com")
     symbol: str = os.getenv("BINANCE_FUTURES_SYMBOL", "BTCUSDT")
     recv_window: int = int(os.getenv("BINANCE_FUTURES_RECV_WINDOW", "5000"))

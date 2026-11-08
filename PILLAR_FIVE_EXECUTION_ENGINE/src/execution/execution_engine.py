@@ -109,9 +109,6 @@ class Pillar5Config:
     default_time_budget_ms: int = int(os.getenv("P5_DEFAULT_TIME_BUDGET_MS", "10000"))
     default_urgency: float = float(os.getenv("P5_DEFAULT_URGENCY", "0.4"))
 
-    # Phase0 maker behaviour: allow post-only rejection vs. use regular GTC to ensure placement
-    post_only_phase0: bool = os.getenv("P5_POST_ONLY_PHASE0", "false").lower() == "true"
-
     # If entry doesn’t fill after ladder -> do we cancel leftover?
     cancel_unfilled_entry_on_timeout: bool = os.getenv("P5_CANCEL_UNFILLED_ENTRY_ON_TIMEOUT", "true").lower() == "true"
 
@@ -147,10 +144,6 @@ class BinanceFuturesClient:
     def _require_json(self, resp: Response, path: str) -> Any:
         ct = (resp.headers.get("Content-Type", "") or "").lower()
         if "application/json" not in ct:
-            text = (resp.text or "").strip()
-            if text.lower() == "ok":
-                logger.warning("Non-JSON OK response from %s; treating as success.", path)
-                return {"ok": True}
             raise RuntimeError(f"Expected JSON from {path}, got content-type={ct!r}: {resp.text[:200]!r}")
         return resp.json()
 
@@ -226,9 +219,7 @@ class BinanceFuturesClient:
                     if int(data.get("code", 0)) == -4059:
                         return {"noop": True, "mode": desired, "result": data}
                 except Exception:
-                    text = (resp.text or "").lower()
-                    if "no need to change position side" in text:
-                        return {"noop": True, "mode": desired, "result": {"code": -4059, "msg": resp.text}}
+                    pass
             raise
 
     def set_leverage(self, symbol: str, leverage: int) -> Any:
@@ -460,7 +451,7 @@ class BinanceFuturesClient:
         if not resp.ok:
             logger.error("POST /fapi/v1/listenKey failed (%s): %s", resp.status_code, (resp.text or "")[:300])
             resp.raise_for_status()
-        data = self._require_json(resp, "/fapi/v1/listenKey")
+        data = resp.json()
         lk = str(data.get("listenKey", ""))
         if not lk:
             raise RuntimeError(f"listenKey missing in response: {data}")
@@ -551,11 +542,7 @@ class WebSocketRunner:
             logger.warning("WebSocket disabled (missing deps). Install `pip install websockets`. Reason: %s", e)
             return
 
-        try:
-            self.listen_key = self.client.start_listen_key()
-        except Exception as e:
-            logger.warning("WebSocket disabled (listenKey error): %s", e)
-            return
+        self.listen_key = self.client.start_listen_key()
 
         self._thread = threading.Thread(target=self._run_loop_thread, daemon=True)
         self._thread.start()
@@ -641,15 +628,12 @@ class OMSState:
     position_side: str  # LONG / SHORT
     entry_order_id: Optional[int] = None
     entry_client_id: Optional[str] = None
-    entry_created_ms: Optional[int] = None  # when the current entry ladder started
 
     tp_order_id: Optional[int] = None
     tp_client_id: Optional[str] = None
-    tp_price: Optional[float] = None
 
     sl_order_id: Optional[int] = None
     sl_client_id: Optional[str] = None
-    sl_price: Optional[float] = None
 
     last_entry_status: str = ""
     last_known_position_amt: float = 0.0
@@ -741,8 +725,6 @@ class Pillar5ExecutionEngine:
                 entry_client_id=entry_cid,
                 tp_client_id=tp_cid,
                 sl_client_id=sl_cid,
-                tp_price=tp_price,
-                sl_price=sl_price,
             )
 
         # Quantize qty
@@ -758,13 +740,9 @@ class Pillar5ExecutionEngine:
         reference_mid = float(snap["mid"])
         chase_cap_price = reference_mid * (1.0 + max_chase_bps / 1e4) if side_str == "long" else reference_mid * (1.0 - max_chase_bps / 1e4)
 
-        start_ms = int(time.time() * 1000)
-        deadline_ms = start_ms + time_budget_ms
-
         with self._oms_lock:
             self._states[state_key].reference_mid = reference_mid
             self._states[state_key].chase_cap_price = chase_cap_price
-            self._states[state_key].entry_created_ms = start_ms
 
         # Refuse if spread already too wide
         if snap["spread_bps"] is not None and float(snap["spread_bps"]) > max_fill_spread_bps:
@@ -775,6 +753,9 @@ class Pillar5ExecutionEngine:
                 "max_fill_spread_bps": max_fill_spread_bps,
                 "market": snap,
             }
+
+        start_ms = int(time.time() * 1000)
+        deadline_ms = start_ms + time_budget_ms
 
         # -------------------------
         # Phase 0: Maker attempt
@@ -1028,18 +1009,10 @@ class Pillar5ExecutionEngine:
     def _cancel_by_any_id(self, symbol: str, order_obj: Dict[str, Any]) -> None:
         oid = order_obj.get("orderId")
         cid = order_obj.get("clientOrderId")
-        try:
-            if oid is not None:
-                self.client.cancel_order(symbol, order_id=int(oid))
-            elif cid:
-                self.client.cancel_order(symbol, orig_client_order_id=str(cid))
-        except Exception as e:
-            # Binance returns -2011 Unknown order if it was already filled/cancelled; treat as benign.
-            msg = str(e)
-            if "-2011" in msg or "Unknown order" in msg:
-                logger.debug("Cancel ignored for already-absent order %s | %s", symbol, msg)
-                return
-            raise
+        if oid is not None:
+            self.client.cancel_order(symbol, order_id=int(oid))
+        elif cid:
+            self.client.cancel_order(symbol, orig_client_order_id=str(cid))
 
     # ---------------------------
     # Side state + orphan cleanup
@@ -1124,22 +1097,6 @@ class Pillar5ExecutionEngine:
 
         # No position => no brackets
         if abs(pos_amt) == 0.0:
-            # Grace period: if we recently sent an entry and brackets exist, allow time for position to register
-            state_key = f"{symbol}|{position_side}"
-            grace_ms = 15_000
-            recent_entry = False
-            try:
-                with self._oms_lock:
-                    st_state = self._states.get(state_key)
-                if st_state and st_state.entry_created_ms:
-                    recent_entry = (int(time.time() * 1000) - st_state.entry_created_ms) < grace_ms
-            except Exception:
-                recent_entry = False
-
-            if recent_entry and bracket_like:
-                st["reconcile_action"] = "grace_wait_entry_confirm"
-                return st
-
             if bracket_like:
                 for o in bracket_like:
                     try:
@@ -1151,28 +1108,9 @@ class Pillar5ExecutionEngine:
 
         # Position exists => must have BOTH TP and SL
         if tp is None and sl is None:
-            # Try to restore from cached intent state
-            state_key = f"{symbol}|{position_side}"
-            with self._oms_lock:
-                cached = self._states.get(state_key)
-            if cached and cached.tp_price and cached.sl_price:
-                entry_side = "BUY" if position_side == "LONG" else "SELL"
-                tp_cid = cached.tp_client_id or f"{self.cfg.client_id_prefix}{int(time.time()*1000)}_{position_side}_TP_RE"
-                sl_cid = cached.sl_client_id or f"{self.cfg.client_id_prefix}{int(time.time()*1000)}_{position_side}_SL_RE"
-                restore = self._ensure_brackets(
-                    symbol=symbol,
-                    entry_side=entry_side,
-                    position_side=position_side,
-                    tp_price=cached.tp_price,
-                    sl_price=cached.sl_price,
-                    tp_cid=tp_cid,
-                    sl_cid=sl_cid,
-                )
-                st["reconcile_action"] = "restored_missing_both" if restore.get("brackets_placed") else "restore_failed_both"
-                st["restore"] = restore
-                return st
-
             st["reconcile_action"] = "missing_both_brackets_needs_restore"
+            # can't restore without knowing tp/sl levels; Pillar5 execute_intent stores them in state per open_time.
+            # Best effort: do nothing here; actual restore happens immediately after entry in execute_intent.
             return st
 
         if tp is None or sl is None:
@@ -1184,27 +1122,6 @@ class Pillar5ExecutionEngine:
                     self._cancel_by_any_id(symbol, sl)
             except Exception:
                 pass
-            # Try to recreate both if we have cached prices
-            state_key = f"{symbol}|{position_side}"
-            with self._oms_lock:
-                cached = self._states.get(state_key)
-            if cached and cached.tp_price and cached.sl_price:
-                entry_side = "BUY" if position_side == "LONG" else "SELL"
-                tp_cid = cached.tp_client_id or f"{self.cfg.client_id_prefix}{int(time.time()*1000)}_{position_side}_TP_RE"
-                sl_cid = cached.sl_client_id or f"{self.cfg.client_id_prefix}{int(time.time()*1000)}_{position_side}_SL_RE"
-                restore = self._ensure_brackets(
-                    symbol=symbol,
-                    entry_side=entry_side,
-                    position_side=position_side,
-                    tp_price=cached.tp_price,
-                    sl_price=cached.sl_price,
-                    tp_cid=tp_cid,
-                    sl_cid=sl_cid,
-                )
-                st["reconcile_action"] = "restored_partial" if restore.get("brackets_placed") else "restore_failed_partial"
-                st["restore"] = restore
-                return st
-
             st["reconcile_action"] = "partial_bracket_found_cancelled"
             return st
 
@@ -1260,15 +1177,14 @@ class Pillar5ExecutionEngine:
         # quantize
         _, p_str = self.client.quantize_limit_price(symbol, binance_side, raw_price)
 
-        tif = "GTX" if self.cfg.post_only_phase0 else "GTC"
-        logger.info("[P5] Phase0 maker: %s %s qty=%s price=%s tif=%s", symbol, binance_side, qty_str, p_str, tif)
+        logger.info("[P5] Phase0 maker: %s %s qty=%s price=%s tif=GTX", symbol, binance_side, qty_str, p_str)
         return self.client.create_limit(
             symbol=symbol,
             side=binance_side,
             position_side=position_side,
             qty_str=qty_str,
             price_str=p_str,
-            tif=tif,
+            tif="GTX",  # post-only
             client_order_id=client_id,
         )
 
@@ -1453,3 +1369,4 @@ if __name__ == "__main__":
     p = Path(__file__).resolve().parents[1] / "RUN_LAYER" / "data" / "processed" / "PILLAR_THREE_RISK_MODEL" / "risk_intents.parquet"
     res = execute_latest_intent_from_parquet(p, use_websocket=True)
     print(res)
+    

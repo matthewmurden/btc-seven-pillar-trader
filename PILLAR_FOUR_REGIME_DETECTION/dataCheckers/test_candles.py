@@ -1,3 +1,4 @@
+from pathlib import Path
 import pandas as pd
 import numpy as np
 from datetime import timedelta
@@ -5,7 +6,10 @@ from datetime import timedelta
 # ============================================================
 # CONFIG
 # ============================================================
-CSV_PATH = "/Users/mattmurden/TRADINGBOTPROJECT/PILLAR_FOUR_REGIME_DETECTION/data/raw/candles/BTCUSDT_1m_2022-11-01_2025-10-31.csv"
+CSV_PATH = str(
+    Path(__file__).resolve().parents[1]
+    / "data" / "raw" / "candles" / "BTCUSDT_1m_2022-11-01_2025-10-31.csv"
+)
 SYMBOL = "BTCUSDT"
 
 

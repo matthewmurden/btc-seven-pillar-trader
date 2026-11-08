@@ -1,31 +1,22 @@
-pandas
-numpy
-requests
-python-binance
-websockets
-aiohttp
-pyarrow
-scikit-learn
+# Core data handling
+pandas==2.3.3
+numpy==2.3.5
+polars==1.35.2
+pyarrow==22.0.0
+duckdb==1.4.3
 
-# Machine Learning
-scikit-learn
-lightgbm
-xgboost
+# Machine learning
+scikit-learn==1.7.2
+lightgbm==4.6.0
+joblib==1.5.2
 
-# For feature engineering utilities
-numba
+# Exchange connectivity (Binance REST + websockets)
+requests==2.32.5
+websockets==15.0.1
+websocket-client==1.9.0
 
-# Optional but useful for analysis / debugging
-matplotlib
+# Config / secrets (.env files)
+python-dotenv==1.2.1
 
-# Date parsing utilities
-python-dateutil
-
-# For websocket streaming & async data collection
-websocket-client
-
-# Fast file handling (optional future use)
-pyarrow
-
-# For environment variable management
-python-dotenv
+# Charts (equity curves in the optimiser)
+matplotlib==3.10.7
